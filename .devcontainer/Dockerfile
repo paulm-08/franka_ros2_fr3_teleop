@@ -43,7 +43,6 @@ RUN apt-get update && \
     ros-humble-joint-state-publisher-gui \
     ros-humble-launch-testing \
     ros-humble-moveit \
-    ros-humble-pinocchio \
     ros-humble-realtime-tools \
     ros-humble-ros2-control \
     ros-humble-ros2-control-test-assets \
@@ -53,14 +52,26 @@ RUN apt-get update && \
     ros-humble-ros-gz \
     && rm -rf /var/lib/apt/lists/*
 
+
+RUN mkdir -p /etc/apt/keyrings 
+
+RUN curl http://robotpkg.openrobots.org/packages/debian/robotpkg.asc | sudo tee /etc/apt/keyrings/robotpkg.asc
+
+RUN echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/robotpkg.asc] http://robotpkg.openrobots.org/packages/debian/pub $(lsb_release -cs) robotpkg" \
+| sudo tee /etc/apt/sources.list.d/robotpkg.list
+
+RUN apt-get update \
+    && apt-get install -qqy robotpkg-pinocchio
+    
+
 RUN mkdir ~/source_code
 RUN cd ~/source_code && git clone https://github.com/frankaemika/libfranka.git \
     && cd libfranka \
-    && git checkout 0.13.3 \
+    && git checkout 0.14.1 \
     && git submodule init \
     && git submodule update \
     && mkdir build && cd build \
-    && cmake -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release .. \
+    && cmake -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_LIBRARY_PATH=/opt/openrobots/lib -DCMAKE_PREFIX_PATH=/opt/openrobots/ .. \
     && make franka -j$(nproc) \
     && cpack -G DEB \
     && sudo dpkg -i libfranka*.deb

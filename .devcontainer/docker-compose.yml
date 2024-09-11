@@ -18,6 +18,11 @@ services:
     environment:
       QT_X11_NO_MITSHM: 1
       DISPLAY: $DISPLAY
+      PATH: /opt/openrobots/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PKG_CONFIG_PATH: /opt/openrobots/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/lib/pkgconfig
+      LD_LIBRARY_PATH: /opt/openrobots/lib:/usr/local/lib:/usr/lib
+      PYTHONPATH: /opt/openrobots/lib/python3.10/site-packages:/usr/local/lib/python3.10/site-packages
+      CMAKE_PREFIX_PATH: /opt/openrobots:/usr/local
     user: $UID:$UID
     cap_add:
       - SYS_NICE
