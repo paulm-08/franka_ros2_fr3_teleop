@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/frankaemika/franka_ros2/actions/workflows/ci.yml/badge.svg)](https://github.com/frankaemika/franka_ros2/actions/workflows/ci.yml)
 
-**Note:** franka_ros2 is not supported on Windows.
+**Note:** franka_ros2 is not officially supported on Windows.
 
-See the [Franka Control Interface (FCI) documentation](https://frankaemika.github.io/docs) for more information.
+
 
 ## Table of Contents
 - [About](#about)
@@ -28,9 +28,13 @@ This package is in rapid development. Users should expect breaking changes and a
 
 ## Prerequisites
 Before installing **franka_ros2**, ensure you have the following prerequisites:
-- **ROS 2 Humble Installation:** You can install `ros-humble-desktop` or use VSCode IDE with DevContainer.
+- **ROS 2 Humble Installation:** You can install [`ros-humble-desktop`](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)  or use VSCode IDE with DevContainer. 
 - **PREEMPT_RT Kernel (optional but recommended):** A real-time kernel is necessary for the cartesian_pose, joint_position, and elbow_position command interfaces.
-- **System-wide libfranka Installation:** Minimum supported version: 0.13.2. Refer to the [libfranka repository](https://github.com/frankaemika/libfranka) for build steps.
+- **System-wide libfranka Installation:** 
+    - If you plan to **install from source**, a libfranka installation is required. Please refer to the [libfranka repository](https://github.com/frankaemika/libfranka) for detailed build steps.
+    - If you are **using the DevContainer**, you do not need to install libfranka system-wide, as it will be included in the container.
+
+    Regardless of your setup, it is important to check the compatibility of your Robot OS version with libfranka to avoid potential errors. For detailed compatibility information, please consult the [libfranka compatibility matrix](https://frankaemika.github.io/docs/compatibility.htmlk-to-matrix).
 
 ## Optional .bashrc Settings
 Enhance your development experience by adding the following lines to your `.bashrc` file:
@@ -103,10 +107,11 @@ The `franka_ros2` package includes a `.devcontainer` folder, which allows you to
     git clone https://github.com/frankaemika/franka_description.git src/franka_description
     ```
 
-3. **Move the .devcontainer Folder:**
+3. **Copy the .devcontainer Folder:**
     ```bash
-    mv src/franka_ros2/.devcontainer .
+    cp -r src/franka_ros2/.devcontainer .
     ```
+    This step ensures that both the `franka_ros2` and `franka_description` folders are accessible within the DevContainer environment.
 
 4. **Open VSCode:**
     ```bash
@@ -121,7 +126,7 @@ The `franka_ros2` package includes a `.devcontainer` folder, which allows you to
     
     Press Ctrl + (backtick). 
 
-7. **Install the Franka ROS 2 Packages:**
+7. **Source the Environment:**
     ```bash
     source /opt/ros/humble/setup.sh  
     ```
@@ -162,7 +167,7 @@ This occurs because Docker cannot access the `/tmp/.X11-unix` directory on the h
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/frankaemika/franka_description/blob/d722358a418126296a7ad0d79a53c2ba7f6da46c/CONTRIBUTING.md#L4) for more details on how to contribute to this project. 
+Contributions are welcome! Please see [CONTRIBUTING.md]() for more details on how to contribute to this project. 
 
 
 ## License 
@@ -173,3 +178,5 @@ All packages of franka_ros2 are licensed under the [Apache 2.0 license](https://
 ## Contact 
 
 For questions or support, please open an issue on the [GitHub Issues](https://github.com/frankaemika/franka_ros2/issues) page. 
+
+See the [Franka Control Interface (FCI) documentation](https://frankaemika.github.io/docs) for more information.
