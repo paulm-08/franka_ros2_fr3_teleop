@@ -136,34 +136,11 @@ The `franka_ros2` package includes a `.devcontainer` folder, which allows you to
     source install/setup.sh 
     ```
 ## Troubleshooting
-### Error: Docker Unable to Access /tmp/.X11-unix
+### `libfranka: UDP receive: Timeout error`
 
-If you encounter the following error after running **Rebuild and Reopen in Container**: 
+If you encounter a UDP receive timeout error while communicating with the robot, avoid using Docker Desktop. It may not provide the necessary real-time capabilities required for reliable communication with the robot. Instead, using Docker Engine is sufficient for this purpose.
 
-Error response from daemon: Mounts denied:  
-The path /tmp/.X11-unix is not shared from the host and is not known to Docker. 
- 
-
-This occurs because Docker cannot access the `/tmp/.X11-unix` directory on the host system. Follow these steps to fix it: 
-
-1. **Allow Docker to Access /tmp/.X11-unix:**
-
-    If you are using Docker Desktop, navigate to:
-
-    1. `Docker Desktop` -> `Settings` -> `Resources` -> `File Sharing`
-    2. Add `/tmp/.X11-unix` to the list of shared directories.
-    3. Apply the changes and restart Docker.
- 
-2. **Verify Sharing Path on Linux:**
-
-    Ensure that Docker has the correct permissions for /tmp/.X11-unix:  
-    ```bash
-    sudo chmod +x /tmp/.X11-unix 
-    ```
- 
-
-3. **Restart Docker and re-run the container.**
-
+A real-time kernel is essential to ensure proper communication and to prevent timeout issues. For guidance on setting up a real-time kernel, please refer to the [Franka installation documentation](https://frankaemika.github.io/docs/installation_linux.html#setting-up-the-real-time-kernel).
 
 ## Contributing
 
