@@ -111,8 +111,9 @@ JointImpedanceWithIKExampleController::create_ik_service_request(
   service_request->ik_request.robot_state.joint_state.velocity = joint_velocities_current;
   service_request->ik_request.robot_state.joint_state.effort = joint_efforts_current;
 
-  // If Franka Hand is not connected, the following line should be commented out.
-  service_request->ik_request.ik_link_name = arm_id_ + "_hand_tcp";
+  if (is_gripper_loaded_) {
+    service_request->ik_request.ik_link_name = arm_id_ + "_hand_tcp";
+  }
   return service_request;
 }
 
@@ -189,6 +190,8 @@ CallbackReturn JointImpedanceWithIKExampleController::on_init() {
 
 bool JointImpedanceWithIKExampleController::assign_parameters() {
   arm_id_ = get_node()->get_parameter("arm_id").as_string();
+  is_gripper_loaded_ = get_node()->get_parameter("load_gripper").as_bool();
+
   auto k_gains = get_node()->get_parameter("k_gains").as_double_array();
   auto d_gains = get_node()->get_parameter("d_gains").as_double_array();
   if (k_gains.empty()) {

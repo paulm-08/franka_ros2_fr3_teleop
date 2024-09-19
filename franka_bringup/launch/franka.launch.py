@@ -76,6 +76,7 @@ def robot_description_dependent_nodes_spawner(
             parameters=[franka_controllers,
                         {'robot_description': robot_description},
                         {'arm_id': arm_id},
+                        {'load_gripper': load_gripper},
                         ],
             remappings=[('joint_states', 'franka/joint_states')],
             output={

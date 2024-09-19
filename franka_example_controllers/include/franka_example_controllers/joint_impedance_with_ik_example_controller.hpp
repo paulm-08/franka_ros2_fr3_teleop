@@ -98,6 +98,7 @@ class JointImpedanceWithIKExampleController : public controller_interface::Contr
   bool initialization_flag_{true};
 
   std::string arm_id_;
+  bool is_gripper_loaded_ = true;
 
   double elapsed_time_{0.0};
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
