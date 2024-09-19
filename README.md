@@ -14,8 +14,9 @@
 - [Setup](#setup)
   - [Install From Source](#install-from-source)
   - [Use VSCode DevContainer](#use-vscode-devcontainer)
+  - [Test the Setup](#test-the-setup)
 - [Troubleshooting](#troubleshooting)
-  - [Error: Docker Unable to Access /tmp/.X11-unix](#error-docker-unable-to-access-tmpx11-unix)
+  - [libfranka: UDP receive: Timeout error](#libfranka-udp-receive-timeout-error)
 - [Contributing](#contributing)
 - [License](#license)
 - [Contact](#contact)
@@ -37,14 +38,11 @@ Before installing **franka_ros2**, ensure you have the following prerequisites:
     Regardless of your setup, it is important to check the compatibility of your Robot OS version with libfranka to avoid potential errors. For detailed compatibility information, please consult the [libfranka compatibility matrix](https://frankaemika.github.io/docs/compatibility.htmlk-to-matrix).
 
 ## Optional .bashrc Settings
-Enhance your development experience by adding the following lines to your `.bashrc` file:
+Enhance your development experience by adding the following line to your `.bashrc` file:
 
 ```bash
 # Enable colorized warn and error messages
 export RCUTILS_COLORIZED_OUTPUT=1
-
-# Set system language to American English to avoid issues in RViz
-export LC_NUMERIC=en_US.UTF-8  
 ```
 
 ## Setup
@@ -135,6 +133,17 @@ The `franka_ros2` package includes a `.devcontainer` folder, which allows you to
     colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release 
     source install/setup.sh 
     ```
+
+
+### Test the Setup
+
+To verify that your setup works correctly without a robot, you can run the following command to use dummy hardware:
+
+```bash
+ros2 launch franka_moveit_config moveit.launch.py robot_ip:=dont-care use_fake_hardware:=true
+```
+
+
 ## Troubleshooting
 ### `libfranka: UDP receive: Timeout error`
 
@@ -144,7 +153,7 @@ A real-time kernel is essential to ensure proper communication and to prevent ti
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md]() for more details on how to contribute to this project. 
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/frankaemika/franka_ros2/blob/humble/CONTRIBUTING.md) for more details on how to contribute to this project. 
 
 
 ## License 
