@@ -6,6 +6,7 @@ Requires libfranka >= 0.13.2 and franka_description >= 0.3.0 requires ROS 2 Humb
 
 * franka\_gazebo\_bringup: Released and supports joint position, velocity and effort commands
 * franka\_ign\_ros2\_control: ROS 2 hardware interface for gazebo controller. Modified to add gravity torques for Franka robots.
+* fixed the joint-impedance-with-IK example to work without a gripper
 
 ## 0.1.14 - 2024-05-13
 
@@ -16,7 +17,7 @@ Requires libfranka >= 0.13.2, and franka_description >= 0.2.0 requires ROS 2 Hum
 * removed: hard-coded panda robot references
 * removed: franka_description package
 * using the franka_description standalone package https://github.com/frankaemika/franka_description
-* franka_hardware prefixes the robot_state and robot model state interfaces with the read robot name from the urdf. 
+* franka_hardware prefixes the robot_state and robot model state interfaces with the read robot name from the urdf.
 
 ## 0.1.13 - 2024-01-18
 
