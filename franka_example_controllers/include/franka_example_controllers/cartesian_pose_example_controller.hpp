@@ -21,6 +21,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
+#include <franka_example_controllers/robot_utils.hpp>
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
@@ -53,6 +54,10 @@ class CartesianPoseExampleController : public controller_interface::ControllerIn
   bool initialization_flag_{true};
 
   double elapsed_time_{0.0};
+  double initial_robot_time_{0.0};
+  double robot_time_{0.0};
+  std::string robot_description_;
+  std::string arm_id_;
 };
 
 }  // namespace franka_example_controllers

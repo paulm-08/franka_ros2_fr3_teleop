@@ -38,7 +38,8 @@ CartesianElbowExampleController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   config.names = franka_cartesian_pose_->get_state_interface_names();
-
+  // add the robot time interface
+  config.names.push_back(arm_id_ + "/robot_time");
   return config;
 }
 
@@ -50,9 +51,16 @@ controller_interface::return_type CartesianElbowExampleController::update(
     initial_elbow_configuration_ = franka_cartesian_pose_->getInitialElbowConfiguration();
     // Get the initial pose
     initial_pose_configuration_ = franka_cartesian_pose_->getInitialPoseMatrix();
+
+    initial_robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = 0.0;
+
     initialization_flag_ = false;
   }
-  elapsed_time_ = elapsed_time_ + traj_frequency_;
+  else{
+    robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = robot_time_ - initial_robot_time_;
+  }
 
   double angle = M_PI / 15.0 * (1.0 - std::cos(M_PI / 5.0 * elapsed_time_));
   std::array<double, 16> pose_command = initial_pose_configuration_;
@@ -91,6 +99,21 @@ CallbackReturn CartesianElbowExampleController::on_configure(
   } else {
     RCLCPP_INFO(get_node()->get_logger(), "Default collision behavior set.");
   }
+
+  auto parameters_client =
+      std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "/robot_state_publisher");
+  parameters_client->wait_for_service();
+
+  auto future = parameters_client->get_parameters({"robot_description"});
+  auto result = future.get();
+  if (!result.empty()) {
+    robot_description_ = result[0].value_to_string();
+  } else {
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter.");
+  }
+
+  arm_id_ = robot_utils::getRobotNameFromDescription(robot_description_, get_node()->get_logger());
+
 
   return CallbackReturn::SUCCESS;
 }
