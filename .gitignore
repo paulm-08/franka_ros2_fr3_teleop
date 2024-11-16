@@ -7,3 +7,7 @@ cmake-build-*/
 build/
 install/
 log/
+# Don't show libfranka or franka_description
+# even though they might exist in this directory
+libfranka/
+franka_description/

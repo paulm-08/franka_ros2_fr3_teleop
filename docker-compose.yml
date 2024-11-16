@@ -3,7 +3,7 @@ version: '3'
 services:
   franka_ros2:
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile
       args:
         - USER_UID=${UID:-1001}
@@ -15,9 +15,9 @@ services:
     tty: true
     stdin_open: true
     volumes:
-      - ../:/ros2_ws/src
+      - ./:/ros2_ws/src
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - ../limits.conf:/etc/security/limits.conf
+      - ./limits.conf:/etc/security/limits.conf
     environment:
       QT_X11_NO_MITSHM: 1
       DISPLAY: $DISPLAY

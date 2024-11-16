@@ -69,7 +69,7 @@ export RCUTILS_COLORIZED_OUTPUT=1
    ros-humble-realtime-tools \
    ros-humble-xacro \
    ros-humble-hardware-interface \
-    ros-humble-ros-gz \
+   ros-humble-ros-gz \
    python3-colcon-common-extensions
    ```
 

@@ -3,30 +3,20 @@
     "privileged": true,
     "remoteUser": "user",
     "dockerComposeFile": "./docker-compose.yml",
-    "service": "ros2_control",
-    "workspaceFolder": "/workspaces",
-    "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces,type=bind",
+    "service": "franka_ros2",
+    "workspaceFolder": "/ros2_ws/src",
     "customizations": {
         "vscode": {
             "extensions": [
                 "ms-python.python",
-                "bungcip.better-toml",
+                "ms-python.vscode-pylance",
+                "ms-python.black-formatter",
                 "ms-vscode.cpptools",
-                "ms-vscode.cpptools-extension-pack",
-                "ms-vscode.cmake-tools",
                 "xaver.clang-format",
-                "josetr.cmake-language-support-vscode",
                 "twxs.cmake",
-                "cheshirekow.cmake-format"
+                "cheshirekow.cmake-format",
+                "ms-iot.vscode-ros"
             ]
         }
-    },
-    "containerEnv": {
-        "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
-        "ROS_DOMAIN_ID": "100"
-    },
-    "mounts": [
-        "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind,consistency=cached",
-        "source=/dev/dri,target=/dev/dri,type=bind,consistency=cached"
-    ]
+    }
 }
