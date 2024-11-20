@@ -81,7 +81,6 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   bool initial_joint_position_update_{true};
   bool update_robot_time_{true};
   double robot_time_state_{0.0};
-  franka::Duration franka_robot_time_;
 
   std::shared_ptr<Robot> robot_;
   std::shared_ptr<FrankaParamServiceServer> service_node_;

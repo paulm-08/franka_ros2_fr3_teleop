@@ -111,10 +111,11 @@ TEST_F(
     FrankaHardwareInterfaceTest,
     given_that_the_robot_interfaces_are_set_when_call_export_state_return_zero_values_and_correct_interface_names) {
   franka::RobotState robot_state;
-  const size_t state_interface_size =
-      48;  // position, effort and velocity states for
-           // every joint + robot state and model// every joint + robot state and model + initial
-           // pose(16) + initial elbow(2) + position
+  const size_t state_interface_size = 49;  // position, effort and velocity states for 7*3
+                                           // initial joint position(7)
+                                           // + robot state and model
+                                           // + initial pose(16) + initial elbow(2)
+                                           // + robot_time(1)
   auto mock_robot = std::make_shared<MockRobot>();
   MockModel mock_model;
   MockModel* model_address = &mock_model;
@@ -134,8 +135,9 @@ TEST_F(
   auto states = franka_hardware_interface.export_state_interfaces();
   size_t joint_index = 0;
 
-  // Get all the states except the last two reserved for robot state + initial pose, elbow, position
-  for (size_t i = 0; i < states.size() - 20; i++) {
+  // Get all the joint states (28 interfaces = 7 joints * 4 interfaces per joint)
+  const size_t joint_interfaces = 28;
+  for (size_t i = 0; i < joint_interfaces; i++) {
     if (i % 4 == 0) {
       joint_index++;
     }
@@ -148,10 +150,15 @@ TEST_F(
       ASSERT_EQ(states[i].get_name(), joint_name + "/" + k_effort_controller);
     } else if (i % 4 == 3) {
       ASSERT_EQ(states[i].get_name(), joint_name + "/" + "initial_joint_position");
-    } else
-      ASSERT_EQ(states[i].get_value(), 0.0);
+    }
+    ASSERT_EQ(states[i].get_value(), 0.0);
   }
 
+  ASSERT_EQ(states[joint_interfaces].get_name(), arm_id + "/robot_state");
+  ASSERT_EQ(states[joint_interfaces + 1].get_name(), arm_id + "/robot_model");
+  ASSERT_EQ(states[states.size() - 1].get_name(), arm_id + "/robot_time");
+
+  // Verify total number of interfaces
   ASSERT_EQ(states.size(), state_interface_size);
 }
 

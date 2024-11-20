@@ -85,9 +85,7 @@ std::vector<StateInterface> FrankaHardwareInterface::export_state_interfaces() {
         hw_elbow_command_names_.at(i), k_HW_IF_INITIAL_ELBOW_STATE, &initial_elbow_state_.at(i)));
   }
 
-  // add the robot time interface
-  state_interfaces.emplace_back(StateInterface(arm_id_, "robot_time",
-                                                 &robot_time_state_));
+  state_interfaces.emplace_back(StateInterface(arm_id_, "robot_time", &robot_time_state_));
 
   return state_interfaces;
 }
@@ -173,8 +171,7 @@ hardware_interface::return_type FrankaHardwareInterface::read(const rclcpp::Time
     hw_franka_model_ptr_ = robot_->getModel();
   }
   hw_franka_robot_state_ = robot_->readOnce();
-  franka_robot_time_ = hw_franka_robot_state_.time;
-  robot_time_state_ = franka_robot_time_.toSec();
+  robot_time_state_ = hw_franka_robot_state_.time.toSec();
   initializePositionCommands(hw_franka_robot_state_);
 
   hw_positions_ = hw_franka_robot_state_.q;
@@ -197,15 +194,9 @@ hardware_interface::return_type FrankaHardwareInterface::write(const rclcpp::Tim
       hasInfinite(hw_elbow_command_) || hasInfinite(hw_cartesian_pose_)) {
     return hardware_interface::return_type::ERROR;
   }
-  if(update_robot_time_){
-    robot_time_ = hw_franka_robot_state_.time;
-    update_robot_time_ = false;
-  }
-  // if the robot time has changed, write the command to the robot
-  if(robot_time_ != hw_franka_robot_state_.time){
-    robot_time_ = hw_franka_robot_state_.time;
-    if (velocity_joint_interface_running_) {
-      robot_->writeOnce(hw_velocity_commands_);
+
+  if (velocity_joint_interface_running_) {
+    robot_->writeOnce(hw_velocity_commands_);
   } else if (effort_interface_running_) {
     robot_->writeOnce(hw_effort_commands_);
   } else if (position_joint_interface_running_ && !first_position_update_ &&
@@ -228,7 +219,7 @@ hardware_interface::return_type FrankaHardwareInterface::write(const rclcpp::Tim
   } else if (velocity_cartesian_interface_running_ && !elbow_command_interface_running_) {
     robot_->writeOnce(hw_cartesian_velocities_);
   }
-  } 
+
   return hardware_interface::return_type::OK;
 }
 
