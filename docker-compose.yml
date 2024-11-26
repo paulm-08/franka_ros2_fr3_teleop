@@ -1,5 +1,3 @@
-version: '3'
-
 services:
   franka_ros2:
     build:
@@ -18,6 +16,7 @@ services:
       - ./:/ros2_ws/src
       - /tmp/.X11-unix:/tmp/.X11-unix
       - ./limits.conf:/etc/security/limits.conf
+      - /dev:/dev
     environment:
       QT_X11_NO_MITSHM: 1
       DISPLAY: $DISPLAY
