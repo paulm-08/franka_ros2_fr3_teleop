@@ -78,7 +78,6 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   bool first_cartesian_pose_update_{true};
   bool initial_robot_state_update_{true};
   bool initial_elbow_state_update_{true};
-  bool initial_joint_position_update_{true};
   bool update_robot_time_{true};
   double robot_time_state_{0.0};
 
@@ -98,7 +97,6 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   std::array<double, kNumberOfJoints> hw_positions_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, kNumberOfJoints> hw_velocities_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, kNumberOfJoints> hw_efforts_{0, 0, 0, 0, 0, 0, 0};
-  std::array<double, kNumberOfJoints> initial_joint_positions_{0, 0, 0, 0, 0, 0, 0};
   // Cartesian States
   std::array<double, 16> initial_robot_pose_{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
   std::array<double, 2> initial_elbow_state_{0, 0};
@@ -135,7 +133,6 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
 
   const std::string k_HW_IF_INITIAL_CARTESIAN_POSE = "initial_cartesian_pose";
   const std::string k_HW_IF_INITIAL_ELBOW_STATE = "initial_elbow_state";
-  const std::string k_HW_IF_INITIAL_POSITION = "initial_joint_position";
 
   const std::vector<InterfaceInfo> command_interfaces_info_;
 

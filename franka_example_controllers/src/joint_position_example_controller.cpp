@@ -38,16 +38,11 @@ controller_interface::InterfaceConfiguration
 JointPositionExampleController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-  if (!is_gazebo_) {
-    for (int i = 1; i <= num_joints; ++i) {
-      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/" +
-                             k_HW_IF_INITIAL_POSITION);
-    }
-  } else {
-    for (int i = 1; i <= num_joints; ++i) {
-      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
-    }
+
+  for (int i = 1; i <= num_joints; ++i) {
+    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
   }
+
   // add the robot time interface
   config.names.push_back(arm_id_ + "/robot_time");
   return config;
@@ -55,7 +50,7 @@ JointPositionExampleController::state_interface_configuration() const {
 
 controller_interface::return_type JointPositionExampleController::update(
     const rclcpp::Time& /*time*/,
-    const rclcpp::Duration& period) {
+    const rclcpp::Duration& /*period*/) {
   if (initialization_flag_) {
     for (int i = 0; i < num_joints; ++i) {
       initial_q_.at(i) = state_interfaces_[i].get_value();
@@ -63,8 +58,7 @@ controller_interface::return_type JointPositionExampleController::update(
     initialization_flag_ = false;
     initial_robot_time_ = state_interfaces_[num_joints].get_value();
     elapsed_time_ = 0.0;
-  }
-  else{
+  } else {
     robot_time_ = state_interfaces_[num_joints].get_value();
     elapsed_time_ = robot_time_ - initial_robot_time_;
   }

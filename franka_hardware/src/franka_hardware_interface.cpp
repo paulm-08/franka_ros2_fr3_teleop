@@ -60,8 +60,6 @@ std::vector<StateInterface> FrankaHardwareInterface::export_state_interfaces() {
         info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &hw_velocities_.at(i)));
     state_interfaces.emplace_back(
         StateInterface(info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_efforts_.at(i)));
-    state_interfaces.emplace_back(StateInterface(info_.joints[i].name, k_HW_IF_INITIAL_POSITION,
-                                                 &initial_joint_positions_.at(i)));
   }
 
   state_interfaces.emplace_back(StateInterface(
@@ -157,12 +155,10 @@ void FrankaHardwareInterface::initializePositionCommands(const franka::RobotStat
   initializeCommand(initial_elbow_state_update_, elbow_command_interface_running_,
                     initial_elbow_state_, robot_state.elbow_c);
   initializeCommand(first_position_update_, position_joint_interface_running_,
-                    hw_position_commands_, robot_state.q_d);
+                    hw_position_commands_, robot_state.q);
   initializeCommand(first_cartesian_pose_update_, pose_cartesian_interface_running_,
                     hw_cartesian_pose_, robot_state.O_T_EE_d);
   initializeCommand(initial_robot_state_update_, true, initial_robot_pose_, robot_state.O_T_EE_d);
-  initializeCommand(initial_joint_position_update_, true, initial_joint_positions_,
-                    robot_state.q_d);
 }
 
 hardware_interface::return_type FrankaHardwareInterface::read(const rclcpp::Time& /*time*/,
@@ -199,8 +195,7 @@ hardware_interface::return_type FrankaHardwareInterface::write(const rclcpp::Tim
     robot_->writeOnce(hw_velocity_commands_);
   } else if (effort_interface_running_) {
     robot_->writeOnce(hw_effort_commands_);
-  } else if (position_joint_interface_running_ && !first_position_update_ &&
-             !initial_joint_position_update_) {
+  } else if (position_joint_interface_running_ && !first_position_update_) {
     robot_->writeOnce(hw_position_commands_);
   } else if (velocity_cartesian_interface_running_ && elbow_command_interface_running_ &&
              !first_elbow_update_) {
@@ -340,7 +335,6 @@ hardware_interface::return_type FrankaHardwareInterface::perform_command_mode_sw
     robot_->initializeJointPositionInterface();
     position_joint_interface_running_ = true;
     first_position_update_ = true;
-    initial_joint_position_update_ = true;
   } else if (position_joint_interface_running_ && !position_joint_interface_claimed_) {
     robot_->stopRobot();
     position_joint_interface_running_ = false;

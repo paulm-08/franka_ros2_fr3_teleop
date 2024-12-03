@@ -49,7 +49,6 @@ class JointPositionExampleController : public controller_interface::ControllerIn
   double elapsed_time_ = 0.0;
   double initial_robot_time_ = 0.0;
   double robot_time_ = 0.0;
-  const std::string k_HW_IF_INITIAL_POSITION = "initial_joint_position";
 
   bool initialization_flag_{true};
   rclcpp::Time start_time_;
