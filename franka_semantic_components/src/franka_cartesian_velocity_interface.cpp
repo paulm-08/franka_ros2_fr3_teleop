@@ -44,8 +44,8 @@ FrankaCartesianVelocityInterface::FrankaCartesianVelocityInterface(bool command_
   if (command_elbow_active_) {
     command_interface_names_.reserve(full_command_interface_size_);
     command_interfaces_.reserve(full_command_interface_size_);
-    state_interface_names_.reserve(hw_elbow_command_names_.size());
-    state_interfaces_.reserve(hw_elbow_command_names_.size());
+    state_interface_names_.reserve(elbow_state_names_.size());
+    state_interfaces_.reserve(elbow_state_names_.size());
   }
 
   for (const auto& velocity_command_name : hw_cartesian_velocities_names_) {
@@ -56,10 +56,11 @@ FrankaCartesianVelocityInterface::FrankaCartesianVelocityInterface(bool command_
   if (command_elbow_active_) {
     for (const auto& elbow_command_name : hw_elbow_command_names_) {
       auto full_elbow_command_name = elbow_command_name + "/" + elbow_command_interface_name_;
-      auto full_initial_elbow_state_name =
-          elbow_command_name + "/" + elbow_initial_state_interface_name_;
       command_interface_names_.emplace_back(full_elbow_command_name);
-      state_interface_names_.emplace_back(full_initial_elbow_state_name);
+    }
+    for (const auto& elbow_state_name : elbow_state_names_) {
+      auto full_elbow_state_name = elbow_state_name + "/" + elbow_state_interface_name_;
+      state_interface_names_.emplace_back(full_elbow_state_name);
     }
   }
 }
@@ -107,15 +108,14 @@ std::array<double, 2> FrankaCartesianVelocityInterface::getCommandedElbowConfigu
   return elbow_configuration;
 };
 
-std::array<double, 2> FrankaCartesianVelocityInterface::getInitialElbowConfiguration() {
+std::array<double, 2> FrankaCartesianVelocityInterface::getCurrentElbowConfiguration() {
   if (!command_elbow_active_) {
     throw std::runtime_error("Elbow command interface must be claimed to receive elbow state.");
   }
 
   std::array<double, 2> elbow_configuration;
   auto full_configuration = get_values_state_interfaces();
-  std::copy_n(full_configuration.begin(), hw_elbow_command_names_.size(),
-              elbow_configuration.begin());
+  std::copy_n(full_configuration.begin(), elbow_state_names_.size(), elbow_configuration.begin());
 
   return elbow_configuration;
 };

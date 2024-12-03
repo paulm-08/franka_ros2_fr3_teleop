@@ -37,8 +37,7 @@ void FrankaCartesianVelocityTest::setUpHWStateInterfaces(bool elbow_activate) {
     for (auto i = 0U; i < hw_elbow_command_names_.size(); i++) {
       elbow_state_interfaces_container.push_back(
           std::make_shared<hardware_interface::StateInterface>(hardware_interface::StateInterface{
-              hw_elbow_command_names_[i], elbow_initial_state_interface_name_,
-              &initial_elbow_state_.at(i)}));
+              elbow_state_names_[i], elbow_state_interface_name_, &current_elbow_state_.at(i)}));
     }
 
     for (auto& elbow_state_interface : elbow_state_interfaces_container) {
@@ -220,16 +219,16 @@ TEST_F(FrankaCartesianVelocityTest,
 }
 
 TEST_F(FrankaCartesianVelocityTest,
-       given_correct_interface_when_initial_elbow_state_requested_expect_correct) {
+       given_correct_interface_when_current_elbow_state_requested_expect_correct) {
   setUpInterfaces(true);
 
-  auto received_elbow_state = franka_cartesian_command_friend->getInitialElbowConfiguration();
-  ASSERT_EQ(received_elbow_state, initial_elbow_state_);
+  auto received_elbow_state = franka_cartesian_command_friend->getCurrentElbowConfiguration();
+  ASSERT_EQ(received_elbow_state, current_elbow_state_);
 }
 
 TEST_F(FrankaCartesianVelocityTest,
-       given_correct_interface_when_initial_elbow_state_requested_expect_throw) {
+       given_correct_interface_when_current_elbow_state_requested_expect_throw) {
   setUpInterfaces(false);
 
-  ASSERT_THROW(franka_cartesian_command_friend->getInitialElbowConfiguration(), std::runtime_error);
+  ASSERT_THROW(franka_cartesian_command_friend->getCurrentElbowConfiguration(), std::runtime_error);
 }

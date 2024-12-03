@@ -46,7 +46,7 @@ controller_interface::return_type ElbowExampleController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& /*period*/) {
   if (initialization_flag_) {
-    initial_elbow_configuration_ = franka_cartesian_velocity_->getInitialElbowConfiguration();
+    initial_elbow_configuration_ = franka_cartesian_velocity_->getCurrentElbowConfiguration();
     initialization_flag_ = false;
   }
   elapsed_time_ = elapsed_time_ + traj_frequency_;

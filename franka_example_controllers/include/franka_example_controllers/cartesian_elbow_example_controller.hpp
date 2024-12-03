@@ -19,8 +19,8 @@
 #include <controller_interface/controller_interface.hpp>
 #include <rclcpp/rclcpp.hpp>
 
-#include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
 #include <franka_example_controllers/robot_utils.hpp>
+#include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 

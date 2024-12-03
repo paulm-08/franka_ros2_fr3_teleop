@@ -137,7 +137,7 @@ controller_interface::return_type JointImpedanceWithIKExampleController::update(
     const rclcpp::Duration& /*period*/) {
   if (initialization_flag_) {
     std::tie(orientation_, position_) =
-        franka_cartesian_pose_->getInitialOrientationAndTranslation();
+        franka_cartesian_pose_->getCurrentOrientationAndTranslation();
     initialization_flag_ = false;
   }
   update_joint_states();

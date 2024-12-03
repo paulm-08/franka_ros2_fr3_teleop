@@ -77,7 +77,6 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   bool first_position_update_{true};
   bool first_cartesian_pose_update_{true};
   bool initial_robot_state_update_{true};
-  bool initial_elbow_state_update_{true};
   bool update_robot_time_{true};
   double robot_time_state_{0.0};
 
@@ -98,8 +97,8 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   std::array<double, kNumberOfJoints> hw_velocities_{0, 0, 0, 0, 0, 0, 0};
   std::array<double, kNumberOfJoints> hw_efforts_{0, 0, 0, 0, 0, 0, 0};
   // Cartesian States
-  std::array<double, 16> initial_robot_pose_{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-  std::array<double, 2> initial_elbow_state_{0, 0};
+  std::array<double, 16> cartesian_pose_state_{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  std::array<double, 2> elbow_state_{0, 0};
 
   /**
    * Desired Cartesian velocity with respect to the o-frame
@@ -110,7 +109,8 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   std::array<double, 6> hw_cartesian_velocities_{0, 0, 0, 0, 0, 0};
 
   // Pose is represented as a column-major homogeneous transformation matrix.
-  std::array<double, 16> hw_cartesian_pose_{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  std::array<double, 16> hw_cartesian_pose_commands_{1, 0, 0, 0, 0, 1, 0, 0,
+                                                     0, 0, 1, 0, 0, 0, 0, 1};
 
   /**
    * Elbow configuration.
@@ -127,12 +127,14 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   std::array<std::string, 2> hw_elbow_command_names_{"joint_3_position", "joint_4_sign"};
   std::array<double, 2> hw_elbow_command_{0, 0};
 
+  std::array<std::string, 2> elbow_state_names_{"joint_3_position", "joint_4_sign"};
+
   const std::string k_HW_IF_CARTESIAN_VELOCITY = "cartesian_velocity";
-  const std::string k_HW_IF_CARTESIAN_POSE = "cartesian_pose";
+  const std::string k_HW_IF_CARTESIAN_POSE_COMMAND = "cartesian_pose_command";
   const std::string k_HW_IF_ELBOW_COMMAND = "elbow_command";
 
-  const std::string k_HW_IF_INITIAL_CARTESIAN_POSE = "initial_cartesian_pose";
-  const std::string k_HW_IF_INITIAL_ELBOW_STATE = "initial_elbow_state";
+  const std::string k_HW_IF_ELBOW_STATE = "elbow_state";
+  const std::string k_HW_IF_CARTESIAN_POSE_STATE = "cartesian_pose_state";
 
   const std::vector<InterfaceInfo> command_interfaces_info_;
 

@@ -48,16 +48,15 @@ controller_interface::return_type CartesianElbowExampleController::update(
     const rclcpp::Duration& /*period*/) {
   if (initialization_flag_) {
     // Get initial elbow configuration values
-    initial_elbow_configuration_ = franka_cartesian_pose_->getInitialElbowConfiguration();
+    initial_elbow_configuration_ = franka_cartesian_pose_->getCurrentElbowConfiguration();
     // Get the initial pose
-    initial_pose_configuration_ = franka_cartesian_pose_->getInitialPoseMatrix();
+    initial_pose_configuration_ = franka_cartesian_pose_->getCurrentPoseMatrix();
 
     initial_robot_time_ = state_interfaces_.back().get_value();
     elapsed_time_ = 0.0;
 
     initialization_flag_ = false;
-  }
-  else{
+  } else {
     robot_time_ = state_interfaces_.back().get_value();
     elapsed_time_ = robot_time_ - initial_robot_time_;
   }
@@ -113,7 +112,6 @@ CallbackReturn CartesianElbowExampleController::on_configure(
   }
 
   arm_id_ = robot_utils::getRobotNameFromDescription(robot_description_, get_node()->get_logger());
-
 
   return CallbackReturn::SUCCESS;
 }

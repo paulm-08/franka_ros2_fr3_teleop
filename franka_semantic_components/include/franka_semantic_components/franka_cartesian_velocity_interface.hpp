@@ -81,22 +81,24 @@ class FrankaCartesianVelocityInterface : public FrankaSemanticComponentInterface
   std::array<double, 2> getCommandedElbowConfiguration();
 
   /**
-   * @brief Get the initial elbow configuration when the controller started
+   * @brief Get the current elbow configuration
    *
    * @return elbow_configuration [joint3_position, joint4_sign]
    */
-  std::array<double, 2> getInitialElbowConfiguration();
+  std::array<double, 2> getCurrentElbowConfiguration();
 
  private:
   const std::array<std::string, 6> hw_cartesian_velocities_names_{"vx", "vy", "vz",
                                                                   "wx", "wy", "wz"};
   const std::array<std::string, 2> hw_elbow_command_names_{"joint_3_position", "joint_4_sign"};
+  const std::array<std::string, 2> elbow_state_names_{"joint_3_position", "joint_4_sign"};
+
   const size_t full_command_interface_size_{8};
   bool command_elbow_active_;
 
   const std::string cartesian_velocity_command_interface_name_{"cartesian_velocity"};
   const std::string elbow_command_interface_name_{"elbow_command"};
-  const std::string elbow_initial_state_interface_name_{"initial_elbow_state"};
+  const std::string elbow_state_interface_name_{"elbow_state"};
 };
 
 }  // namespace franka_semantic_components

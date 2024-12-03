@@ -126,22 +126,22 @@ class FrankaCartesianPoseInterface
    *
    * @return std::array<double, 2> elbow configuration [joint_3_position, joint_4_sign]
    */
-  std::array<double, 2> getInitialElbowConfiguration();
+  std::array<double, 2> getCurrentElbowConfiguration();
 
   /**
    * @brief Get the Initial Orientation And Translation
    *
-   * @return std::tuple<Eigen::Quaterniond, Eigen::Vector3d> initial orientation values in
-   * quaternion format. Initial translation values in Vector3d format [x,y,z].
+   * @return std::tuple<Eigen::Quaterniond, Eigen::Vector3d> current orientation values in
+   * quaternion format. current translation values in Vector3d format [x,y,z].
    */
-  std::tuple<Eigen::Quaterniond, Eigen::Vector3d> getInitialOrientationAndTranslation();
+  std::tuple<Eigen::Quaterniond, Eigen::Vector3d> getCurrentOrientationAndTranslation();
 
   /**
    * @brief Get the initial pose matrix
    *
-   * @return std::array<double, 16> Initial pose matrix column major homogenous transformation
+   * @return std::array<double, 16> Current pose matrix column major homogenous transformation
    */
-  std::array<double, 16> getInitialPoseMatrix();
+  std::array<double, 16> getCurrentPoseMatrix();
 
  private:
   /**
@@ -155,6 +155,7 @@ class FrankaCartesianPoseInterface
                                                             const Eigen::Vector3d& translation);
 
   const std::array<std::string, 2> hw_elbow_names_{"joint_3_position", "joint_4_sign"};
+  const std::array<std::string, 2> elbow_state_names_{"joint_3_position", "joint_4_sign"};
 
   const size_t full_command_interface_size_{18};
   const size_t command_interface_size_{16};
@@ -162,10 +163,11 @@ class FrankaCartesianPoseInterface
 
   bool command_elbow_active_;
 
-  const std::string cartesian_pose_command_interface_name_{"cartesian_pose"};
+  const std::string cartesian_pose_command_interface_name_{"cartesian_pose_command"};
   const std::string elbow_command_interface_name_{"elbow_command"};
-  const std::string cartesian_initial_pose_state_interface_name_{"initial_cartesian_pose"};
-  const std::string elbow_initial_state_interface_name_{"initial_elbow_state"};
+
+  const std::string cartesian_pose_state_interface_name_{"cartesian_pose_state"};
+  const std::string elbow_state_interface_name_{"elbow_state"};
 };
 
 }  // namespace franka_semantic_components
