@@ -56,10 +56,10 @@ controller_interface::return_type JointPositionExampleController::update(
       initial_q_.at(i) = state_interfaces_[i].get_value();
     }
     initialization_flag_ = false;
-    initial_robot_time_ = state_interfaces_[num_joints].get_value();
+    initial_robot_time_ = state_interfaces_.back().get_value();
     elapsed_time_ = 0.0;
   } else {
-    robot_time_ = state_interfaces_[num_joints].get_value();
+    robot_time_ = state_interfaces_.back().get_value();
     elapsed_time_ = robot_time_ - initial_robot_time_;
   }
 

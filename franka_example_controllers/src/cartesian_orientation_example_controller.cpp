@@ -39,6 +39,7 @@ CartesianOrientationExampleController::state_interface_configuration() const {
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   config.names = franka_cartesian_pose_->get_state_interface_names();
 
+  config.names.push_back(arm_id_ + "/robot_time");
   return config;
 }
 
@@ -48,11 +49,15 @@ controller_interface::return_type CartesianOrientationExampleController::update(
   if (initialization_flag_) {
     std::tie(orientation_, position_) =
         franka_cartesian_pose_->getCurrentOrientationAndTranslation();
+    initial_robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = 0.0;
 
     initialization_flag_ = false;
+  } else {
+    robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = robot_time_ - initial_robot_time_;
   }
 
-  elapsed_time_ = elapsed_time_ + trajectory_period_;
   double angle = M_PI / 8 * (1 - std::cos(M_PI / 5.0 * elapsed_time_));
 
   Eigen::Quaterniond new_orientation;
@@ -96,6 +101,20 @@ CallbackReturn CartesianOrientationExampleController::on_configure(
   } else {
     RCLCPP_INFO(get_node()->get_logger(), "Default collision behavior set.");
   }
+
+  auto parameters_client =
+      std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "/robot_state_publisher");
+  parameters_client->wait_for_service();
+
+  auto future = parameters_client->get_parameters({"robot_description"});
+  auto result = future.get();
+  if (!result.empty()) {
+    robot_description_ = result[0].value_to_string();
+  } else {
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter.");
+  }
+
+  arm_id_ = robot_utils::getRobotNameFromDescription(robot_description_, get_node()->get_logger());
 
   return CallbackReturn::SUCCESS;
 }

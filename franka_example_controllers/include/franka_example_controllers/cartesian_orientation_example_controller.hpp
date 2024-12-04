@@ -20,6 +20,7 @@
 #include <controller_interface/controller_interface.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <franka_example_controllers/robot_utils.hpp>
 #include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -47,11 +48,14 @@ class CartesianOrientationExampleController : public controller_interface::Contr
 
   Eigen::Quaterniond orientation_;
   Eigen::Vector3d position_;
-  double trajectory_period_{0.001};
   const bool k_elbow_activated_{false};
   bool initialization_flag_{true};
 
   double elapsed_time_{0.0};
+  double initial_robot_time_{0.0};
+  double robot_time_{0.0};
+  std::string robot_description_;
+  std::string arm_id_;
 };
 
 }  // namespace franka_example_controllers

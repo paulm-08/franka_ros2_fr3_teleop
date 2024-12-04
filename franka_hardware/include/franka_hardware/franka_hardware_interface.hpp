@@ -77,7 +77,6 @@ class FrankaHardwareInterface : public hardware_interface::SystemInterface {
   bool first_position_update_{true};
   bool first_cartesian_pose_update_{true};
   bool initial_robot_state_update_{true};
-  bool update_robot_time_{true};
   double robot_time_state_{0.0};
 
   std::shared_ptr<Robot> robot_;

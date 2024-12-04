@@ -49,7 +49,6 @@ class CartesianPoseExampleController : public controller_interface::ControllerIn
   Eigen::Quaterniond orientation_;
   Eigen::Vector3d position_;
 
-  double trajectory_period_{0.001};
   const bool k_elbow_activated_{false};
   bool initialization_flag_{true};
 

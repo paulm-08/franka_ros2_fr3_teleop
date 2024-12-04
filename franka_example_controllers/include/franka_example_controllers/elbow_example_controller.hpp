@@ -19,6 +19,7 @@
 #include <controller_interface/controller_interface.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <franka_example_controllers/robot_utils.hpp>
 #include <franka_semantic_components/franka_cartesian_velocity_interface.hpp>
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -49,7 +50,10 @@ class ElbowExampleController : public controller_interface::ControllerInterface 
   bool initialization_flag_{true};
   std::array<double, 2> initial_elbow_configuration_{0.0, 0.0};
   double elapsed_time_{0.0};
-  const double traj_frequency_{0.001};
+  double initial_robot_time_{0.0};
+  double robot_time_{0.0};
+  std::string robot_description_;
+  std::string arm_id_;
 };
 
 }  // namespace franka_example_controllers
