@@ -29,9 +29,9 @@ This package is in rapid development. Users should expect breaking changes and a
 
 ## Prerequisites
 Before installing **franka_ros2**, ensure you have the following prerequisites:
-- **ROS 2 Humble Installation:** You can install [`ros-humble-desktop`](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)  or use VSCode IDE with DevContainer. 
+- **ROS 2 Humble Installation:** You can install [`ros-humble-desktop`](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)  or use VSCode IDE with DevContainer.
 - **PREEMPT_RT Kernel (optional but recommended):** A real-time kernel is necessary for the cartesian_pose, joint_position, and elbow_position command interfaces.
-- **System-wide libfranka Installation:** 
+- **System-wide libfranka Installation:**
     - If you plan to **install from source**, a libfranka installation is required. Please refer to the [libfranka repository](https://github.com/frankaemika/libfranka) for detailed build steps.
     - If you are **using the DevContainer**, you do not need to install libfranka system-wide, as it will be included in the container.
 
@@ -81,12 +81,12 @@ export RCUTILS_COLORIZED_OUTPUT=1
 3. **Clone the Repositories and Build Packages:**
    ```bash
     source /opt/ros/humble/setup.bash
-    cd ~/franka_ros2_ws 
-    git clone https://github.com/frankaemika/franka_ros2.git src/franka_ros2 
-    git clone https://github.com/frankaemika/franka_description.git src/franka_description 
-    colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release 
+    cd ~/franka_ros2_ws
+    git clone https://github.com/frankaemika/franka_ros2.git src/franka_ros2
+    git clone https://github.com/frankaemika/franka_description.git src/franka_description
+    colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
     source install/setup.sh
-    ``` 
+    ```
 
 ### Use VSCode DevContainer
 
@@ -101,7 +101,7 @@ The `franka_ros2` package includes a `.devcontainer` folder, which allows you to
 
 2. **Clone the Repositories:**
     ```bash
-    git clone https://github.com/frankaemika/franka_ros2.git src/franka_ros2 
+    git clone https://github.com/frankaemika/franka_ros2.git src/franka_ros2
     git clone https://github.com/frankaemika/franka_description.git src/franka_description
     ```
 
@@ -113,25 +113,25 @@ The `franka_ros2` package includes a `.devcontainer` folder, which allows you to
 
 4. **Open VSCode:**
     ```bash
-    code . 
+    code .
     ```
 5. **Open the Current Folder in DevContainer:**
-    
+
     Press Ctrl + Shift + P and type: `Dev Containers: Rebuild and Reopen in Container`.
 
 
 6. **Open the Terminal in VSCode:**
-    
-    Press Ctrl + (backtick). 
+
+    Press Ctrl + (backtick).
 
 7. **Source the Environment:**
     ```bash
-    source /opt/ros/humble/setup.sh  
+    source /opt/ros/humble/setup.sh
     ```
 8. **Install the Franka ROS 2 Packages:**
     ```bash
-    colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release 
-    source install/setup.sh 
+    colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+    source install/setup.sh
     ```
 
 
@@ -140,7 +140,7 @@ The `franka_ros2` package includes a `.devcontainer` folder, which allows you to
 To verify that your setup works correctly without a robot, you can run the following command to use dummy hardware:
 
 ```bash
-ros2 launch franka_moveit_config moveit.launch.py robot_ip:=dont-care use_fake_hardware:=true
+ros2 launch franka_fr3_moveit_config moveit.launch.py robot_ip:=dont-care use_fake_hardware:=true
 ```
 
 
@@ -153,16 +153,16 @@ A real-time kernel is essential to ensure proper communication and to prevent ti
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/frankaemika/franka_ros2/blob/humble/CONTRIBUTING.md) for more details on how to contribute to this project. 
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/frankaemika/franka_ros2/blob/humble/CONTRIBUTING.md) for more details on how to contribute to this project.
 
 
-## License 
+## License
 
-All packages of franka_ros2 are licensed under the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0.html). 
- 
+All packages of franka_ros2 are licensed under the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0.html).
 
-## Contact 
 
-For questions or support, please open an issue on the [GitHub Issues](https://github.com/frankaemika/franka_ros2/issues) page. 
+## Contact
+
+For questions or support, please open an issue on the [GitHub Issues](https://github.com/frankaemika/franka_ros2/issues) page.
 
 See the [Franka Control Interface (FCI) documentation](https://frankaemika.github.io/docs) for more information.
