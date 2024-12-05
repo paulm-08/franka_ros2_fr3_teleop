@@ -115,12 +115,12 @@ class FrankaCartesianPoseInterface
    * Get the commanded orientation and translation values.
    *
    * @return std::tuple<Eigen::Quaterniond, Eigen::Vector3d> commanded orientation values in
-   * quaternion format. Initial translation values in Vector3d format [x,y,z].
+   * quaternion format. Commanded translation values in Vector3d format [x,y,z].
    */
   std::tuple<Eigen::Quaterniond, Eigen::Vector3d> getCommandedOrientationAndTranslation();
 
   /**
-   * @brief Get the initial elbow configuration
+   * @brief Get the current elbow configuration
    *
    * @throws std::runtime_error if the elbow is not activated.
    *
@@ -129,7 +129,7 @@ class FrankaCartesianPoseInterface
   std::array<double, 2> getCurrentElbowConfiguration();
 
   /**
-   * @brief Get the Initial Orientation And Translation
+   * @brief Get the current Orientation And Translation
    *
    * @return std::tuple<Eigen::Quaterniond, Eigen::Vector3d> current orientation values in
    * quaternion format. current translation values in Vector3d format [x,y,z].
@@ -137,7 +137,7 @@ class FrankaCartesianPoseInterface
   std::tuple<Eigen::Quaterniond, Eigen::Vector3d> getCurrentOrientationAndTranslation();
 
   /**
-   * @brief Get the initial pose matrix
+   * @brief Get the current pose matrix
    *
    * @return std::array<double, 16> Current pose matrix column major homogenous transformation
    */
