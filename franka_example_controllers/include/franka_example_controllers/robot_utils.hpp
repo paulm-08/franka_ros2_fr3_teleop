@@ -15,10 +15,12 @@
 #pragma once
 
 #include <tinyxml2.h>
+#include <chrono>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
 
 namespace robot_utils {
+using namespace std::chrono_literals;
 
 inline std::string getRobotNameFromDescription(const std::string& robot_description,
                                                const rclcpp::Logger& logger) {
@@ -43,5 +45,7 @@ inline std::string getRobotNameFromDescription(const std::string& robot_descript
   }
   return robot_name;
 }
+
+const auto time_out = 1000ms;
 
 }  // namespace robot_utils

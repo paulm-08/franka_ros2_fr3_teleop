@@ -23,8 +23,6 @@
 
 #include <Eigen/Eigen>
 
-using namespace std::chrono_literals;
-
 namespace franka_example_controllers {
 
 controller_interface::InterfaceConfiguration
@@ -106,7 +104,7 @@ CallbackReturn JointVelocityExampleController::on_configure(
     auto request = DefaultRobotBehavior::getDefaultCollisionBehaviorRequest();
 
     auto future_result = client->async_send_request(request);
-    future_result.wait_for(1000ms);
+    future_result.wait_for(robot_utils::time_out);
 
     auto success = future_result.get();
     if (!success) {
