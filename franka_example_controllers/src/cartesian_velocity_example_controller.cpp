@@ -14,6 +14,7 @@
 
 #include <franka_example_controllers/cartesian_velocity_example_controller.hpp>
 #include <franka_example_controllers/default_robot_behavior_utils.hpp>
+#include <franka_example_controllers/robot_utils.hpp>
 
 #include <cassert>
 #include <cmath>
@@ -21,8 +22,6 @@
 #include <string>
 
 #include <Eigen/Eigen>
-
-using namespace std::chrono_literals;
 
 namespace franka_example_controllers {
 
@@ -82,7 +81,7 @@ CallbackReturn CartesianVelocityExampleController::on_configure(
   auto request = DefaultRobotBehavior::getDefaultCollisionBehaviorRequest();
 
   auto future_result = client->async_send_request(request);
-  future_result.wait_for(1000ms);
+  future_result.wait_for(robot_utils::time_out);
 
   auto success = future_result.get();
   if (!success) {

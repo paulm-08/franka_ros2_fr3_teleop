@@ -20,8 +20,6 @@
 #include <exception>
 #include <string>
 
-using namespace std::chrono_literals;
-
 namespace franka_example_controllers {
 
 controller_interface::InterfaceConfiguration
@@ -38,7 +36,8 @@ CartesianPoseExampleController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   config.names = franka_cartesian_pose_->get_state_interface_names();
-
+  // add the robot time interface
+  config.names.push_back(arm_id_ + "/robot_time");
   return config;
 }
 
@@ -48,11 +47,16 @@ controller_interface::return_type CartesianPoseExampleController::update(
   if (initialization_flag_) {
     // Get initial orientation and translation
     std::tie(orientation_, position_) =
-        franka_cartesian_pose_->getInitialOrientationAndTranslation();
+        franka_cartesian_pose_->getCurrentOrientationAndTranslation();
+    initial_robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = 0.0;
+
     initialization_flag_ = false;
+  } else {
+    robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = robot_time_ - initial_robot_time_;
   }
 
-  elapsed_time_ = elapsed_time_ + trajectory_period_;
   double radius = 0.1;
   double angle = M_PI / 4 * (1 - std::cos(M_PI / 5.0 * elapsed_time_));
 
@@ -92,7 +96,7 @@ CallbackReturn CartesianPoseExampleController::on_configure(
   auto request = DefaultRobotBehavior::getDefaultCollisionBehaviorRequest();
 
   auto future_result = client->async_send_request(request);
-  future_result.wait_for(1000ms);
+  future_result.wait_for(robot_utils::time_out);
 
   auto success = future_result.get();
   if (!success) {
@@ -101,6 +105,20 @@ CallbackReturn CartesianPoseExampleController::on_configure(
   } else {
     RCLCPP_INFO(get_node()->get_logger(), "Default collision behavior set.");
   }
+
+  auto parameters_client =
+      std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "/robot_state_publisher");
+  parameters_client->wait_for_service();
+
+  auto future = parameters_client->get_parameters({"robot_description"});
+  auto result = future.get();
+  if (!result.empty()) {
+    robot_description_ = result[0].value_to_string();
+  } else {
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter.");
+  }
+
+  arm_id_ = robot_utils::getRobotNameFromDescription(robot_description_, get_node()->get_logger());
 
   return CallbackReturn::SUCCESS;
 }

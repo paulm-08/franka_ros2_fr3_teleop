@@ -5,7 +5,7 @@ using ::testing::_;
 TEST_F(FrankaCartesianCommandInterfaceTest, cartesian_command_interface_number_is_setup_correctly) {
   auto mock_robot = std::make_shared<MockRobot>();
   std::string arm_id{"fr3"};
- franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   const auto command_interfaces = franka_hardware_interface.export_command_interfaces();
 
@@ -25,7 +25,7 @@ TEST_P(
   auto mock_robot = std::make_shared<MockRobot>();
 
   std::string arm_id{"fr3"};
- franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -55,7 +55,7 @@ TEST_P(
 
   auto mock_robot = std::make_shared<MockRobot>();
   std::string arm_id{"fr3"};
- franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -85,7 +85,7 @@ TEST_P(
 
   auto mock_robot = std::make_shared<MockRobot>();
   std::string arm_id{"fr3"};
- franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface, stop_interface;
 
@@ -108,7 +108,7 @@ TEST_P(
 
   auto mock_robot = std::make_shared<MockRobot>();
   std::string arm_id{"fr3"};
- franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface, stop_interface;
 
@@ -133,8 +133,8 @@ TEST_F(FrankaCartesianCommandInterfaceTest,
 
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 6>{}, _)).Times(0);
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -172,8 +172,8 @@ TEST_F(FrankaCartesianCommandInterfaceTest,
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 6>{}, _)).Times(1);
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 6>{})).Times(0);
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -206,7 +206,7 @@ TEST_F(
     given_cartesian_velocity_and_elbow_set_and_elbow_has_infinite_values_when_write_called_expect_error) {
   auto mock_robot = std::make_shared<MockRobot>();
   franka::RobotState robot_state;
-  robot_state.elbow_c = std::array<double, 2>{std::numeric_limits<double>::infinity()};
+  robot_state.elbow = std::array<double, 2>{std::numeric_limits<double>::infinity()};
 
   EXPECT_CALL(*mock_robot, stopRobot());
   EXPECT_CALL(*mock_robot, initializeCartesianVelocityInterface());
@@ -215,8 +215,8 @@ TEST_F(
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 6>{}, _)).Times(0);
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 6>{})).Times(0);
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -255,8 +255,8 @@ TEST_F(FrankaCartesianCommandInterfaceTest,
   // Only cartesian velocity command
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 6>{}));
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -284,8 +284,8 @@ TEST_F(
     given_only_elbow_command_is_claimed_without_cartesian_velocity_when_perform_mode_switch_is_called_expect_error) {
   auto mock_robot = std::make_shared<MockRobot>();
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -314,8 +314,8 @@ TEST_F(
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 16>{}, _)).Times(0);
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 16>{})).Times(0);
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -342,17 +342,17 @@ TEST_F(
     given_cartesian_pose_interface_is_ready_when_write_called_with_read_robot_write_once_will_be_called) {
   auto mock_robot = std::make_shared<MockRobot>();
   franka::RobotState robot_state;
-  robot_state.O_T_EE_d = std::array<double, 16>{0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
-                                                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
+  robot_state.O_T_EE = std::array<double, 16>{0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                                              0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
 
   EXPECT_CALL(*mock_robot, stopRobot());
   EXPECT_CALL(*mock_robot, initializeCartesianPoseInterface());
 
   EXPECT_CALL(*mock_robot, readOnce()).WillOnce(testing::Return(robot_state));
-  EXPECT_CALL(*mock_robot, writeOnce(robot_state.O_T_EE_d)).Times(1);
+  EXPECT_CALL(*mock_robot, writeOnce(robot_state.O_T_EE)).Times(1);
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -380,7 +380,7 @@ TEST_F(
     given_cartesian_pose_and_elbow_set_and_elbow_has_infinite_values_when_write_called_expect_error) {
   auto mock_robot = std::make_shared<MockRobot>();
   franka::RobotState robot_state;
-  robot_state.elbow_c = std::array<double, 2>{std::numeric_limits<double>::infinity()};
+  robot_state.elbow = std::array<double, 2>{std::numeric_limits<double>::infinity()};
 
   EXPECT_CALL(*mock_robot, stopRobot());
   EXPECT_CALL(*mock_robot, initializeCartesianPoseInterface());
@@ -389,8 +389,8 @@ TEST_F(
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 16>{}, _)).Times(0);
   EXPECT_CALL(*mock_robot, writeOnce(std::array<double, 16>{})).Times(0);
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 
@@ -424,18 +424,18 @@ TEST_F(
     given_cartesian_pose_interface_is_ready_with_elbow_when_read_and_write_called_expect_correct_elbow_and_cartesian_pose) {
   auto mock_robot = std::make_shared<MockRobot>();
   franka::RobotState robot_state;
-  robot_state.O_T_EE_d = std::array<double, 16>{0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
-                                                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
-  robot_state.elbow_c = std::array<double, 2>{0.0, 2.0};
+  robot_state.O_T_EE = std::array<double, 16>{0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                                              0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
+  robot_state.elbow = std::array<double, 2>{0.0, 2.0};
 
   EXPECT_CALL(*mock_robot, stopRobot());
   EXPECT_CALL(*mock_robot, initializeCartesianPoseInterface());
 
   EXPECT_CALL(*mock_robot, readOnce()).WillOnce(testing::Return(robot_state));
-  EXPECT_CALL(*mock_robot, writeOnce(robot_state.O_T_EE_d, robot_state.elbow_c)).Times(1);
+  EXPECT_CALL(*mock_robot, writeOnce(robot_state.O_T_EE, robot_state.elbow)).Times(1);
 
- std::string arm_id{"fr3"};
-franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);;
+  std::string arm_id{"fr3"};
+  franka_hardware::FrankaHardwareInterface franka_hardware_interface(mock_robot, arm_id);
 
   std::vector<std::string> start_interface;
 

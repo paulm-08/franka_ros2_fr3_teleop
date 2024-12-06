@@ -48,20 +48,20 @@ class FrankaCartesianPoseTest : public ::testing::Test {
       elbow_state_interfaces_container;
   std::array<std::string, 2> hw_elbow_command_names_{"joint_3_position", "joint_4_sign"};
 
-  std::array<double, 16> hw_cartesian_pose_{0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
-                                            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
+  std::array<double, 16> hw_cartesian_pose_command_{0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                                                    0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
   std::array<double, 2> hw_elbow_command_{0.0, 0.0};
 
-  std::array<double, 16> initial_cartesian_pose_{1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
-                                                 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0};
-  std::array<double, 2> initial_elbow_state_{1.0, 1.0};
+  std::array<double, 16> cartesian_pose_state_{1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                                               0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+  std::array<double, 2> elbow_state_{1.0, 1.0};
 
   std::unique_ptr<FrankaCartesianPoseTestFriend> franka_cartesian_command_friend;
   std::vector<hardware_interface::LoanedCommandInterface> temp_command_interfaces;
   std::vector<hardware_interface::LoanedStateInterface> temp_state_interfaces;
 
-  const std::string cartesian_pose_command_interface_name_{"cartesian_pose"};
+  const std::string cartesian_pose_command_interface_name_{"cartesian_pose_command"};
   const std::string elbow_command_interface_name_{"elbow_command"};
-  const std::string cartesian_initial_pose_state_interface_name_{"initial_cartesian_pose"};
-  const std::string initial_elbow_state_interface_name_{"initial_elbow_state"};
+  const std::string cartesian_pose_state_interface_name_{"cartesian_pose_state"};
+  const std::string elbow_state_interface_name_{"elbow_state"};
 };

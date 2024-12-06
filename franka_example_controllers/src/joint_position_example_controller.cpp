@@ -38,16 +38,13 @@ controller_interface::InterfaceConfiguration
 JointPositionExampleController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-  if (!is_gazebo_) {
-    for (int i = 1; i <= num_joints; ++i) {
-      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/" +
-                             k_HW_IF_INITIAL_POSITION);
-    }
-  } else {
-    for (int i = 1; i <= num_joints; ++i) {
-      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
-    }
+
+  for (int i = 1; i <= num_joints; ++i) {
+    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
   }
+
+  // add the robot time interface
+  config.names.push_back(arm_id_ + "/robot_time");
   return config;
 }
 
@@ -59,9 +56,13 @@ controller_interface::return_type JointPositionExampleController::update(
       initial_q_.at(i) = state_interfaces_[i].get_value();
     }
     initialization_flag_ = false;
+    initial_robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = 0.0;
+  } else {
+    robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = robot_time_ - initial_robot_time_;
   }
 
-  elapsed_time_ = elapsed_time_ + trajectory_period;
   double delta_angle = M_PI / 16 * (1 - std::cos(M_PI / 5.0 * elapsed_time_)) * 0.2;
 
   for (int i = 0; i < num_joints; ++i) {

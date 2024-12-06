@@ -71,7 +71,6 @@ void JointImpedanceWithIKExampleController::update_joint_states() {
 }
 
 Eigen::Vector3d JointImpedanceWithIKExampleController::compute_new_position() {
-  elapsed_time_ = elapsed_time_ + trajectory_period_;
   double radius = 0.1;
 
   double angle = M_PI / 4 * (1 - std::cos(M_PI / 5.0 * elapsed_time_));
@@ -137,8 +136,14 @@ controller_interface::return_type JointImpedanceWithIKExampleController::update(
     const rclcpp::Duration& /*period*/) {
   if (initialization_flag_) {
     std::tie(orientation_, position_) =
-        franka_cartesian_pose_->getInitialOrientationAndTranslation();
+        franka_cartesian_pose_->getCurrentOrientationAndTranslation();
+
+    initial_robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = 0.0;
     initialization_flag_ = false;
+  } else {
+    robot_time_ = state_interfaces_.back().get_value();
+    elapsed_time_ = robot_time_ - initial_robot_time_;
   }
   update_joint_states();
 
@@ -252,6 +257,20 @@ CallbackReturn JointImpedanceWithIKExampleController::on_configure(
   } else {
     RCLCPP_INFO(get_node()->get_logger(), "Default collision behavior set.");
   }
+
+  auto parameters_client =
+      std::make_shared<rclcpp::AsyncParametersClient>(get_node(), "/robot_state_publisher");
+  parameters_client->wait_for_service();
+
+  auto future = parameters_client->get_parameters({"robot_description"});
+  auto result = future.get();
+  if (!result.empty()) {
+    robot_description_ = result[0].value_to_string();
+  } else {
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter.");
+  }
+
+  arm_id_ = robot_utils::getRobotNameFromDescription(robot_description_, get_node()->get_logger());
 
   return CallbackReturn::SUCCESS;
 }

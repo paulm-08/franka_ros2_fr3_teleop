@@ -37,7 +37,7 @@ class FrankaCartesianCommandInterfaceTest
   const size_t k_number_of_joints{7};
 
   const std::string k_cartesian_velocity_command_interface_name{"cartesian_velocity"};
-  const std::string k_cartesian_pose_command_interface_name{"cartesian_pose"};
+  const std::string k_cartesian_pose_command_interface_name{"cartesian_pose_command"};
   const std::string k_elbow_command_interface_name{"elbow_command"};
 };
 
@@ -49,6 +49,6 @@ INSTANTIATE_TEST_SUITE_P(
                       std::make_tuple(std::vector<std::string>{"0", "1", "2", "3", "4", "5", "6",
                                                                "7", "8", "9", "10", "11", "12",
                                                                "13", "14", "15"},
-                                      "cartesian_pose"),
+                                      "cartesian_pose_command"),
                       std::make_tuple(std::vector<std::string>{"joint_3_position", "joint_4_sign"},
                                       "elbow_command")));

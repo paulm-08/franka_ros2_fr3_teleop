@@ -47,16 +47,17 @@ FrankaCartesianPoseInterface::FrankaCartesianPoseInterface(bool command_elbow_ac
 
   for (auto i = 0U; i < 16; i++) {
     auto full_interface_name = std::to_string(i) + "/" + cartesian_pose_command_interface_name_;
-    auto state_interface_name =
-        std::to_string(i) + "/" + cartesian_initial_pose_state_interface_name_;
+    auto state_interface_name = std::to_string(i) + "/" + cartesian_pose_state_interface_name_;
     command_interface_names_.emplace_back(full_interface_name);
     state_interface_names_.emplace_back(state_interface_name);
   }
   if (command_elbow_active_) {
-    for (const auto& elbow_name : hw_elbow_names_) {
-      auto full_elbow_command_name = elbow_name + "/" + elbow_command_interface_name_;
-      auto full_elbow_state_name = elbow_name + "/" + elbow_initial_state_interface_name_;
+    for (const auto& elbow_command_name : hw_elbow_names_) {
+      auto full_elbow_command_name = elbow_command_name + "/" + elbow_command_interface_name_;
       command_interface_names_.emplace_back(full_elbow_command_name);
+    }
+    for (const auto& elbow_state_name : elbow_state_names_) {
+      auto full_elbow_state_name = elbow_state_name + "/" + elbow_state_interface_name_;
       state_interface_names_.emplace_back(full_elbow_state_name);
     }
   }
@@ -166,25 +167,25 @@ std::array<double, 2> FrankaCartesianPoseInterface::getCommandedElbowConfigurati
   return elbow_configuration;
 };
 
-std::array<double, 16> FrankaCartesianPoseInterface::getInitialPoseMatrix() {
-  std::array<double, 16> initial_pose{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+std::array<double, 16> FrankaCartesianPoseInterface::getCurrentPoseMatrix() {
+  std::array<double, 16> current_pose{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-  auto pose_configuration = get_values_state_interfaces();
+  auto pose_from_state = get_values_state_interfaces();
 
-  std::copy_n(pose_configuration.begin(), command_interface_size_, initial_pose.begin());
+  std::copy_n(pose_from_state.begin(), command_interface_size_, current_pose.begin());
 
-  return initial_pose;
+  return current_pose;
 }
 
 std::tuple<Eigen::Quaterniond, Eigen::Vector3d>
-FrankaCartesianPoseInterface::getInitialOrientationAndTranslation() {
-  std::array<double, 16> initial_pose{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+FrankaCartesianPoseInterface::getCurrentOrientationAndTranslation() {
+  std::array<double, 16> current_pose{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-  auto pose_configuration = get_values_state_interfaces();
-  std::copy_n(pose_configuration.begin(), command_interface_size_, initial_pose.begin());
+  auto pose_from_state = get_values_state_interfaces();
+  std::copy_n(pose_from_state.begin(), command_interface_size_, current_pose.begin());
 
   Eigen::Matrix4d pose =
-      Eigen::Map<Eigen::Matrix<double, 4, 4, Eigen::ColMajor>>(initial_pose.data());
+      Eigen::Map<Eigen::Matrix<double, 4, 4, Eigen::ColMajor>>(current_pose.data());
   Eigen::Quaterniond quaternion = Eigen::Quaterniond(pose.block<3, 3>(0, 0));
   Eigen::Vector3d translation = pose.block<3, 1>(0, 3);
 
@@ -204,7 +205,7 @@ FrankaCartesianPoseInterface::getCommandedOrientationAndTranslation() {
   return std::make_tuple(quaternion, translation);
 }
 
-std::array<double, 2> FrankaCartesianPoseInterface::getInitialElbowConfiguration() {
+std::array<double, 2> FrankaCartesianPoseInterface::getCurrentElbowConfiguration() {
   if (!command_elbow_active_) {
     throw std::runtime_error("Elbow command interface must be claimed to receive elbow state.");
   }

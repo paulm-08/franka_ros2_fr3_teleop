@@ -18,6 +18,7 @@
 #include <string>
 
 #include <controller_interface/controller_interface.hpp>
+#include <franka_example_controllers/robot_utils.hpp>
 #include <moveit_msgs/srv/get_position_ik.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include "franka_semantic_components/franka_cartesian_pose_interface.hpp"
@@ -93,14 +94,16 @@ class JointImpedanceWithIKExampleController : public controller_interface::Contr
   Eigen::Vector3d position_;
   rclcpp::Client<moveit_msgs::srv::GetPositionIK>::SharedPtr compute_ik_client_;
 
-  double trajectory_period_{0.001};
   const bool k_elbow_activated_{false};
   bool initialization_flag_{true};
 
   std::string arm_id_;
   bool is_gripper_loaded_ = true;
+  std::string robot_description_;
 
   double elapsed_time_{0.0};
+  double initial_robot_time_{0.0};
+  double robot_time_{0.0};
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
 
   const std::string k_robot_state_interface_name{"robot_state"};
