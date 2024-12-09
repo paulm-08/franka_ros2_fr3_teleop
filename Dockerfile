@@ -19,6 +19,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
         curl \
         git \
         openssh-client \
+        python3-colcon-argcomplete \
         sudo \
         vim \
     && rm -rf /var/lib/apt/lists/*
@@ -29,7 +30,8 @@ WORKDIR /ros2_ws
 RUN groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
     && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
-    && echo "source /opt/ros/$ROS_DISTRO/setup.bash" >> /home/$USERNAME/.bashrc
+    && echo "source /opt/ros/$ROS_DISTRO/setup.bash" >> /home/$USERNAME/.bashrc \
+    && echo "source /usr/share/colcon_argcomplete/hook/colcon-argcomplete.bash" >> /home/$USERNAME/.bashrc
     
 USER $USERNAME
 
@@ -47,4 +49,4 @@ RUN sudo chown -R $USERNAME:$USERNAME /ros2_ws \
 # Set the default shell to bash and the workdir to the source directory
 SHELL [ "/bin/bash", "-c" ]
 ENTRYPOINT []
-WORKDIR /ros2_ws/src
+WORKDIR /ros2_ws

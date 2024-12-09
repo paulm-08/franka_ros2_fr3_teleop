@@ -35,7 +35,7 @@ This package is in rapid development. Users should expect breaking changes and a
 
 
 ## Local Machine Installation
-1. *Install ROS2 Development environment*
+1. **Install ROS2 Development environment**
 
     _**franka_ros2**_ is built upon _**ROS 2 Humble**_.  
 
@@ -55,87 +55,88 @@ This package is in rapid development. Users should expect breaking changes and a
     ```bash
     sudo apt install ros-humble-dev-tools
     ```
-    Installing the **Desktop** or **Bare Bones** should automatically source the **ROS2** environment but, under some circumastances you may need to do this again:
+    Installing the **Desktop** or **Bare Bones** should automatically source the **ROS2** environment but, under some circumstances you may need to do this again:
     ```bash
     source /opt/ros/humble/setup.bash
     ```
 
-2. *Create a ROS 2 Workspace:*
+2. **Create a ROS 2 Workspace:**
    ```bash
    mkdir -p ~/franka_ros2_ws/src
-   cd ~/franka_ros2_ws  # NOT src
+   cd ~/franka_ros2_ws  # not into src
    ```
-3. *Clone the Repositories:*
+3. **Clone the Repositories:**
    ```bash
-    source /opt/ros/humble/setup.bash
-    cd ~/franka_ros2_ws
-    git clone https://github.com/frankaemika/franka_ros2.git src/franka_ros2
-    git clone https://github.com/frankaemika/franka_description.git src/franka_description
+    git clone https://github.com/frankaemika/franka_ros2.git src
     ``` 
-4. *Detect and install project dependencies*
+4. **Detect and install project dependencies**
    ```bash
    rosdep install --from-paths src --ignore-src --rosdistro humble -y
    ```
-5. *Build*
+5. **Build**
    ```bash
    # use the --symlinks option to reduce disk usage, and facilitate development.
    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
    ```
-6. *Adjust Enviroment*
+6. **Adjust Enviroment**
    ```bash
    # Adjust environment to recognize packages and dependencies in your newly built ROS 2 workspace.
    source install/setup.sh
    ```
 
 ## Docker Container Installation
-The **franka_ros2** package includes a `Dockerfile` and a `.devcontainer` directory (and also a docker-compose.yml), which allows you to use Franka ROS 2 packages without manually installing **ROS2**. 
+The **franka_ros2** package includes a `Dockerfile` and a `docker-compose.yml`, which allows you to use `franka_ros2` packages without manually installing **ROS 2**. Also, the support for Dev Containers in Visual Studio Code is provided.
 
 For detailed instructions, on preparing VSCode to use the `.devcontainer` follow the setup guide from [VSCode devcontainer_setup](https://code.visualstudio.com/docs/devcontainers/tutorial).
 
-1. **Create a ROS 2 Workspace:**
-   ```bash
-   mkdir -p franka_ros2_ws/src
-   cd franka_ros2_ws  # Not into src
-   ```
-2. **Clone the Repositories:**
+1. **Clone the Repositories:**
     ```bash
-    git clone https://github.com/frankaemika/franka_ros2.git src/franka_ros2
-    git clone https://github.com/frankaemika/franka_description.git src/franka_description
+    git clone https://github.com/frankaemika/franka_ros2.git
+    cd franka_ros2
     ```
-3. **Prepare to use the Container**
+Depending on whether you want to use Visual Studio Code's Docker support, you can follow the first part of the guide (without Visual Studio Code) or the second part (with).
 
-    Copy the .devcontainer Folder:**
+### Option 1: using Docker Compose
 
-    In order to use the provided Dockerfile, from within VSCode, you will probably want to copy the `.devcontainer` directory into the current directory
+  2. **Build the container:**
+      ```bash
+      docker compose build
+      ```
+  3. **Run the container:**
+      ```bash
+      docker compose up -d
+      ```
+  4. **Open a shell inside the container:**
+      ```bash
+      docker exec -it franka_ros2 /bin/bash
+      ```
+  5. **Build the workspace:**
+      ```bash
+      colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+      ```
+  6. **Source the built workspace:**
+      ```bash
+      source install/setup.bash
+      ```
+  7. **When you are done, you can exit the shell and delete the container**:
+      ```bash
+      docker compose down -t 0
+      ```
 
-    This step **also** ensures that both the _*franka_ros2*_ and _*franka_description*_ folders are accessible within the DevContainer environment.
-    ```bash
-    cp -r src/franka_ros2/.devcontainer .
-    ```
-4. **Open VSCode and open the Current Folder in DevContainer**
+### Option 2: using Dev Containers in Visual Studio Code
 
-5. **Rebuild and Reopen workspace within the Container**
+  2. **Open Visual Studio Code and the `franka_ros2` folder.**
 
-    Press Ctrl + Shift + P and type: `Dev Containers: Rebuild and Reopen in Container`.
+  3. **Click the button `Reopen in container` when prompted.**
 
-    > This command *should* result in the `rosdep` command being run during container build.  Subsequent opening of the container will not do this.
-
-6. **Open the Terminal in VSCode:**
-
-    Press Ctrl + (backtick). 
-7. **Source the Environment:**
-    ```bash
-    source /opt/ros/humble/setup.sh  
-    ```
-8. **Build and "local install" the Franka ROS 2 Packages:**
-    ```bash
-    colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release 
-    ```
-8. *Adjust Enviroment*
-   ```bash
-   # Adjust environment to recognize packages and dependencies in your newly built ROS 2 workspace.
-   source install/setup.sh
-   ```    
+  4. **After the container builds, open a terminal an build the workspace:**
+      ```bash
+      colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+      ```
+  5. **Source the built workspace:**
+      ```bash
+      source install/setup.bash
+      ```
 
 
 # Test the build
