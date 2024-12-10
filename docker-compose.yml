@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        - USER_UID=${UID:-1001}
-        - USER_GID=${UID:-1001}
+        - USER_UID=${USER_UID}
+        - USER_GID=${USER_GID}
     container_name: franka_ros2
     network_mode: "host"
     privileged: true
@@ -20,7 +20,6 @@ services:
     environment:
       QT_X11_NO_MITSHM: 1
       DISPLAY: $DISPLAY
-    user: ${UID:-1001}:${UID:-1001}
     cap_add:
       - SYS_NICE
     ulimits:

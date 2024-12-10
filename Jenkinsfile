@@ -27,8 +27,8 @@ pipeline {
                 sh '''
                     . /opt/ros/humble/setup.sh
                     . install/setup.sh
-                    colcon test
-                    colcon test-result
+                    colcon test --event-handlers console_direct+
+                    colcon test-result --verbose
                 '''
             }
             post {

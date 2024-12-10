@@ -107,27 +107,33 @@ For detailed instructions, on preparing VSCode to use the `.devcontainer` follow
 
 #### Option A: using Docker Compose
 
-  2. **Build the container:**
+  2. **Save the current user id into a file:**
+      ```bash
+      echo -e "USER_UID=$(id -u $USER)\nUSER_GID=$(id -g $USER)" > .env
+      ```
+      It is needed to mount the folder from inside the Docker container.
+
+  3. **Build the container:**
       ```bash
       docker compose build
       ```
-  3. **Run the container:**
+  4. **Run the container:**
       ```bash
       docker compose up -d
       ```
-  4. **Open a shell inside the container:**
+  5. **Open a shell inside the container:**
       ```bash
       docker exec -it franka_ros2 /bin/bash
       ```
-  5. **Build the workspace:**
+  6. **Build the workspace:**
       ```bash
       colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
       ```
-  6. **Source the built workspace:**
+  7. **Source the built workspace:**
       ```bash
       source install/setup.bash
       ```
-  7. **When you are done, you can exit the shell and delete the container**:
+  8. **When you are done, you can exit the shell and delete the container**:
       ```bash
       docker compose down -t 0
       ```

@@ -18,8 +18,10 @@ RUN --mount=type=cache,target=/var/cache/apt \
         bash-completion \
         curl \
         git \
+        nano \
         openssh-client \
         python3-colcon-argcomplete \
+        python3-colcon-common-extensions \
         sudo \
         vim \
     && rm -rf /var/lib/apt/lists/*
