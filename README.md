@@ -21,7 +21,7 @@
 # About
 The **franka_ros2** repository provides a **ROS 2** integration of **libfranka**, allowing efficient control of the Franka Robotics arm within the ROS 2 framework. This project is designed to facilitate robotic research and development by providing a robust interface for controlling the research versions of Franka Robotics robots.
 
-We provide a Dockerfile and docker-compose.yml files for convenience. While it is possible to build **franka_ros2** directly on your local machine, doing so requires installing some dependencies manually, while hundreds of others will be managed and installed automatically by the **ROS 2** build system (e.g., via **rosdep**). This process can result in a large number of libraries being installed directly onto your system. Using Docker encapsulates these dependencies within the container, reducing the potential for conflicts. Additionally, Docker ensures a consistent and reproducible build environment across systems. For these reasons, we recommend using Docker.
+For convenience, we provide Dockerfile and docker-compose.yml files. While it is possible to build **franka_ros2** directly on your local machine, this approach requires manual installation of certain dependencies, while many others will be automatically installed by the **ROS 2** build system (e.g., via **rosdep**). This can result in a large number of libraries being installed on your system, potentially causing conflicts. Using Docker encapsulates these dependencies within the container, minimizing such risks. Docker also ensures a consistent and reproducible build environment across systems. For these reasons, we recommend using Docker.
 
 # Caution
 This package is in rapid development. Users should expect breaking changes and are encouraged to report any bugs via [GitHub Issues page](https://github.com/frankaemika/franka_ros2/issues).
@@ -50,8 +50,13 @@ This package is in rapid development. Users should expect breaking changes and a
     - **"ROS-Base Install (Bare Bones)"** (`ros-humble-ros-base`)  
       A minimal installation that includes only the core ROS 2 libraries.  
       Suitable for resource-constrained environments or headless systems.
+
+    ```bash
+    # replace <YOUR CHOICE> with either ros-humble-desktop or ros-humble-ros-base
+    sudo apt install <YOUR CHOICE>  
+    ```
     ---
-    As discussed in the installation guide, you will need to install the **Development Tools** package:
+    Also install the **Development Tools** package:
     ```bash
     sudo apt install ros-humble-dev-tools
     ```
@@ -94,9 +99,13 @@ For detailed instructions, on preparing VSCode to use the `.devcontainer` follow
     git clone https://github.com/frankaemika/franka_ros2.git
     cd franka_ros2
     ```
-Depending on whether you want to use Visual Studio Code's Docker support, you can follow the first part of the guide (without Visual Studio Code) or the second part (with).
+    We provide separate instructions for using Docker with Visual Studio Code or the command line. Choose one of the following options:
 
-### Option 1: using Docker Compose
+    Option A: Set up and use Docker from the command line (without Visual Studio Code).
+
+    Option B: Set up and use Docker with Visual Studio Code's Docker support.
+
+#### Option A: using Docker Compose
 
   2. **Build the container:**
       ```bash
@@ -123,17 +132,21 @@ Depending on whether you want to use Visual Studio Code's Docker support, you ca
       docker compose down -t 0
       ```
 
-### Option 2: using Dev Containers in Visual Studio Code
+#### Option B: using Dev Containers in Visual Studio Code
 
-  2. **Open Visual Studio Code and the `franka_ros2` folder.**
+  2. **Open Visual Studio Code ...**
+  
+        Then, open folder  `franka_ros2`
 
-  3. **Click the button `Reopen in container` when prompted.**
+  3. **Choose `Reopen in container` when prompted.**
 
-  4. **After the container builds, open a terminal an build the workspace:**
+      The container will be built automatically, as required.
+
+  4. **Open a terminal and build the workspace:**
       ```bash
       colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
       ```
-  5. **Source the built workspace:**
+  5. **Source the built workspace environment:**
       ```bash
       source install/setup.bash
       ```
