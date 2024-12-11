@@ -9,6 +9,7 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
+  <depend>libfranka</depend>
   <depend>rclcpp</depend>
   <depend>franka_msgs</depend>
   <depend>hardware_interface</depend>

@@ -28,7 +28,6 @@ from launch import LaunchContext, LaunchDescription
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import  LaunchConfiguration
-from launch.actions import AppendEnvironmentVariable
 from launch_ros.actions import Node
 
 def get_robot_description(context: LaunchContext, arm_id, load_gripper, franka_hand):
@@ -70,7 +69,7 @@ def get_robot_description(context: LaunchContext, arm_id, load_gripper, franka_h
 
 
 
-def prepare_launch_description():
+def generate_launch_description():
     # Configure ROS nodes for launch
     load_gripper_name = 'load_gripper'
     franka_hand_name = 'franka_hand'
@@ -99,6 +98,7 @@ def prepare_launch_description():
         args=[arm_id, load_gripper, franka_hand])
 
     # Gazebo Sim
+    os.environ['GZ_SIM_RESOURCE_PATH'] = os.path.dirname(get_package_share_directory('franka_description'))
     pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
     gazebo_empty_world = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -164,14 +164,3 @@ def prepare_launch_description():
                  'rate': 30}],
         ),
     ])
-
-def generate_launch_description():
-    launch_description = prepare_launch_description()
-
-    set_env_vars_resources = AppendEnvironmentVariable(
-        'GZ_SIM_RESOURCE_PATH',
-        os.path.join(get_package_share_directory('franka_description')))
-
-    launch_description.add_action(set_env_vars_resources)
-
-    return launch_description
