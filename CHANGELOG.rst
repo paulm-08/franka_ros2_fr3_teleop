@@ -8,15 +8,16 @@ Requires libfranka >= 0.15.0 and franka_description >= 0.3.0 requires ROS 2 Humb
 
 * fix: reduced acceleration discontinuities by adding new robot_time state to franka_hardware
 *      that allows to update controllers with same time that robot uses
+*
 * BREAKING_CHANGE: initial_joint_position state removed from franka_hardware. 
-***
-***      initial_cartesian_pose and initial_elbow_state states are
-*** now  cartesian_pose_state   and elbow_state.
-***
-***      getInitialElbowConfiguration, getInitialOrientationAndTranslation and getInitialPoseMatrix are
-*** now  getCurrentElbowConfiguration, getCurrentOrientationAndTranslation and getCurrentPoseMatrix 
-***
-*** in franka_semantic_components
+*                  rename/replace functions in franka_semantic_components as follows:
+* -  initial_cartesian_pose, initial_elbow_state
+* +  cartesian_pose_state,   elbow_state.
+*
+* - getInitialElbowConfiguration, getInitialOrientationAndTranslation, getInitialPoseMatrix
+* + getCurrentElbowConfiguration, getCurrentOrientationAndTranslation, getCurrentPoseMatrix 
+*
+
 
 0.1.15 (2024-06-21)
 ------------------
