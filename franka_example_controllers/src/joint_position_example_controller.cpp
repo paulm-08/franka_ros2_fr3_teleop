@@ -44,7 +44,10 @@ JointPositionExampleController::state_interface_configuration() const {
   }
 
   // add the robot time interface
-  config.names.push_back(arm_id_ + "/robot_time");
+  if (!is_gazebo_) {
+    config.names.push_back(arm_id_ + "/robot_time");
+  }
+
   return config;
 }
 
@@ -56,11 +59,17 @@ controller_interface::return_type JointPositionExampleController::update(
       initial_q_.at(i) = state_interfaces_[i].get_value();
     }
     initialization_flag_ = false;
-    initial_robot_time_ = state_interfaces_.back().get_value();
+    if (!is_gazebo_) {
+      initial_robot_time_ = state_interfaces_.back().get_value();
+    }
     elapsed_time_ = 0.0;
   } else {
-    robot_time_ = state_interfaces_.back().get_value();
-    elapsed_time_ = robot_time_ - initial_robot_time_;
+    if (!is_gazebo_) {
+      robot_time_ = state_interfaces_.back().get_value();
+      elapsed_time_ = robot_time_ - initial_robot_time_;
+    } else {
+      elapsed_time_ += trajectory_period_;
+    }
   }
 
   double delta_angle = M_PI / 16 * (1 - std::cos(M_PI / 5.0 * elapsed_time_)) * 0.2;

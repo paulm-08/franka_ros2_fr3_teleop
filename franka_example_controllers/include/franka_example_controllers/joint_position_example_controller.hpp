@@ -49,7 +49,7 @@ class JointPositionExampleController : public controller_interface::ControllerIn
   double elapsed_time_ = 0.0;
   double initial_robot_time_ = 0.0;
   double robot_time_ = 0.0;
-
+  double trajectory_period_ = 0.001;
   bool initialization_flag_{true};
   rclcpp::Time start_time_;
 };
