@@ -71,4 +71,10 @@
             The franka model example controller evaluates and prints the dynamic model ofFranka Robotics Robots.
         </description>
     </class>
+    <class name="franka_example_controllers/GripperExampleController"
+           type="franka_example_controllers::GripperExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The Gripper example controller demonstrates the use of the Robot gripper.
+        </description>
+    </class>
 </library>

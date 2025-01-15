@@ -38,6 +38,9 @@ controller_manager:
     model_example_controller:
       type: franka_example_controllers/ModelExampleController
 
+    gripper_example_controller:
+      type: franka_example_controllers/GripperExampleController      
+
     joint_trajectory_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 

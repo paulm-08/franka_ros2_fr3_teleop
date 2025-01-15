@@ -17,6 +17,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     apt-get install -y --no-install-recommends \
         bash-completion \
         curl \
+        gdb \
         git \
         nano \
         openssh-client \
