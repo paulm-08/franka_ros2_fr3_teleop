@@ -19,6 +19,7 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
+#include "fmt/format.h"
 #include "franka_example_controllers/default_robot_behavior_utils.hpp"
 #include "franka_example_controllers/gripper_example_controller.hpp"
 
@@ -31,23 +32,12 @@ namespace franka_example_controllers {
 
 controller_interface::InterfaceConfiguration
 GripperExampleController::command_interface_configuration() const {
-  controller_interface::InterfaceConfiguration config;
-  config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-
-  for (int i = 1; i <= num_joints; ++i) {
-    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/effort");
-  }
-  return config;
+  return {};
 }
 
 controller_interface::InterfaceConfiguration
 GripperExampleController::state_interface_configuration() const {
   return {};
-}
-
-controller_interface::return_type GripperExampleController::update(const rclcpp::Time&,
-                                                                   const rclcpp::Duration&) {
-  return controller_interface::return_type::OK;
 }
 
 CallbackReturn GripperExampleController::on_init() {
@@ -63,21 +53,21 @@ CallbackReturn GripperExampleController::on_init() {
 CallbackReturn GripperExampleController::on_configure(const rclcpp_lifecycle::State&) {
   arm_id_ = get_node()->get_parameter("arm_id").as_string();
 
-  gripper_grasp_action_client_ =
-      rclcpp_action::create_client<franka_msgs::action::Grasp>(get_node(), "/fr3_gripper/grasp");
+  gripper_grasp_action_client_ = rclcpp_action::create_client<franka_msgs::action::Grasp>(
+      get_node(), fmt::format("/{}_gripper/grasp", arm_id_));
 
-  gripper_move_action_client_ =
-      rclcpp_action::create_client<franka_msgs::action::Move>(get_node(), "/fr3_gripper/move");
+  gripper_move_action_client_ = rclcpp_action::create_client<franka_msgs::action::Move>(
+      get_node(), fmt::format("/{}_gripper/move", arm_id_));
 
-  gripper_stop_client_ = get_node()->create_client<std_srvs::srv::Trigger>("/fr3_gripper/stop");
-
-  std::string urdf_path =
-      ament_index_cpp::get_package_share_directory("franka_description") + "/urdfs/fr3.urdf";
-  RCLCPP_INFO(get_node()->get_logger(), "urdf_path: %s", urdf_path.c_str());
+  gripper_stop_client_ =
+      get_node()->create_client<std_srvs::srv::Trigger>(fmt::format("/{}_gripper/stop", arm_id_));
 
   assignMoveGoalOptionsCallbacks();
   assignGraspGoalOptionsCallbacks();
-  return CallbackReturn::SUCCESS;
+  return nullptr != gripper_grasp_action_client_ && nullptr != gripper_move_action_client_ &&
+                 nullptr != gripper_stop_client_
+             ? CallbackReturn::SUCCESS
+             : CallbackReturn::ERROR;
 }
 
 CallbackReturn GripperExampleController::on_activate(const rclcpp_lifecycle::State&) {
@@ -89,7 +79,7 @@ CallbackReturn GripperExampleController::on_activate(const rclcpp_lifecycle::Sta
     RCLCPP_ERROR(get_node()->get_logger(), "Grasp Action server not available after waiting.");
     return CallbackReturn::ERROR;
   }
-  // open gripper
+  // Toggle the Gripper, initially we will order it to open
   toggleGripperState();
   return CallbackReturn::SUCCESS;
 }
@@ -110,6 +100,11 @@ controller_interface::CallbackReturn GripperExampleController::on_deactivate(
     RCLCPP_ERROR(get_node()->get_logger(), "Gripper stop service is not available.");
   }
   return CallbackReturn::SUCCESS;
+}
+
+controller_interface::return_type GripperExampleController::update(const rclcpp::Time&,
+                                                                   const rclcpp::Duration&) {
+  return controller_interface::return_type::OK;
 }
 
 void GripperExampleController::assignMoveGoalOptionsCallbacks() {
@@ -173,8 +168,8 @@ void GripperExampleController::assignGraspGoalOptionsCallbacks() {
 
 void GripperExampleController::toggleGripperState() {
   /*
-  Indeed this is silly; but, it is just an example.
-  */
+   * Simply toggle the existing gripper state between open and closed.
+   */
   enum ordered_state { open, closed };
   static ordered_state ordered_gripper_state = ordered_state::closed;
 
@@ -196,8 +191,9 @@ bool GripperExampleController::openGripper() {
   move_goal.speed = 0.2;
 
   std::shared_future<std::shared_ptr<rclcpp_action::ClientGoalHandle<franka_msgs::action::Move>>>
-      fut = gripper_move_action_client_->async_send_goal(move_goal, move_goal_options_);
-  bool ret = fut.valid();
+      move_goal_handle =
+          gripper_move_action_client_->async_send_goal(move_goal, move_goal_options_);
+  bool ret = move_goal_handle.valid();
   if (ret) {
     RCLCPP_INFO(get_node()->get_logger(), "Submited a Move Goal");
   } else {
@@ -221,9 +217,10 @@ void GripperExampleController::graspGripper() {
   grasp_goal.epsilon.outer = 0.010;  // 25mm or more == fail !
 
   std::shared_future<std::shared_ptr<rclcpp_action::ClientGoalHandle<franka_msgs::action::Grasp>>>
-      fut = gripper_grasp_action_client_->async_send_goal(grasp_goal, grasp_goal_options_);
+      grasp_goal_handle =
+          gripper_grasp_action_client_->async_send_goal(grasp_goal, grasp_goal_options_);
 
-  bool ret = fut.valid();
+  bool ret = grasp_goal_handle.valid();
   if (ret) {
     RCLCPP_INFO(get_node()->get_logger(), "Submited a Grasp Goal");
   } else {
