@@ -125,7 +125,7 @@ if(BUILD_TESTING)
     if(CHECK_TIDY)
         find_package(ament_cmake_clang_tidy REQUIRED)
         set(ament_cmake_clang_tidy_CONFIG_FILE ../.clang-tidy)
-        ament_clang_tidy(${CMAKE_BINARY_DIR})
+        ament_clang_tidy(${CMAKE_BINARY_DIR} --jobs 6)
     endif()
 endif()
 
