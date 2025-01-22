@@ -6,6 +6,7 @@ Forthcoming
 
 Requires libfranka >= 0.15.0 and franka_description >= 0.3.0 requires ROS 2 Humble
 
+* feat: franka_example_controllers: Add a Franka Hand controller example (gripper_example_controller)
 * fix: reduced acceleration discontinuities by adding new robot_time state to franka_hardware
 *      that allows to update controllers with same time that robot uses
 *
