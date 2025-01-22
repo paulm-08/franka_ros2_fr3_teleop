@@ -2,5 +2,5 @@
 Changelog for package integration_launch_testing
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+1.0.0 (2025-01-22)
+------------------

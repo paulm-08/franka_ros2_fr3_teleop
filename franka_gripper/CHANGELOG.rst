@@ -2,5 +2,5 @@
 Changelog for package franka_gripper
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+1.0.0 (2025-01-22)
+------------------

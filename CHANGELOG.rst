@@ -1,15 +1,15 @@
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Changelog for package franka_ros2
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Forthcoming
------------
+v1.0.0 (2025-01-22)
+-------------------
 
 Requires libfranka >= 0.15.0 and franka_description >= 0.3.0 requires ROS 2 Humble
 
-* feat: franka_example_controllers: Add a Franka Hand controller example (gripper_example_controller)
+* feat: franka_example_controllers - Add a Franka Hand controller example (gripper_example_controller)
 * fix: reduced acceleration discontinuities by adding new robot_time state to franka_hardware
 *      that allows to update controllers with same time that robot uses
-*
+* refactor: Improved Docker image for development with VSCode
 * BREAKING_CHANGE: initial_joint_position state removed from franka_hardware. 
 *                  rename/replace functions in franka_semantic_components as follows:
 * -  initial_cartesian_pose, initial_elbow_state
