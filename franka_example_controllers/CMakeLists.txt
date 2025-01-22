@@ -15,33 +15,37 @@ option(CHECK_TIDY "Adds clang-tidy tests" OFF)
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
-find_package(rclcpp REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(controller_interface REQUIRED)
-find_package(pluginlib REQUIRED)
-find_package(rclcpp_lifecycle REQUIRED)
-find_package(hardware_interface REQUIRED)
 find_package(franka_msgs REQUIRED)
-find_package(Eigen3 REQUIRED)
 find_package(franka_semantic_components REQUIRED)
+find_package(hardware_interface REQUIRED)
 find_package(moveit_core REQUIRED)
 find_package(moveit_msgs REQUIRED)
+find_package(pinocchio REQUIRED)
+find_package(pluginlib REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 add_library(
         ${PROJECT_NAME}
         SHARED
-        src/gravity_compensation_example_controller.cpp
-        src/joint_impedance_example_controller.cpp
-        src/joint_velocity_example_controller.cpp
-        src/joint_position_example_controller.cpp
-        src/cartesian_velocity_example_controller.cpp
-        src/cartesian_pose_example_controller.cpp
-        src/joint_impedance_with_ik_example_controller.cpp
         src/cartesian_elbow_example_controller.cpp
         src/cartesian_orientation_example_controller.cpp
+        src/cartesian_pose_example_controller.cpp
+        src/cartesian_velocity_example_controller.cpp
         src/elbow_example_controller.cpp
+        src/gravity_compensation_example_controller.cpp
+        src/gripper_example_controller.cpp
+        src/joint_impedance_example_controller.cpp
+        src/joint_impedance_with_ik_example_controller.cpp
+        src/joint_position_example_controller.cpp
+        src/joint_velocity_example_controller.cpp
         src/model_example_controller.cpp
-        src/move_to_start_example_controller.cpp
-        src/motion_generator.cpp)
+        src/motion_generator.cpp
+        src/move_to_start_example_controller.cpp)
 target_include_directories(
         ${PROJECT_NAME}
         PUBLIC
@@ -51,13 +55,16 @@ target_include_directories(
 ament_target_dependencies(
         ${PROJECT_NAME}
         controller_interface
+        franka_msgs
+        franka_semantic_components
         hardware_interface
+        moveit_core
+        moveit_msgs
+        pinocchio
         pluginlib
         rclcpp
         rclcpp_lifecycle
-        franka_semantic_components
-        moveit_core
-        moveit_msgs
+        std_srvs
 )
 
 pluginlib_export_plugin_description_file(
