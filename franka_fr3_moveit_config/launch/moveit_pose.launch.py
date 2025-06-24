@@ -303,7 +303,7 @@ def generate_launch_description():
     )
 
     vive_pose_publisher = ExecuteProcess(
-        cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/vive_denso_control_publisher_new.py'],
+        cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/teleop_vive_leap_ros2.py'],
         output='screen'
     )
 
