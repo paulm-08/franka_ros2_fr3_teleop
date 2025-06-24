@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>leap_description</name>
+  <version>0.1.0</version>
+  <description>LEAP Hand robot description and meshes</description>
+  <maintainer email="maestre.paul.antoine.q8@dc.tohoku.ac.jp">Paul Maestre</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>urdf</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

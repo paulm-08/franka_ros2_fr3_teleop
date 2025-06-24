@@ -28,6 +28,7 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(realtime_tools REQUIRED)
 
 add_library(
         ${PROJECT_NAME}
@@ -65,6 +66,7 @@ ament_target_dependencies(
         rclcpp
         rclcpp_lifecycle
         std_srvs
+        realtime_tools
 )
 
 pluginlib_export_plugin_description_file(

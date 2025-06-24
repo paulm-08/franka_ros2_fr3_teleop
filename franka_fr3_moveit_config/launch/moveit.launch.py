@@ -60,9 +60,14 @@ def generate_launch_description():
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(
         fake_sensor_commands_parameter_name)
+    
+    # Get parameters for the Servo node
+    servo_yaml = load_yaml("franka_fr3_moveit_config", "config/servo_fr3.yaml")
+    if servo_yaml is None:
+        raise RuntimeError("Could not load servo_fr3.yaml from franka_fr3_moveit_config package!")
+    servo_params = servo_yaml
 
     # Command-line arguments
-
     db_arg = DeclareLaunchArgument(
         'db', default_value='False', description='Database flag'
     )
@@ -74,7 +79,7 @@ def generate_launch_description():
     )
 
     robot_description_config = Command(
-        [FindExecutable(name='xacro'), ' ', franka_xacro_file, ' hand:=true',
+        [FindExecutable(name='xacro'), ' ', franka_xacro_file, ' hand:=false',
          ' robot_ip:=', robot_ip, ' use_fake_hardware:=', use_fake_hardware,
          ' fake_sensor_commands:=', fake_sensor_commands, ' ros2_control:=true'])
 
@@ -89,7 +94,7 @@ def generate_launch_description():
 
     robot_description_semantic_config = Command(
         [FindExecutable(name='xacro'), ' ',
-         franka_semantic_xacro_file, ' hand:=true']
+         franka_semantic_xacro_file, ' hand:=false']
     )
 
     robot_description_semantic = {'robot_description_semantic': ParameterValue(
@@ -190,6 +195,7 @@ def generate_launch_description():
         'config',
         'fr3_ros_controllers.yaml',
     )
+    
     ros2_control_node = Node(
         package='controller_manager',
         executable='ros2_control_node',
@@ -243,12 +249,26 @@ def generate_launch_description():
         default_value='false',
         description="Fake sensor commands. Only valid when '{}' is true".format(
             use_fake_hardware_parameter_name))
-    gripper_launch_file = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([PathJoinSubstitution(
-            [FindPackageShare('franka_gripper'), 'launch', 'gripper.launch.py'])]),
-        launch_arguments={'robot_ip': robot_ip,
-                          use_fake_hardware_parameter_name: use_fake_hardware}.items(),
+    # gripper_launch_file = IncludeLaunchDescription(
+    #     PythonLaunchDescriptionSource([PathJoinSubstitution(
+    #         [FindPackageShare('franka_gripper'), 'launch', 'gripper.launch.py'])]),
+    #     launch_arguments={'robot_ip': robot_ip,
+    #                       use_fake_hardware_parameter_name: use_fake_hardware}.items(),
+    # )
+
+    # Servo node
+    servo_node = Node(
+        package="moveit_servo",
+        executable="servo_node_main",
+        parameters=[
+            servo_params,
+            robot_description,
+            robot_description_semantic,
+            kinematics_yaml,
+        ],
+        output="screen",
     )
+
     return LaunchDescription(
         [robot_arg,
          use_fake_hardware_arg,
@@ -260,7 +280,8 @@ def generate_launch_description():
          ros2_control_node,
          joint_state_publisher,
          franka_robot_state_broadcaster,
-         gripper_launch_file
+        #  gripper_launch_file,
+        # servo_node
          ]
         + load_controllers
     )

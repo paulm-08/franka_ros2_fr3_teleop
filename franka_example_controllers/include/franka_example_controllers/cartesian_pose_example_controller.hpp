@@ -22,6 +22,9 @@
 
 #include <franka_example_controllers/robot_utils.hpp>
 #include <franka_semantic_components/franka_cartesian_pose_interface.hpp>
+#include <realtime_tools/realtime_buffer.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
@@ -42,12 +45,26 @@ class CartesianPoseExampleController : public controller_interface::ControllerIn
   CallbackReturn on_configure(const rclcpp_lifecycle::State& previous_state) override;
   CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) override;
   CallbackReturn on_deactivate(const rclcpp_lifecycle::State& previous_state) override;
-
+  
  private:
   std::unique_ptr<franka_semantic_components::FrankaCartesianPoseInterface> franka_cartesian_pose_;
 
   Eigen::Quaterniond orientation_;
   Eigen::Vector3d position_;
+  Eigen::Vector3d target_position_;
+  Eigen::Quaterniond target_orientation_;
+  Eigen::Vector3d initial_position_;
+  Eigen::Quaterniond initial_orientation_;
+  Eigen::Vector3d pose_offset_;
+  Eigen::Quaterniond orientation_offset_;
+  bool offset_computed_ = false;
+  Eigen::Vector3d filtered_position_;
+  Eigen::Quaterniond filtered_orientation_;
+  Eigen::Vector3d filtered_velocity_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d filtered_acceleration_{Eigen::Vector3d::Zero()};
+
+  realtime_tools::RealtimeBuffer<geometry_msgs::msg::PoseStamped> pose_buffer_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
 
   const bool k_elbow_activated_{false};
   bool initialization_flag_{true};
@@ -58,5 +75,7 @@ class CartesianPoseExampleController : public controller_interface::ControllerIn
   std::string robot_description_;
   std::string arm_id_;
 };
+
+bool is_valid_pose(const geometry_msgs::msg::PoseStamped& msg);
 
 }  // namespace franka_example_controllers
