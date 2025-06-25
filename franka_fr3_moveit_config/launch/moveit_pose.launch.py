@@ -26,13 +26,14 @@ from launch.actions import (
     TimerAction,
     Shutdown
 )
-from launch.conditions import UnlessCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
     FindExecutable,
     LaunchConfiguration,
-    PathJoinSubstitution
+    PathJoinSubstitution,
+    PythonExpression
 )
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -61,6 +62,9 @@ def generate_launch_description():
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(
         fake_sensor_commands_parameter_name)
+
+    mode_param_name = 'mode'
+    mode = LaunchConfiguration(mode_param_name)
 
     # Load pose tracking PID settings
     pose_tracking_settings = load_yaml(
@@ -304,7 +308,25 @@ def generate_launch_description():
 
     vive_pose_publisher = ExecuteProcess(
         cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/teleop_vive_leap_ros2.py'],
-        output='screen'
+        output='screen',
+        condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
+    )
+
+    bag_recorder = ExecuteProcess(
+        cmd=['ros2', 'bag', 'record', '-o', '/tmp/pose_tracking_bag', '/target_pose'],
+        output='screen',
+        condition=IfCondition(PythonExpression(["'", mode, "' == 'record'"]))
+    )
+    
+    bag_replayer = TimerAction(
+        period=5.0,  # seconds
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'bag', 'play', '/tmp/pose_tracking_bag'],
+                output='screen',
+                condition=IfCondition(PythonExpression(["'", mode, "' == 'replay'"]))
+            )
+        ]
     )
 
     origin_reset_trigger = TimerAction(
@@ -332,24 +354,25 @@ def generate_launch_description():
         ]
     )
 
-    return LaunchDescription(
-        [robot_arg,
-         use_fake_hardware_arg,
-         fake_sensor_commands_arg,
-         db_arg,
-         rviz_node,
-         robot_state_publisher,
-        #  run_move_group_node,
-         ros2_control_node,
-         joint_state_publisher,
-         franka_robot_state_broadcaster,
-        #  gripper_launch_file,
-        #  servo_node,
-         pose_tracking_node,
-         process_killer,
-         vive_pose_publisher,
-         origin_reset_trigger,
-         servo_node_trigger,
-         ]
-        + load_controllers
+    return LaunchDescription([
+        robot_arg,
+        use_fake_hardware_arg,
+        fake_sensor_commands_arg,
+        db_arg,
+        rviz_node,
+        robot_state_publisher,
+        # run_move_group_node,
+        ros2_control_node,
+        joint_state_publisher,
+        franka_robot_state_broadcaster,
+        # gripper_launch_file,
+        # servo_node,
+        pose_tracking_node,
+        process_killer,
+        vive_pose_publisher,
+        origin_reset_trigger,
+        servo_node_trigger,
+        bag_recorder,
+        bag_replayer,
+    ] + load_controllers
     )
