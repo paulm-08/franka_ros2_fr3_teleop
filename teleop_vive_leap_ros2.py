@@ -30,6 +30,8 @@ from std_srvs.srv import Trigger
 # --- Configuration and Initialization ---
 target_rate = 30  # Target loop rate in Hz
 
+teleop_mode = "mirror"  # "side_to_side" or "mirror"
+
 # Open3D visualization setup
 visualize=True  # Set to True to enable Open3D visualization
 if visualize:
@@ -204,7 +206,7 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
 
         _, joint_pos, _, _ = detector.detect(rgb)
         if joint_pos is None:
-            # logger.warning(f"{hand_type} hand is not detected.")
+            logger.warning(f"{hand_type} hand is not detected.")
             pass
         else:
             retargeting_type = retargeting.optimizer.retargeting_type
@@ -249,25 +251,51 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
 
             # ['1', '0', '2', '3', '12', '13', '14', '15', '5', '4', '6', '7', '9', '8', '10', '11']
 
-            qpos_cmd[0] = qpos[1]
-            qpos_cmd[1] = qpos[0]
-            qpos_cmd[2] = qpos[2]
-            qpos_cmd[3] = qpos[3]
+            if teleop_mode == "side_to_side":
+                qpos_cmd[0] = qpos[1]
+                qpos_cmd[1] = qpos[0]
+                qpos_cmd[2] = qpos[2]
+                qpos_cmd[3] = qpos[3]
 
-            qpos_cmd[4] = qpos[9] # thumb - middle
-            qpos_cmd[5] = qpos[8]
-            qpos_cmd[6] = qpos[10]
-            qpos_cmd[7] = qpos[11]
+                qpos_cmd[4] = qpos[9] # thumb - middle
+                qpos_cmd[5] = qpos[8]
+                qpos_cmd[6] = qpos[10]
+                qpos_cmd[7] = qpos[11]
 
-            qpos_cmd[8] = qpos[13] # none
-            qpos_cmd[9] = qpos[12]
-            qpos_cmd[10] = qpos[14]
-            qpos_cmd[11] = qpos[15]
+                qpos_cmd[8] = qpos[13] # none
+                qpos_cmd[9] = qpos[12]
+                qpos_cmd[10] = qpos[14]
+                qpos_cmd[11] = qpos[15]
 
-            qpos_cmd[12] = qpos[4] # thumb - middle 
-            qpos_cmd[13] = qpos[5]
-            qpos_cmd[14] = qpos[6]
-            qpos_cmd[15] = qpos[7]
+                qpos_cmd[12] = qpos[4] # thumb - middle 
+                qpos_cmd[13] = qpos[5]
+                qpos_cmd[14] = qpos[6]
+                qpos_cmd[15] = qpos[7]
+
+            elif teleop_mode == "mirror":
+                qpos_cmd[0] = -qpos[1]
+                qpos_cmd[1] = qpos[0]
+                qpos_cmd[2] = qpos[2]
+                qpos_cmd[3] = qpos[3]
+
+                qpos_cmd[4] = -qpos[9] # thumb - middle
+                qpos_cmd[5] = qpos[8]
+                qpos_cmd[6] = qpos[10]
+                qpos_cmd[7] = qpos[11]
+
+                qpos_cmd[8] = -qpos[13] # none
+                qpos_cmd[9] = qpos[12]
+                qpos_cmd[10] = qpos[14]
+                qpos_cmd[11] = qpos[15]
+
+                qpos_cmd[12] = -qpos[4] # thumb - middle 
+                qpos_cmd[13] = qpos[5]
+                qpos_cmd[14] = qpos[6]
+                qpos_cmd[15] = qpos[7]
+            
+            else:
+                print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
+                continue
 
             # qpos_cmd[8] = qpos[8]        
 
@@ -543,7 +571,14 @@ async def main(args=None):
 
     # LEAP Hand setup
     leap_hand = LeapNode()
-    config_path = Path(__file__).resolve().parents[2] / "dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml"
+    if teleop_mode == "side_to_side":
+        config_path = Path(__file__).resolve().parents[2] / "dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml"
+    elif teleop_mode == "mirror":
+        config_path = Path(__file__).resolve().parents[2] / "dex_retargeting/configs/teleop/leap_hand_left_dexpilot.yml"
+    else:
+        print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
+        return
+    
     robot_dir = Path(__file__).resolve().parents[2] / "assets/robots/hands"
     consumer_process = multiprocessing.Process(target=start_retargeting, args=(queue, str(robot_dir), str(config_path), leap_hand))
     consumer_process.start()
@@ -569,20 +604,40 @@ async def main(args=None):
                 # VIVE: x (right), y (up), z (backward)
                 # ROS:  x (forward), y (left), z (up)
 
-                position = np.array([
-                    -pose["position"]["z"],  # ROS X = -VIVE Z (forward/backward)
-                    -pose["position"]["x"],  # ROS Y = -VIVE X (left/right)
-                    pose["position"]["y"]    # ROS Z = VIVE Y (up/down)
-                ])
+                if teleop_mode == "side_to_side":
+                    position = np.array([
+                        -pose["position"]["z"],  # ROS X = -VIVE Z (forward/backward)
+                        -pose["position"]["x"],  # ROS Y = -VIVE X (left/right)
+                        pose["position"]["y"]    # ROS Z = VIVE Y (up/down)
+                    ])
 
-                # Convert orientation (quaternion) from VIVE to ROS
-                # VIVE quaternion: [w, x, y, z]
-                orientation = np.array([
-                    -pose["orientation"]["z"],
-                    -pose["orientation"]["x"],
-                    pose["orientation"]["y"],
-                    pose["orientation"]["w"]
-                ])
+                    # Convert orientation (quaternion) from VIVE to ROS
+                    # VIVE quaternion: [w, x, y, z]
+                    orientation = np.array([
+                        -pose["orientation"]["z"],
+                        -pose["orientation"]["x"],
+                        pose["orientation"]["y"],
+                        pose["orientation"]["w"]
+                    ])
+
+                elif teleop_mode == "mirror":
+                    position = np.array([
+                        pose["position"]["z"],  # ROS X = VIVE Z (forward/backward)
+                        -pose["position"]["x"],  # ROS Y = -VIVE X (left/right)
+                        pose["position"]["y"]    # ROS Z = VIVE Y (up/down)
+                    ])
+
+                    # Convert orientation (quaternion) from VIVE to ROS
+                    # VIVE quaternion: [w, x, y, z]
+                    orientation = np.array([
+                        pose["orientation"]["z"],
+                        -pose["orientation"]["x"],
+                        -pose["orientation"]["y"],
+                        pose["orientation"]["w"]
+                    ])
+                else:
+                    print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
+                    continue
 
                 # # Define the rotation from VIVE to ROS axes
                 # # Example: 90 deg about Y then 90 deg about Z (adjust as needed)
