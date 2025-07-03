@@ -311,13 +311,25 @@ def generate_launch_description():
         output='screen',
         condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
     )
-
-    bag_recorder = ExecuteProcess(
-        cmd=['ros2', 'bag', 'record', '-o', '/tmp/pose_tracking_bag', '/target_pose'],
+    remove_old_bag = ExecuteProcess(
+        cmd=['rm', '-rf', '/tmp/pose_tracking_bag'],
         output='screen',
         condition=IfCondition(PythonExpression(["'", mode, "' == 'record'"]))
     )
-    
+    bag_recorder = TimerAction(
+        period=5.0,  # seconds
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'ros2', 'bag', 'record', '-o', '/tmp/pose_tracking_bag',
+                    '/target_pose'],
+                output='screen',
+                condition=IfCondition(PythonExpression(["'", mode, "' == 'record'"]))
+            )
+        ]
+    )
+
+    # Bag replayer: play the bag only
     bag_replayer = TimerAction(
         period=5.0,  # seconds
         actions=[
@@ -372,6 +384,7 @@ def generate_launch_description():
         vive_pose_publisher,
         origin_reset_trigger,
         servo_node_trigger,
+        remove_old_bag,
         bag_recorder,
         bag_replayer,
     ] + load_controllers
