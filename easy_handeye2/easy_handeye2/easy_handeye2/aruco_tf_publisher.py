@@ -91,8 +91,8 @@ class ArucoTfPublisher(Node):
                     annotated_msg.header.stamp = msg.header.stamp
                     self.image_pub.publish(annotated_msg)
 
-                    self.get_logger().info(f"Published TF for marker {marker_id}")
-                    self.get_logger().info(f"Position: {tvec}, Orientation: {quat}")
+                    # self.get_logger().info(f"Published TF for marker {marker_id}")
+                    # self.get_logger().info(f"Position: {tvec}, Orientation: {quat}")
 
 
 def main(args=None):

@@ -409,7 +409,7 @@ def generate_launch_description():
         output='screen',
         parameters=[
             {'marker_id': 0,  # Change this to your marker ID
-             'marker_size': 0.15,  # Size of the marker in meters
+             'marker_size': 0.10,  # Size of the marker in meters
              'camera_frame': 'camera_link',  # Frame of the camera
              'tracking_marker_frame': 'aruco_marker_frame',  # Frame for the marker
             #  'camera_matrix': [600, 0, 320, 0, 600, 240, 0, 0, 1],  # Example camera matrix
