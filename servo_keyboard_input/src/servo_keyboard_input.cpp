@@ -243,43 +243,43 @@ int KeyboardServo::keyLoop()
         break;
       case KEYCODE_1:
         RCLCPP_DEBUG(nh_->get_logger(), "1");
-        joint_msg->joint_names.push_back("panda_joint1");
+        joint_msg->joint_names.push_back("fr3_joint1");
         joint_msg->velocities.push_back(joint_vel_cmd_);
         publish_joint = true;
         break;
       case KEYCODE_2:
         RCLCPP_DEBUG(nh_->get_logger(), "2");
-        joint_msg->joint_names.push_back("panda_joint2");
+        joint_msg->joint_names.push_back("fr3_joint2");
         joint_msg->velocities.push_back(joint_vel_cmd_);
         publish_joint = true;
         break;
       case KEYCODE_3:
         RCLCPP_DEBUG(nh_->get_logger(), "3");
-        joint_msg->joint_names.push_back("panda_joint3");
+        joint_msg->joint_names.push_back("fr3_joint3");
         joint_msg->velocities.push_back(joint_vel_cmd_);
         publish_joint = true;
         break;
       case KEYCODE_4:
         RCLCPP_DEBUG(nh_->get_logger(), "4");
-        joint_msg->joint_names.push_back("panda_joint4");
+        joint_msg->joint_names.push_back("fr3_joint4");
         joint_msg->velocities.push_back(joint_vel_cmd_);
         publish_joint = true;
         break;
       case KEYCODE_5:
         RCLCPP_DEBUG(nh_->get_logger(), "5");
-        joint_msg->joint_names.push_back("panda_joint5");
+        joint_msg->joint_names.push_back("fr3_joint5");
         joint_msg->velocities.push_back(joint_vel_cmd_);
         publish_joint = true;
         break;
       case KEYCODE_6:
         RCLCPP_DEBUG(nh_->get_logger(), "6");
-        joint_msg->joint_names.push_back("panda_joint6");
+        joint_msg->joint_names.push_back("fr3_joint6");
         joint_msg->velocities.push_back(joint_vel_cmd_);
         publish_joint = true;
         break;
       case KEYCODE_7:
         RCLCPP_DEBUG(nh_->get_logger(), "7");
-        joint_msg->joint_names.push_back("panda_joint7");
+        joint_msg->joint_names.push_back("fr3_joint7");
         joint_msg->velocities.push_back(joint_vel_cmd_);
         publish_joint = true;
         break;
