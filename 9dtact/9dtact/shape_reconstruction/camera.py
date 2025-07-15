@@ -39,7 +39,6 @@ class Camera:
         self.col_index_path = os.path.join(self.camera_calibration_dir, camera_calibration['col_index_path'])
         self.position_scale_path = os.path.join(self.camera_calibration_dir, camera_calibration['position_scale_path'])
 
-
         self.crop_img_height = camera_calibration['crop_size'][0]
         self.crop_img_width = camera_calibration['crop_size'][1]
 
@@ -58,111 +57,78 @@ class Camera:
         return self.cap.read()[1]
 
     def rectify_image(self, img):
-        img_rectify = img[self.row_index, self.col_index]
-        return img_rectify
+        return img[self.row_index, self.col_index]
 
     def crop_image(self, img):
         return img[self.height_begin:self.height_end, self.width_begin:self.width_end]
 
     def rectify_crop_image(self, img):
-        img = self.crop_image(self.rectify_image(img))
-        return img
+        return self.crop_image(self.rectify_image(img))
 
     def get_rectify_image(self):
-        img = self.rectify_image(self.get_raw_image())
-        return img
+        return self.rectify_image(self.get_raw_image())
 
     def get_rectify_crop_image(self):
-        img = self.crop_image(self.get_rectify_image())
-        return img
+        return self.crop_image(self.get_rectify_image())
 
-    def get_raw_avg_image(self):
-        global img
-        while True:
-            img = self.cap.read()[1]
-            cv2.imshow('img', img)
-            key = cv2.waitKey(1)
-            if key == ord('y'):
-                cv2.destroyWindow('img')
-                break
-            if key == ord('q'):
-                quit()
-        img_add = np.zeros_like(img, float)
-        img_number = 10
-        for i in range(img_number):
-            raw_image = self.cap.read()[1]
-            img_add += raw_image
-        img_avg = img_add / img_number
-        img_avg = img_avg.astype(np.uint8)
-        return img_avg
+    def get_raw_avg_image(self, n=10):
+        img_add = None
+        for _ in range(n):
+            ret, img = self.cap.read()
+            if not ret:
+                continue
+            if img_add is None:
+                img_add = np.zeros_like(img, dtype=np.float32)
+            img_add += img.astype(np.float32)
+        return (img_add / n).astype(np.uint8)
 
-    def get_rectify_avg_image(self):
-        global img
-        while True:
+    def get_rectify_avg_image(self, n=10):
+        img_add = None
+        for _ in range(n):
             img = self.get_rectify_image()
-            cv2.imshow('img', img)
-            key = cv2.waitKey(1)
-            if key == ord('y'):
-                cv2.destroyWindow('img')
-                break
-            if key == ord('q'):
-                quit()
-        img_add = np.zeros_like(img, float)
-        img_number = 10
-        for i in range(img_number):
-            raw_image = self.get_rectify_image()
-            img_add += raw_image
-        img_avg = img_add / img_number
-        img_avg = img_avg.astype(np.uint8)
-        return img_avg
+            if img_add is None:
+                img_add = np.zeros_like(img, dtype=np.float32)
+            img_add += img.astype(np.float32)
+        return (img_add / n).astype(np.uint8)
 
-    def get_rectify_crop_avg_image(self):
-        global img
-        while True:
+    def get_rectify_crop_avg_image(self, n=10):
+        img_add = None
+        for _ in range(n):
             img = self.get_rectify_crop_image()
-            cv2.imshow('img', img)
-            key = cv2.waitKey(1)
-            if key == ord('y'):
-                cv2.destroyWindow('img')
-                break
-            if key == ord('q'):
-                quit()
-        img_add = np.zeros_like(img, float)
-        img_number = 10
-        for i in range(img_number):
-            raw_image = self.get_rectify_crop_image()
-            img_add += raw_image
-        img_avg = img_add / img_number
-        img_avg = img_avg.astype(np.uint8)
-        return img_avg
+            if img_add is None:
+                img_add = np.zeros_like(img, dtype=np.float32)
+            img_add += img.astype(np.float32)
+        return (img_add / n).astype(np.uint8)
 
     def img_list_avg_rectify(self, img_list):
-        img_1 = cv2.imread(img_list[0])
-        img_add = np.zeros_like(img_1, float)
+        img_add = None
         for img_path in img_list:
             img = cv2.imread(img_path)
-            img_add += img
-        img_avg = img_add / len(img_list)
-        img_avg = img_avg.astype(np.uint8)
-        ref_img_avg = self.rectify_image(img_avg)
-        return ref_img_avg
+            if img_add is None:
+                img_add = np.zeros_like(img, dtype=np.float32)
+            img_add += img.astype(np.float32)
+        img_avg = (img_add / len(img_list)).astype(np.uint8)
+        return self.rectify_image(img_avg)
 
 
 if __name__ == '__main__':
-    f = open("shape_config.yaml", 'r+', encoding='utf-8')
+    f = open("shape_config.yaml", 'r', encoding='utf-8')
     cfg = yaml.load(f, Loader=yaml.FullLoader)
     camera = Camera(cfg)
+
     while True:
         raw_img = camera.get_raw_image()
         cv2.imshow('raw_img', raw_img)
-        raw_img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
-        cv2.imshow('raw_img_GRAY', raw_img_GRAY)
+        cv2.imshow('raw_img_GRAY', cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY))
+
         rectify_img = camera.get_rectify_image()
         cv2.imshow('rectify_img', rectify_img)
+
         rectify_crop_img = camera.get_rectify_crop_image()
         cv2.imshow('rectify_crop_img', rectify_crop_img)
-        rectify_crop_GRAY = cv2.cvtColor(rectify_crop_img, cv2.COLOR_BGR2GRAY)
-        cv2.imshow('rectify_crop_GRAY', rectify_crop_GRAY)
-        key = cv2.waitKey(1)
-        if key == ord('q'):
+        cv2.imshow('rectify_crop_GRAY', cv2.cvtColor(rectify_crop_img, cv2.COLOR_BGR2GRAY))
+
+        if cv2.waitKey(1) == ord('q'):
             break
+
+    cv2.destroyAllWindows()

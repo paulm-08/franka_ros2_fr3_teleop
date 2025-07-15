@@ -67,7 +67,7 @@ class ShapeReconstructionNode(Node):
         return height_map
 
     def reconstruction_callback(self, msg):
-        self.get_logger().info("Received new image for reconstruction.")
+        # self.get_logger().info("Received new image for reconstruction.")
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         img_GRAY = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         self.height_map = self.map(img_GRAY)
