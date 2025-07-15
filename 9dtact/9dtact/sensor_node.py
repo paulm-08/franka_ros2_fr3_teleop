@@ -44,7 +44,7 @@ class SensorPublisher(Node):
         self.ref_pub.publish(ref_msg)
 
     def timer_callback(self):
-        self.get_logger().info("Timer callback running")
+        # self.get_logger().info("Timer callback running")
         image = self.sensor.get_rectify_crop_image()
         rep_img, mix_vis = self.sensor.raw_image_2_representation(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
 

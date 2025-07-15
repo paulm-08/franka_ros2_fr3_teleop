@@ -5,8 +5,8 @@ import yaml
 import os
 
 class Sensor(Camera):
-    def __init__(self, cfg, package_share_path=None, calibrated=True, ref=None):
-        super().__init__(cfg)
+    def __init__(self, cfg, package_share_path=None, calibrated=True, ref=None, open_camera=True):
+        super().__init__(cfg, calibrated=calibrated, open_camera=open_camera)
 
         if package_share_path is None:
             from ament_index_python.packages import get_package_share_directory

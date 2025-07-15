@@ -23,7 +23,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='user',
+    maintainer='Paul Maestre',
     maintainer_email='maestre.paul.antoine.q8@dc.tohoku.ac.jp',
     description='ROS 2 interface for 9DTact sensor',
     license='MIT',
@@ -31,6 +31,7 @@ setup(
     entry_points={
         'console_scripts': [
             'sensor_node = 9dtact.sensor_node:main',
+            'shape_reconstruction_node = 9dtact.shape_reconstruction_node:main',
         ],
     },
 )

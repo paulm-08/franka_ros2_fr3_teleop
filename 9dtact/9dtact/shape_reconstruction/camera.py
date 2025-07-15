@@ -6,22 +6,23 @@ import os
 
 
 class Camera:
-    def __init__(self, cfg, calibrated=True):
+    def __init__(self, cfg, calibrated=True, open_camera=True):
         sensor_id = cfg['sensor_id']
         camera_setting = cfg['camera_setting']
-        camera_channel = camera_setting['camera_channel']
-        raw_img_width = camera_setting['resolution'][0]
-        raw_img_height = camera_setting['resolution'][1]
-        fps = camera_setting['fps']
-        self.cap = cv2.VideoCapture(camera_channel)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Failed to open camera at index {camera_channel}")
-        print('------Camera is open--------')
-
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, raw_img_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, raw_img_height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-
+        if open_camera:
+            camera_channel = camera_setting['camera_channel']
+            self.cap = cv2.VideoCapture(camera_channel)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Failed to open camera at index {camera_channel}")
+            print('------Camera is open--------')
+            raw_img_width = camera_setting['resolution'][0]
+            raw_img_height = camera_setting['resolution'][1]
+            fps = camera_setting['fps']
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, raw_img_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, raw_img_height)
+            self.cap.set(cv2.CAP_PROP_FPS, fps)
+        else:
+            self.cap = None
 
         package_share = get_package_share_directory('9dtact')
         camera_calibration = cfg['camera_calibration']
