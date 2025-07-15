@@ -335,7 +335,7 @@ def generate_launch_description():
     )
 
     vive_pose_publisher = ExecuteProcess(
-        cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/teleop_vive_leap_ros2.py'],
+        cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/teleop_vive_leap_ros2.py', f'--hand', str(hand), f'--ee_id', str(ee_id)],
         output='screen',
         condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
     )
@@ -395,10 +395,18 @@ def generate_launch_description():
     )
 
     # Launch the realsense camera node to publish frames to /tf
+
     realsense_node = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            PathJoinSubstitution([FindPackageShare("realsense2_camera"), "launch", "rs_launch.py"])
+            PathJoinSubstitution([
+                FindPackageShare("realsense2_camera"),
+                "launch",
+                "rs_launch.py"
+            ])
         ),
+        launch_arguments={
+            "serial_no": "_151422254571"  # Change this to your camera's serial number
+        }.items(),
     )
 
     # Launch the Aruco marker pose publisher
@@ -428,6 +436,14 @@ def generate_launch_description():
         }.items()
     )
 
+    # Launch the 9DTact sensor node
+    sensor_node = Node(
+        package='9dtact',
+        executable='sensor_node',
+        name='sensor_node',
+        output='screen',
+    )
+
     return LaunchDescription([
         robot_arg,
         mode_parameter,
@@ -455,5 +471,6 @@ def generate_launch_description():
         realsense_node,
         aruco_tf_publisher,
         handeye_node,
+        sensor_node
     ] + load_controllers
     )

@@ -27,10 +27,12 @@ from scipy.spatial.transform import Rotation as R
 
 from std_srvs.srv import Trigger
 
+import argparse
+
 # --- Configuration and Initialization ---
 target_rate = 30  # Target loop rate in Hz
 
-teleop_mode = "mirror"  # "side_to_side" or "mirror"
+teleop_mode = "side_to_side"  # "side_to_side" or "mirror"
 
 # Open3D visualization setup
 visualize=True  # Set to True to enable Open3D visualization
@@ -206,7 +208,7 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
 
         _, joint_pos, _, _ = detector.detect(rgb)
         if joint_pos is None:
-            logger.warning(f"{hand_type} hand is not detected.")
+            # logger.warning(f"{hand_type} hand is not detected.")
             pass
         else:
             retargeting_type = retargeting.optimizer.retargeting_type
@@ -329,11 +331,14 @@ def produce_frame(queue, camera_path=None):
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-def produce_realsense_frame(queue: multiprocessing.Queue):
+def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None):
     import pyrealsense2 as rs
 
     pipeline = rs.pipeline()
     config = rs.config()
+    if serial_number:
+        print(f"[INFO] Enabling RealSense device with serial: {serial_number}")
+        config.enable_device(serial_number)
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)  
 
     try:
@@ -543,6 +548,14 @@ class ViveToROS2Publisher(Node):
 
 # --- Main Async Loop ---
 async def main(args=None):
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--hand',type=str, default='true')
+    parser.add_argument('--ee_id', type=str, default='leap_hand')
+    parsed_args = parser.parse_args()
+    hand = parsed_args.hand
+    ee_id = parsed_args.ee_id
+
     # UDP setup
     UDP_IP = "0.0.0.0"
     UDP_PORT = 5005
@@ -560,17 +573,19 @@ async def main(args=None):
     # Camera setup (multiprocessing)
     queue = multiprocessing.Queue(maxsize=1)
     camera_path = None  # or set to your camera device
+    d405_serial_number = "218622273562"  # Replace with your D405 serial
+    producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue,d405_serial_number))
 
-    cap = cv2.VideoCapture(camera_path or 0)
-    if cap.isOpened():
-        producer_process = multiprocessing.Process(target=produce_frame, args=(queue, camera_path))
-    else:
-        print("[INFO] Webcam not found, trying RealSense D405.")
-        producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue,))
+    # cap = cv2.VideoCapture(camera_path or 0)
+    # if cap.isOpened():
+    #     producer_process = multiprocessing.Process(target=produce_frame, args=(queue, camera_path))
+    # else:
+    #     print("[INFO] Webcam not found, trying RealSense D405.")
+    #     producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue,d405_serial_number))
+    
     producer_process.start()
 
     # LEAP Hand setup
-    leap_hand = LeapNode()
     if teleop_mode == "side_to_side":
         config_path = Path(__file__).resolve().parents[2] / "dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml"
     elif teleop_mode == "mirror":
@@ -579,9 +594,18 @@ async def main(args=None):
         print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
         return
     
-    robot_dir = Path(__file__).resolve().parents[2] / "assets/robots/hands"
-    consumer_process = multiprocessing.Process(target=start_retargeting, args=(queue, str(robot_dir), str(config_path), leap_hand))
-    consumer_process.start()
+    if hand == 'true' and ee_id == "leap_hand":
+        leap_hand = LeapNode()
+        robot_dir = Path(__file__).resolve().parents[2] / "assets/robots/hands"
+        consumer_process = multiprocessing.Process(
+            target=start_retargeting,
+            args=(queue, str(robot_dir), str(config_path), leap_hand)
+        )
+        consumer_process.start()
+    else:
+        leap_hand = None
+        consumer_process = None
+        print(f"[INFO] LEAP hand control is disabled (ee_id: {ee_id})")
 
 
     loop_counter = 0
@@ -688,15 +712,25 @@ async def main(args=None):
                 await asyncio.sleep(sleep_time)
             else:
                 print(f"[WARNING] Loop took too long: {elapsed_loop:.4f} seconds, skipping sleep", flush=True)
-
+    
+    except asyncio.CancelledError:
+        print("[INFO] Shutdown requested via asyncio.CancelledError.")
+    except KeyboardInterrupt:
+        print("[INFO] Keyboard interrupt received, shutting down...")
+    except Exception as e:
+        print(f"[ERROR] An error occurred: {e}", flush=True)
+        logger.exception("Exception in main loop")
     finally:
         producer_process.terminate()
-        consumer_process.terminate()
-        cap.release()
+        if consumer_process is not None:
+            consumer_process.terminate()
+        # cap.release()
         cv2.destroyAllWindows()
         if visualize:
             vis.destroy_window()
-        rclpy.shutdown()
+        
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
