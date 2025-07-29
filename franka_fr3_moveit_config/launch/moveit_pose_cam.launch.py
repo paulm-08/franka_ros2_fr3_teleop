@@ -74,14 +74,16 @@ def generate_launch_description():
     )
 
     hand_parameter_name = 'hand'
-    hand = LaunchConfiguration('hand')
+    hand = 'true'
+    # hand = LaunchConfiguration(hand_parameter_name)
     hand_parameter = DeclareLaunchArgument(
         hand_parameter_name,
         default_value='true',
         description='true if the robot has a hand, false if it is a bare robot arm'
     )
     ee_id_parameter_name = 'ee_id'
-    ee_id = LaunchConfiguration('ee_id')
+    ee_id = 'leap_hand'  # Default end-effector ID
+    # ee_id = LaunchConfiguration(ee_id_parameter_name)
     ee_id_parameter = DeclareLaunchArgument(
         ee_id_parameter_name,
         default_value='leap_hand',
@@ -138,7 +140,7 @@ def generate_launch_description():
 
     robot_description_semantic_config = Command(
         [FindExecutable(name='xacro'), ' ',
-         franka_semantic_xacro_file, ' hand:=true ee_id:=leap_hand']
+         franka_semantic_xacro_file, ' hand:=',hand,' ee_id:=',ee_id]
     )
 
     robot_description_semantic = {'robot_description_semantic': ParameterValue(
@@ -335,10 +337,11 @@ def generate_launch_description():
     )
 
     vive_pose_publisher = ExecuteProcess(
-        cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/teleop_vive_leap_ros2.py', f'--hand', str(hand), f'--ee_id', str(ee_id)],
+        cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/teleop_vive_leap_ros2.py'],
         output='screen',
         condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
     )
+
     remove_old_bag = ExecuteProcess(
         cmd=['rm', '-rf', '/tmp/pose_tracking_bag'],
         output='screen',
@@ -444,6 +447,12 @@ def generate_launch_description():
         output='screen',
     )
 
+    recorder = ExecuteProcess(
+        cmd=['python3', '../dex-retargeting/example/vector_retargeting/tactexo_fr3_leap_recorder.py'],
+        output='screen',
+        # condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
+    )
+
     return LaunchDescription([
         robot_arg,
         mode_parameter,
@@ -464,7 +473,7 @@ def generate_launch_description():
         process_killer,
         vive_pose_publisher,
         origin_reset_trigger,
-        servo_node_trigger,
+        # servo_node_trigger,
         remove_old_bag,
         bag_recorder,
         bag_replayer,
@@ -472,5 +481,6 @@ def generate_launch_description():
         aruco_tf_publisher,
         handeye_node,
         sensor_node
+        # recorder,
     ] + load_controllers
     )

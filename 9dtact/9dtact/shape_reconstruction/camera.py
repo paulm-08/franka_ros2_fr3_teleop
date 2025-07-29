@@ -3,7 +3,7 @@ import cv2
 import yaml
 from ament_index_python.packages import get_package_share_directory
 import os
-
+import time
 
 class Camera:
     def __init__(self, cfg, calibrated=True, open_camera=True):
@@ -71,7 +71,19 @@ class Camera:
     def get_rectify_crop_image(self):
         return self.crop_image(self.get_rectify_image())
 
-    def get_raw_avg_image(self, n=10):
+    def get_raw_avg_image(self, n=10, warmup_time=4.0):
+        print(f"[INFO] Warming up camera (raw image) for {warmup_time:.1f} seconds...")
+        start_time = time.time()
+        while time.time() - start_time < warmup_time:
+            ret, img = self.cap.read()
+            if ret:
+                cv2.imshow("Reference image - Raw", img)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("[INFO] Warmup interrupted by user.")
+                break
+        cv2.destroyWindow("Reference image - Raw")
+
+        print("[INFO] Capturing averaged raw image...")
         img_add = None
         for _ in range(n):
             ret, img = self.cap.read()
@@ -82,19 +94,42 @@ class Camera:
             img_add += img.astype(np.float32)
         return (img_add / n).astype(np.uint8)
 
-    def get_rectify_avg_image(self, n=10):
+
+    def get_rectify_crop_avg_image(self, n=10, warmup_time=4.0):
+        print(f"[INFO] Warming up camera (rectify+crop) for {warmup_time:.1f} seconds...")
+        start_time = time.time()
+        while time.time() - start_time < warmup_time:
+            img = self.get_rectify_crop_image()
+            cv2.imshow("Reference image - Rectify + Crop", img)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("[INFO] Warmup interrupted by user.")
+                break
+        cv2.destroyWindow("Reference image - Rectify + Crop")
+
+        print("[INFO] Capturing averaged rectify+crop image...")
         img_add = None
         for _ in range(n):
-            img = self.get_rectify_image()
+            img = self.get_rectify_crop_image()
             if img_add is None:
                 img_add = np.zeros_like(img, dtype=np.float32)
             img_add += img.astype(np.float32)
         return (img_add / n).astype(np.uint8)
 
-    def get_rectify_crop_avg_image(self, n=10):
+    def get_rectify_avg_image(self, n=10, warmup_time=4.0):
+        print(f"[INFO] Warming up camera (rectify) for {warmup_time:.1f} seconds...")
+        start_time = time.time()
+        while time.time() - start_time < warmup_time:
+            img = self.get_rectify_image()
+            cv2.imshow("Reference image - Rectify", img)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("[INFO] Warmup interrupted by user.")
+                break
+        cv2.destroyWindow("Reference image - Rectify")
+
+        print("[INFO] Capturing averaged rectify image...")
         img_add = None
         for _ in range(n):
-            img = self.get_rectify_crop_image()
+            img = self.get_rectify_image()
             if img_add is None:
                 img_add = np.zeros_like(img, dtype=np.float32)
             img_add += img.astype(np.float32)
