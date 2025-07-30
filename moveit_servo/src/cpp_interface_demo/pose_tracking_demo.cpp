@@ -46,6 +46,9 @@
 #include <moveit_servo/servo_parameters.h>
 #include <moveit_servo/make_shared_from_pool.h>
 #include <thread>
+#include "std_srvs/srv/trigger.hpp"
+#include <chrono>
+using namespace std::chrono_literals;
 
 
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("moveit_servo.pose_tracking_demo");
@@ -135,8 +138,8 @@ int main(int argc, char** argv)
   // Subscribe to servo status (and log it when it changes)
   StatusMonitor status_monitor(node, servo_parameters->status_topic);
 
-  Eigen::Vector3d lin_tol{ 0.005, 0.005, 0.005 };
-  double rot_tol = 0.05;
+  Eigen::Vector3d lin_tol{ 0.002, 0.002, 0.002 };  // 2 mm tolerance in x, y, z
+  double rot_tol = 0.05; // 0.05 rad tolerance in angle
   
   // // Get the current EE transform
   // geometry_msgs::msg::TransformStamped current_ee_tf;
@@ -179,6 +182,41 @@ int main(int argc, char** argv)
   // resetTargetPose() can be used to clear the target pose and wait for a new one, e.g. when moving between multiple
   // waypoints
   tracker.resetTargetPose();
+
+  auto client = node->create_client<std_srvs::srv::Trigger>("/reset_tracking_origin");
+
+  // Wait for the service to be available
+  if (!client->wait_for_service(10s))  // Adjust the timeout as needed
+  {
+    RCLCPP_ERROR(node->get_logger(), "Service /reset_tracking_origin not available");
+    return 1;
+  }
+
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  auto future = client->async_send_request(request);
+
+  // Spin manually until response
+  while (rclcpp::ok() && future.wait_for(10000ms) != std::future_status::ready)
+  {
+    executor.spin_some();
+  }
+
+  if (future.valid())
+  {
+    auto response = future.get();
+    if (response->success)
+    {
+      RCLCPP_INFO(node->get_logger(), "Reset tracking origin succeeded: %s", response->message.c_str());
+    }
+    else
+    {
+      RCLCPP_WARN(node->get_logger(), "Reset tracking origin failed: %s", response->message.c_str());
+    }
+  }
+  else
+  {
+    RCLCPP_ERROR(node->get_logger(), "Future was invalid, skipping response handling.");
+  }
 
   // // Publish target pose after 10 seconds
   // rclcpp::WallRate rate(10);

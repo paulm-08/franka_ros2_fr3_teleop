@@ -24,7 +24,8 @@ from launch.actions import (
     ExecuteProcess,
     IncludeLaunchDescription,
     TimerAction,
-    Shutdown
+    Shutdown,
+    RegisterEventHandler
 )
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -35,6 +36,8 @@ from launch.substitutions import (
     PathJoinSubstitution,
     PythonExpression
 )
+from launch.event_handlers import OnProcessStart
+
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -372,19 +375,23 @@ def generate_launch_description():
         ]
     )
 
-    origin_reset_trigger = TimerAction(
-        period=4.0,  # seconds
-        actions=[
-            ExecuteProcess(
-                cmd=[
-                    'ros2', 'service', 'call',
-                    '/reset_tracking_origin',
-                    'std_srvs/srv/Trigger', '{}'
-                ],
-                output='screen'
-            )
-        ]
+    # Reset tracking origin trigger when pose tracking starts
+    origin_reset_trigger = RegisterEventHandler(
+        event_handler=OnProcessStart(
+            target_action=pose_tracking_node,
+            on_start=[
+                ExecuteProcess(
+                    cmd=[
+                        'ros2', 'service', 'call',
+                        '/reset_tracking_origin',
+                        'std_srvs/srv/Trigger', '{}'
+                    ],
+                    output='screen'
+                )
+            ]
+        )
     )
+
 
     servo_node_trigger = TimerAction(
         period=5.0,  # seconds
@@ -472,7 +479,7 @@ def generate_launch_description():
         pose_tracking_node,
         process_killer,
         vive_pose_publisher,
-        origin_reset_trigger,
+        # origin_reset_trigger,
         # servo_node_trigger,
         remove_old_bag,
         bag_recorder,
