@@ -9,6 +9,7 @@ from cv_bridge import CvBridge
 from .shape_reconstruction import Sensor
 import ament_index_python.packages
 from ament_index_python.packages import get_package_share_directory
+import numpy as np
 
 package_share = get_package_share_directory('9dtact')
 calibration_dir = os.path.join(package_share, 'shape_reconstruction', 'calibration', 'sensor_1', 'camera_calibration')
@@ -33,6 +34,7 @@ class SensorPublisher(Node):
         self.ref_pub = self.create_publisher(Image, '/rectify_crop_ref_image', 1)
         self.image_pub = self.create_publisher(Image, '/rectify_crop_image', 1)
         self.repr_pub = self.create_publisher(Image, '/deformation_representation', 1)
+        self.height_map_pub = self.create_publisher(Image, '/height_map', 1)
 
         self.publish_reference_image()
         self.timer = self.create_timer(1.0 / 30.0, self.timer_callback)  # 30 Hz
@@ -47,9 +49,16 @@ class SensorPublisher(Node):
         # self.get_logger().info("Timer callback running")
         image = self.sensor.get_rectify_crop_image()
         rep_img, mix_vis = self.sensor.raw_image_2_representation(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+        height_map = self.sensor.raw_image_2_height_map(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+        height_map = self.sensor.expand_image(height_map)
+        height_map_normalized = cv2.normalize(height_map, None, 0, 255, cv2.NORM_MINMAX)
+        height_map_uint8 = height_map_normalized.astype(np.uint8)
+        height_map_color = cv2.applyColorMap(height_map_uint8, cv2.COLORMAP_JET)
 
         cv2.imshow('rectify_crop_image', image)
         cv2.imshow('mixed_visualization', mix_vis)
+        cv2.imshow('deformation_representation', rep_img)
+        cv2.imshow('height_map', height_map_color)
         key = cv2.waitKey(1)
         if key == ord('q'):
             rclpy.shutdown()
@@ -66,6 +75,10 @@ class SensorPublisher(Node):
         rep_msg.header.frame_id = 'representation'
         self.repr_pub.publish(rep_msg)
 
+        height_map_msg = self.bridge.cv2_to_imgmsg(height_map_color, encoding='bgr8')
+        height_map_msg.header.stamp = now
+        height_map_msg.header.frame_id = 'height_map'
+        self.height_map_pub.publish(height_map_msg)
 
 def main(args=None):
     rclpy.init(args=args)

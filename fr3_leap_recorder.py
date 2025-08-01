@@ -33,6 +33,14 @@ from transforms3d.quaternions import quat2mat
 # control leap hand msg 
 from leap_hand.srv import LeapPosition, LeapPosVelEff
 
+import yaml
+from shape_reconstruction import Sensor, Visualizer
+
+from multiprocessing import Process, Manager
+import threading
+
+TACT_BASE_PATH = '/home/user/franka_ros2_ws/src/9dtact/9dtact/shape_reconstruction/'
+
 def save_frame(
     frame_id,
     out_directory,
@@ -54,6 +62,7 @@ def save_frame(
     if not color_buffer:
         print("No color buffer")
     # print("Saving frame ", frame_id)
+    
     frame_directory = os.path.join(out_directory, f"frame_{frame_id}")
     os.makedirs(frame_directory, exist_ok=True)
 
@@ -65,13 +74,13 @@ def save_frame(
         os.path.join(frame_directory, "depth_image.png"), depth_buffer[frame_id]
     )
 
-    # cv2.imwrite(
-    #     os.path.join(frame_directory, "color_image2.jpg"),
-    #     color_buffer2[frame_id],
-    # )
-    # cv2.imwrite(
-    #     os.path.join(frame_directory, "depth_image2.png"), depth_buffer2[frame_id]
-    # )
+    cv2.imwrite(
+        os.path.join(frame_directory, "color_image2.jpg"),
+        color_buffer2[frame_id],
+    )
+    cv2.imwrite(
+        os.path.join(frame_directory, "depth_image2.png"), depth_buffer2[frame_id]
+    )
 
     # # point cloud
     # o3d.io.write_point_cloud(os.path.join(frame_directory, "pc.ply"), pc_buffer[frame_id])
@@ -112,11 +121,14 @@ class RobotRecorder(Node):
     def __init__(
         self,
         total_frame,
-        out_directory=None
+        out_directory=None,
+        enable_tactile=True,
+        enable_visualization=True,
     ):
         super().__init__("TacExo_Real_Record_Data")
         self.save = True
-        self.enable_visualization = False
+        self.enable_tactile = enable_tactile
+        self.enable_visualization = enable_visualization
         self.out_directory = out_directory or "recorded_data"
         self.bridge = CvBridge()
         self.sample_rate = 20 # 20 Hz (make it a constant in hyperparameters.py or in input arguments in the furture)
@@ -172,13 +184,139 @@ class RobotRecorder(Node):
         
 
 
-        thumb_raw_sub = Subscriber(self, Image, '/rectify_crop_image')
-        index_raw_sub = Subscriber(self, Image, '/sensor_soft_04/rectify_crop_image')
-        middle_raw_sub = Subscriber(self, Image, '/sensor_soft_03/rectify_crop_image')
-        thumb_deform_sub = Subscriber(self, Image, '/deformation_representation')
-        index_deform_sub = Subscriber(self, Image, '/sensor_soft_04/deformation_representation')
-        middle_deform_sub = Subscriber(self, Image, '/sensor_soft_03/deformation_representation')
+        # thumb_raw_sub = Subscriber(self, Image, '/rectify_crop_image')
+        # index_raw_sub = Subscriber(self, Image, '/sensor_soft_04/rectify_crop_image')
+        # middle_raw_sub = Subscriber(self, Image, '/sensor_soft_03/rectify_crop_image')
+        # thumb_deform_sub = Subscriber(self, Image, '/deformation_representation')
+        # index_deform_sub = Subscriber(self, Image, '/sensor_soft_04/deformation_representation')
+        # middle_deform_sub = Subscriber(self, Image, '/sensor_soft_03/deformation_representation')
 
+        # Tactile sensors
+        if self.enable_tactile:
+            # tactile configuration loading and init
+            # thumb_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_tacexo_thumb.yaml")
+            thumb_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config.yaml")
+
+            # assert the path exists
+            if not os.path.exists(thumb_cfg_path):
+                raise FileNotFoundError(f"Configuration file not found: {thumb_cfg_path}")
+            thumb_f = open(thumb_cfg_path, 'r+', encoding='utf-8')
+            thumb_cfg = yaml.load(thumb_f, Loader=yaml.FullLoader)
+            self.thumb_tactile_sensor = Sensor(thumb_cfg)
+            # self.thumb_tactile_vis  = Visualizer(self.thumb_tactile_sensor.points)
+
+            index_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_tacexo_index.yaml")
+            index_f = open(index_cfg_path, 'r+', encoding='utf-8')
+            index_cfg = yaml.load(index_f, Loader=yaml.FullLoader)
+            self.index_tactile_sensor = Sensor(index_cfg)
+            # self.index_tactile_vis  = Visualizer(self.index_tactile_sensor.points)
+
+            middle_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_tacexo_middle.yaml")
+            middle_f = open(middle_cfg_path, 'r+', encoding='utf-8')
+            middle_cfg = yaml.load(middle_f, Loader=yaml.FullLoader)
+            self.middle_tactile_sensor = Sensor(middle_cfg)
+            # self.middle_tactile_vis  = Visualizer(self.middle_tactile_sensor.points)
+
+            self.thumb_points = []
+            self.index_points = []
+            self.middle_points = []
+
+            self.thumb_height_map = []
+            self.index_height_map = []
+            self.middle_height_map = []
+
+            self.thumb_heat_map = []
+            self.index_heat_map = []
+            self.middle_heat_map = []
+
+            self.tac_thumb_lock = threading.Lock()
+            self.tac_index_lock = threading.Lock()
+            self.tac_middle_lock = threading.Lock()
+            self.tac_main_lock = threading.Lock()
+
+            # Start threads for each tactile sensor
+            self.start_tac_processing()
+
+    def process_tactile_data(self, sensor, img_size):
+        heat_map = []
+        raw_img = []
+        points = []
+    
+        raw_img = sensor.get_rectify_crop_image()
+        img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
+        height_map = sensor.raw_image_2_height_map(img_GRAY)
+        height_map = sensor.expand_image(height_map)
+        heat_map_input = cv2.normalize(height_map, None, 0, 255, cv2.NORM_MINMAX)
+        heat_map_input = np.uint8(heat_map_input)
+        heat_map = cv2.applyColorMap(heat_map_input, cv2.COLORMAP_JET)
+        # Add subtitles to each image
+        cv2.putText(heat_map, "Thumb", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        # Resize images for display
+        target_size = img_size
+        heat_map = cv2.resize(heat_map, target_size, interpolation=cv2.INTER_LINEAR)
+        points, gradients = sensor.height_map_2_point_cloud_gradients(height_map)
+
+        return raw_img, points, heat_map
+
+    def process_thumb_tactile(self):
+        # Process thumb tactile data
+        # cal procssing time
+        
+        while True:
+            # start_time = time.time()
+            thumb_raw_img, thumb_points, thumb_heat_map = self.process_tactile_data(self.thumb_tactile_sensor, (640, 480))
+            # print(f"Thumb processing time: {time.time() - start_time:.4f} seconds")
+
+            with self.tac_thumb_lock:
+                self.thumb_raw_img = thumb_raw_img
+                self.thumb_points = thumb_points
+                self.thumb_heat_map = thumb_heat_map
+
+    def process_index_tactile(self):
+        # Process index tactile data
+        while True:
+            index_raw_img, index_points, index_heat_map = self.process_tactile_data(self.index_tactile_sensor, (640, 480))
+
+            with self.tac_index_lock:
+                self.index_raw_img = index_raw_img
+                self.index_points = index_points
+                self.index_heat_map = index_heat_map
+    
+    def process_middle_tactile(self):
+        # Process middle tactile data
+        while True:
+            middle_raw_img, middle_points, middle_heat_map = self.process_tactile_data(self.middle_tactile_sensor, (640, 480))
+
+            with self.tac_middle_lock:
+                self.middle_raw_img = middle_raw_img
+                self.middle_points = middle_points
+                self.middle_heat_map = middle_heat_map
+
+    def start_tac_processing(self):
+        # Start threads for each tactile sensor
+        self.thumb_thread = threading.Thread(target=self.process_thumb_tactile)
+        self.thumb_thread.start()
+        self.index_thread = threading.Thread(target=self.process_index_tactile)
+        self.index_thread.start()
+        self.middle_thread = threading.Thread(target=self.process_middle_tactile)
+        self.middle_thread.start()
+
+
+    def close_tac_processing(self):
+        # Close threads for each tactile sensor
+        self.thumb_thread.join()
+        self.index_thread.join()
+        self.middle_thread.join()
+
+
+
+            # # Stack images horizontally (ensure same size)
+            # heatmap_canvas = cv2.hconcat([thumb_heatmap, index_heatmap, middle_heatmap])
+
+            # # Show all in one window
+            # cv2.imshow("Tactile Heatmaps", heatmap_canvas)
+
+            # cv2.waitKey(1)
 
         self.joint_positions = np.zeros(6)
         self.leap_hand_positions = np.zeros(16)
@@ -229,8 +367,8 @@ class RobotRecorder(Node):
         ])
         self.camfront2robot = self.camfront2robot @ T
 
-        cam_side_translation = [0.8191031027617821, 0.7523905863952166, 0.5717842949076667]
-        cam_side_quaternion = [0.6814160180896522, 0.17193089301379363, 0.20154558868356742, -0.6822692679584189]  # [w, x, y, z]
+        cam_side_translation = [1.021937584648497, -0.023025721635462904, 0.6443127069445715]
+        cam_side_quaternion = [-0.6146708290494457, -0.6121969801948346, 0.34739950920513696, 0.3559609674669709]  # [w, x, y, z]
         # Convert quaternion to rotation matrix
         cam_side_rotation_matrix = quat2mat([cam_side_quaternion[0], cam_side_quaternion[1], cam_side_quaternion[2], cam_side_quaternion[3]])
 
@@ -267,8 +405,8 @@ class RobotRecorder(Node):
     def configure_stream(self):
         print("Configuring Realsense stream...")
         camera_serials = {
-            'camera1': '242422303461',
-            'camera2': '234222300515',
+            'camera1': '151422254571',
+            # 'camera2': '234222300515',
             # Add more cameras as needed
         }
 
@@ -290,22 +428,22 @@ class RobotRecorder(Node):
         align_to = rs.stream.color     # align depth frame to color frame
         self.align = rs.align(align_to)
 
-        # Configure Camera 2
-        self.pipeline_cam2 = rs.pipeline()
-        config2 = rs.config()
-        config2.enable_device(camera_serials['camera2'])
-        config2.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-        config2.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        pipeline_profile2 = self.pipeline_cam2.start(config2)
-        print(f"Started streaming from Camera 2 with serial number {camera_serials['camera2']}")
+        # # Configure Camera 2
+        # self.pipeline_cam2 = rs.pipeline()
+        # config2 = rs.config()
+        # config2.enable_device(camera_serials['camera2'])
+        # config2.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        # config2.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        # pipeline_profile2 = self.pipeline_cam2.start(config2)
+        # print(f"Started streaming from Camera 2 with serial number {camera_serials['camera2']}")
 
-        # Get intrinsics for Camera 2
-        self.intrinsics2 = pipeline_profile2.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        self.intrinsics_cam2 = self.intrinsics2
-        print(f"Intrinsics for Camera 2: {self.intrinsics2}")
+        # # Get intrinsics for Camera 2
+        # self.intrinsics2 = pipeline_profile2.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        # self.intrinsics_cam2 = self.intrinsics2
+        # print(f"Intrinsics for Camera 2: {self.intrinsics2}")
 
-        # Align depth to color frame for Camera 2
-        self.align_cam2 = rs.align(rs.stream.color)
+        # # Align depth to color frame for Camera 2
+        # self.align_cam2 = rs.align(rs.stream.color)
 
         self.vis = None
 
@@ -510,7 +648,7 @@ class RobotRecorder(Node):
         time.sleep(1)
         self.first_frame = True
         o3d_depth_intrinsic = o3d.camera.PinholeCameraIntrinsic(self.intrinsics.width, self.intrinsics.height, self.intrinsics.fx, self.intrinsics.fy, self.intrinsics.ppx, self.intrinsics.ppy)
-        o3d_depth_intrinsic2 = o3d.camera.PinholeCameraIntrinsic(self.intrinsics2.width, self.intrinsics2.height, self.intrinsics2.fx, self.intrinsics2.fy, self.intrinsics2.ppx, self.intrinsics2.ppy)
+        # o3d_depth_intrinsic2 = o3d.camera.PinholeCameraIntrinsic(self.intrinsics2.width, self.intrinsics2.height, self.intrinsics2.fx, self.intrinsics2.fy, self.intrinsics2.ppx, self.intrinsics2.ppy)
 
         try:
             while frame_count < self.total_frame:
@@ -531,9 +669,9 @@ class RobotRecorder(Node):
 
 
                 rgbd, self.depth, self.color = self.get_rgbd_frame_from_realsense(enable_visualization=self.enable_visualization)
-                rgbd2, self.depth2, self.color2 = self.get_rgbd_frame_from_realsense_cam2(enable_visualization=self.enable_visualization)
+                # rgbd2, self.depth2, self.color2 = self.get_rgbd_frame_from_realsense_cam2(enable_visualization=self.enable_visualization)
                 self.pc = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, o3d_depth_intrinsic)
-                self.pc2 = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd2, o3d_depth_intrinsic2)
+                # self.pc2 = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd2, o3d_depth_intrinsic2)
                 self.pc.transform(self.camfront2robot)
                 # self.pc2.transform(self.camside2robot)
 
@@ -541,9 +679,9 @@ class RobotRecorder(Node):
                 if self.first_frame:
                     if self.enable_visualization:
                         pcd_vis = self.pc
-                        pcd_vis2 = self.pc2
+                        # pcd_vis2 = self.pc2
                         self.vis.add_geometry(pcd_vis)
-                        self.vis.add_geometry(pcd_vis2)
+                        # self.vis.add_geometry(pcd_vis2)
 
                         robot_base = o3d.geometry.TriangleMesh.create_coordinate_frame(
                             size=0.2
@@ -554,10 +692,10 @@ class RobotRecorder(Node):
                     if self.enable_visualization:
                         pcd_vis.points = self.pc.points
                         pcd_vis.colors = self.pc.colors
-                        pcd_vis2.points = self.pc2.points
-                        pcd_vis2.colors = self.pc2.colors
+                        # pcd_vis2.points = self.pc2.points
+                        # pcd_vis2.colors = self.pc2.colors
                         self.vis.update_geometry(pcd_vis)
-                        self.vis.update_geometry(pcd_vis2)
+                        # self.vis.update_geometry(pcd_vis2)
                         self.vis.poll_events()
                         self.vis.update_renderer()
                         

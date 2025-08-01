@@ -1,3 +1,6 @@
+import sys
+sys.path.insert(0, "/home/user/dex-retargeting")  # Adjust to actual repo path
+
 import multiprocessing
 import asyncio
 import json
@@ -29,10 +32,16 @@ from std_srvs.srv import Trigger
 
 import argparse
 
+import pyrealsense2 as rs
+
+
 # --- Configuration and Initialization ---
 target_rate = 30  # Target loop rate in Hz
 
 teleop_mode = "side_to_side"  # "side_to_side" or "mirror"
+
+hand = True  # Whether to use a hand
+ee_id = "leap_hand"  # End effector ID
 
 # Open3D visualization setup
 visualize=True  # Set to True to enable Open3D visualization
@@ -153,8 +162,16 @@ class LeapNode:
         self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.kI, 82, 2) # Igain
         self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.kD, 80, 2) # Dgain damping
         self.dxl_client.sync_write([0,4,8], np.ones(3) * (self.kD * 0.75), 80, 2) # Dgain damping for side to side should be a bit less
+
+
         #Max at current (in unit 1ma) so don't overheat and grip too hard #500 normal or #350 for lite
         self.dxl_client.sync_write(motors, np.ones(len(motors)) * self.curr_lim, 102, 2)
+
+        # pinch_motors = [1, 2, 3, 13, 14, 15] # Motors for pinch fingers
+        # self.dxl_client.sync_write(pinch_motors, np.ones(len(pinch_motors)) * 1000, 84, 2)  # Higher P gain
+        # self.dxl_client.sync_write(pinch_motors, np.ones(len(pinch_motors)) * 300, 80, 2) # Higher D gain
+        # self.dxl_client.sync_write(pinch_motors, np.ones(len(pinch_motors)) * 1300, 102, 2)  # Higher current limit
+
         self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
 
     #Receive LEAP pose and directly control the robot
@@ -189,9 +206,12 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
     logger.info(f"Start retargeting with config {config_path}")
     retargeting = RetargetingConfig.load_from_file(config_path).build()
 
+    logger.info(f"Retargeting config loaded: {retargeting}")
+    logger.info(f"Retargeting type: {retargeting.optimizer.retargeting_type}")
+    logger.info(f"Num fingers: {retargeting.optimizer.num_fingers}")
+
     hand_type = "Right" if "right" in config_path.lower() else "Left"
     detector = SingleHandDetector(hand_type=hand_type, selfie=False)
-
 
     # Different robot loader may have different orders for joints
     # sapien_joint_names = [joint.get_name() for joint in robot.get_active_joints()]
@@ -220,8 +240,25 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
                 origin_indices = indices[0, :]
                 task_indices = indices[1, :]
                 ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
-            qpos = retargeting.retarget(ref_value)
+            qpos = retargeting.retarget(ref_value) # ,np.array([-0.3,-1.0])) # fixed q_pos
+            # logger.info(f"Link names: {retargeting.optimizer.link_names}\n")
+            # logger.info(f"Computed link names: {retargeting.optimizer.computed_link_names}\n")
+            # logger.info(f"Origin link names: {retargeting.optimizer.origin_link_names}\n")
+            # logger.info(f"Task link names: {retargeting.optimizer.task_link_names}\n")
+            # logger.info(f"Projected: {retargeting.optimizer.projected}\n")
+            # logger.info(f"Project index origin: {retargeting.optimizer.s2_project_index_origin}\n")
+            # logger.info(f"Project index task: {retargeting.optimizer.s2_project_index_task}\n")
+            # logger.info(f"Projected dist: {retargeting.optimizer.projected_dist}\n")
+            # logger.info(f"Target vector: {retargeting.optimizer.target_vec_dist}\n")
+            # logger.info(f"qpos: {qpos}\n")
             # print("qpos: " + ", ".join(f"{pos:.4f}" for pos in qpos))
+
+            # logger.info(f"Body position: {retargeting.optimizer.body_pos}")
+            # if retargeting.optimizer.forward_parallel_loss is not None:
+            #     logger.info(f"forward parallelism loss: {retargeting.optimizer.forward_parallel_loss}")
+            # if retargeting.optimizer.side_parallel_loss is not None:
+            #     logger.info(f"side parallelism loss: {retargeting.optimizer.side_parallel_loss}")
+            # logger.info(f"Huber distance loss: {retargeting.optimizer.huber_distance}")
 
             qpos_cmd = np.zeros(16)
             # current_pos = leaphand.read_pos()
@@ -254,25 +291,53 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
             # ['1', '0', '2', '3', '12', '13', '14', '15', '5', '4', '6', '7', '9', '8', '10', '11']
 
             if teleop_mode == "side_to_side":
-                qpos_cmd[0] = qpos[1]
-                qpos_cmd[1] = qpos[0]
-                qpos_cmd[2] = qpos[2]
-                qpos_cmd[3] = qpos[3]
+                # #Index
+                # qpos_cmd[0] = qpos[1] # rotation
+                # qpos_cmd[1] = qpos[0] # base
+                # qpos_cmd[2] = qpos[2] # middle
+                # qpos_cmd[3] = -0.3 #qpos[3]-1.4 # tip
 
-                qpos_cmd[4] = qpos[9] # thumb - middle
-                qpos_cmd[5] = qpos[8]
-                qpos_cmd[6] = qpos[10]
-                qpos_cmd[7] = qpos[11]
+                # # Middle finger
+                # qpos_cmd[4] = qpos[9] # rotation
+                # qpos_cmd[5] = qpos[8] # base
+                # qpos_cmd[6] = qpos[10] # middle
+                # qpos_cmd[7] = qpos[11]
 
-                qpos_cmd[8] = qpos[13] # none
-                qpos_cmd[9] = qpos[12]
-                qpos_cmd[10] = qpos[14]
-                qpos_cmd[11] = qpos[15]
+                # # Pinky 
+                # qpos_cmd[8] = qpos[13] # rotation
+                # qpos_cmd[9] = qpos[12] # base
+                # qpos_cmd[10] = qpos[14] # middle
+                # qpos_cmd[11] = qpos[15] # tip
 
-                qpos_cmd[12] = qpos[4] # thumb - middle 
-                qpos_cmd[13] = qpos[5]
-                qpos_cmd[14] = qpos[6]
-                qpos_cmd[15] = qpos[7]
+                # # Thumb
+                # qpos_cmd[12] = qpos[4] # base 
+                # qpos_cmd[13] = qpos[5] # rotation
+                # qpos_cmd[14] = qpos[6]#+0.3 # middle
+                # qpos_cmd[15] = -1.0 # tip
+                                
+                #Index
+                qpos_cmd[0] = qpos[1] # rotation
+                qpos_cmd[1] = qpos[0] # base
+                qpos_cmd[2] = qpos[2] # middle
+                qpos_cmd[3] = qpos[3] # tip
+
+                # Middle finger
+                qpos_cmd[4] = qpos[9] # rotation
+                qpos_cmd[5] = qpos[8] # base
+                qpos_cmd[6] = qpos[10] # middle
+                qpos_cmd[7] = qpos[11] # tip
+
+                # Pinky 
+                qpos_cmd[8] = qpos[13] # rotation
+                qpos_cmd[9] = qpos[12] # base
+                qpos_cmd[10] = qpos[14] # middle
+                qpos_cmd[11] = qpos[15] # tip
+
+                # Thumb
+                qpos_cmd[12] = qpos[4] # base 
+                qpos_cmd[13] = qpos[5] # rotation
+                qpos_cmd[14] = qpos[6] # middle
+                qpos_cmd[15] = qpos[7] # tip
 
             elif teleop_mode == "mirror":
                 qpos_cmd[0] = -qpos[1]
@@ -306,14 +371,12 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
             # print("qpos_cmd: " + ", ".join(f"{pos:.4f}" for pos in qpos_cmd))
             end_t = time.time()
             # print(f"time: {end_t - start_t:.4f} s")
-
+        
             leaphand.set_allegro(qpos_cmd)
-
 
             # print("Position: " + str(leaphand.read_pos()))
             # time.sleep(0.02)
             # a = input("test")
-
 
 # --- Camera Producer (runs in a process) ---
 def produce_frame(queue, camera_path=None):
@@ -332,7 +395,9 @@ def produce_frame(queue, camera_path=None):
             break
 
 def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None):
-    import pyrealsense2 as rs
+
+    # Initialize hand detector
+    detector = SingleHandDetector(hand_type="Right", selfie=False)
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -355,12 +420,20 @@ def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None):
             if not color_frame:
                 continue
 
-            # 轉為 numpy array
+            # Convert frame to numpy array and RGB format
             color_image = np.asanyarray(color_frame.get_data())
             rgb_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
 
+            # Detect hand keypoints
+            _,_,keypoints,_ = detector.detect(rgb_image)
+            if keypoints is not None:
+                # Draw the skeleton on the original BGR image
+                annotated_image = SingleHandDetector.draw_skeleton_on_image(color_image, keypoints, style="white")
+            else:
+                annotated_image = color_image
+
             queue.put(rgb_image)
-            cv2.imshow("RealSense", color_image)
+            cv2.imshow("RealSense", annotated_image)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
@@ -548,14 +621,6 @@ class ViveToROS2Publisher(Node):
 
 # --- Main Async Loop ---
 async def main(args=None):
-    # Parse command line arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--hand',type=str, default='true')
-    parser.add_argument('--ee_id', type=str, default='leap_hand')
-    parsed_args = parser.parse_args()
-    hand = parsed_args.hand
-    ee_id = parsed_args.ee_id
-
     # UDP setup
     UDP_IP = "0.0.0.0"
     UDP_PORT = 5005
@@ -594,7 +659,7 @@ async def main(args=None):
         print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
         return
     
-    if hand == 'true' and ee_id == "leap_hand":
+    if hand == True and ee_id == "leap_hand":
         leap_hand = LeapNode()
         robot_dir = Path(__file__).resolve().parents[2] / "assets/robots/hands"
         consumer_process = multiprocessing.Process(
