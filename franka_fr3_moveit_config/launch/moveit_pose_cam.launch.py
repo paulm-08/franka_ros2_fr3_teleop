@@ -309,6 +309,7 @@ def generate_launch_description():
     # )
 
     # Servo node
+    # This is the main node for pose tracking, not needed if using the pose tracking executable
     servo_node = Node(
         package="moveit_servo",
         executable="servo_node_main",
@@ -334,17 +335,21 @@ def generate_launch_description():
         ],
     )
     
+    # Process killer to ensure the port 5005 is free (camera)
     process_killer = ExecuteProcess(
         cmd=['fuser', '-k', '5005/udp'],
         output='screen'
     )
 
+    # Vive pose publisher
+    # This node publishes the pose of the Vive trackers to the /target_pose topic and starts the retargeting process
     vive_pose_publisher = ExecuteProcess(
-        cmd=['python3', '/home/user/dex-retargeting/example/vector_retargeting/teleop_vive_leap_ros2.py'],
+        cmd=['ros2', 'run', 'fr3_leap_teleop', 'teleop_vive_leap_ros2'],
         output='screen',
         condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
     )
 
+    # Bag recorder: record the /target_pose topic to a ROS2 bag
     remove_old_bag = ExecuteProcess(
         cmd=['rm', '-rf', '/tmp/pose_tracking_bag'],
         output='screen',
@@ -376,6 +381,8 @@ def generate_launch_description():
     )
 
     # Reset tracking origin trigger when pose tracking starts
+    # This is needed to reset the tracking origin to the current pose of the robot
+    # The trigger was moved to the pose tracking executable to ensure it is called right before the pose tracking starts, so it is not needed here
     origin_reset_trigger = RegisterEventHandler(
         event_handler=OnProcessStart(
             target_action=pose_tracking_node,
@@ -392,7 +399,8 @@ def generate_launch_description():
         )
     )
 
-
+    # Trigger servo node to start servoing after 5 seconds
+    # This is not needed if using the pose tracking executable
     servo_node_trigger = TimerAction(
         period=5.0,  # seconds
         actions=[
@@ -404,8 +412,8 @@ def generate_launch_description():
         ]
     )
 
-    # Launch the realsense camera node to publish frames to /tf
-
+    # Realsense camera node to publish frames to /tf and the images to camera topics
+    # Realsense cameras are started in the recorder process to avoid using ROS2 topics
     realsense_node = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -419,7 +427,10 @@ def generate_launch_description():
         }.items(),
     )
 
-    # Launch the Aruco marker pose publisher
+    # Aruco marker pose publisher
+    # This node publishes the pose of the ArUco marker to the /aruco_marker_frame topic
+    # It is used for hand-eye calibration, so it is not needed if you are not calibrating the camera
+    # If using an Aruco marker for the task, do it in data processing to avoid using ROS2 topics
     aruco_tf_publisher = Node(
         package='easy_handeye2',
         executable='aruco_tf_publisher',
@@ -436,7 +447,8 @@ def generate_launch_description():
         ]
     )
 
-    # Launch the easy_handeye2 hand-eye calibration publisher
+    # easy_handeye2 hand-eye calibration publisher
+    # This node publishes the transform between the camera and the robot base frame to /tf
     handeye_node = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([FindPackageShare("easy_handeye2"), "launch", "publish.launch.py"])
@@ -446,7 +458,9 @@ def generate_launch_description():
         }.items()
     )
 
-    # Launch the 9DTact sensor node
+    # 9DTact sensor node
+    # This node publishes the sensor data to the /rectify_crop_image, /deformation_representation, and /height_map topics
+    # The recording script directly gets the image from the sensor to avoid using ROS2 topics
     sensor_node = Node(
         package='9dtact',
         executable='sensor_node',
@@ -454,10 +468,12 @@ def generate_launch_description():
         output='screen',
     )
 
+    # Recorder script
+    # This script records the FR3 and LEAP hand joint states, RGB and depth images from the Realsense cameras and 9DTact sensor image 
     recorder = ExecuteProcess(
-        cmd=['python3', '../dex-retargeting/example/vector_retargeting/tactexo_fr3_leap_recorder.py'],
+        cmd=['ros2', 'run', 'fr3_leap_recorder', 'fr3_leap_recorder'],
         output='screen',
-        # condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
+        condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
     )
 
     return LaunchDescription([
@@ -481,13 +497,13 @@ def generate_launch_description():
         vive_pose_publisher,
         # origin_reset_trigger,
         # servo_node_trigger,
-        remove_old_bag,
-        bag_recorder,
-        bag_replayer,
-        realsense_node,
-        aruco_tf_publisher,
-        handeye_node,
-        sensor_node
+        # remove_old_bag,
+        # bag_recorder,
+        # bag_replayer,
+        # realsense_node,
+        # aruco_tf_publisher,
+        # handeye_node,
+        # sensor_node
         # recorder,
     ] + load_controllers
     )
