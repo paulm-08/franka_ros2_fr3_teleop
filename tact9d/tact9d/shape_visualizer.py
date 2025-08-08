@@ -9,7 +9,7 @@ class Visualizer:
         self.vis = open3d.visualization.Visualizer()
         self.vis.create_window(window_name='3D_Shape_Reconstruction', width=2000, height=1600)
 
-        package_share = get_package_share_directory('9dtact')
+        package_share = get_package_share_directory('tact9d')
         sensor_obj_dir = os.path.join(package_share, 'shape_reconstruction', 'sensor_obj')
 
         black_base = open3d.io.read_triangle_mesh(os.path.join(sensor_obj_dir, 'black_base.obj'))

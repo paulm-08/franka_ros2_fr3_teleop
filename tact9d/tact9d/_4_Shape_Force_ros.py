@@ -23,7 +23,7 @@ def wrench_callback(msg):
 
 
 if __name__ == '__main__':
-    rospy.init_node('9DTact')
+    rospy.init_node('tact9d')
     wrench_sub = rospy.Subscriber('/predicted_wrench', WrenchStamped, wrench_callback)
     representation_pub = rospy.Publisher('/deformation_representation', Image, queue_size=1)
     rate = rospy.Rate(90)

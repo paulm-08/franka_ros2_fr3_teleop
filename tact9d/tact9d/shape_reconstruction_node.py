@@ -21,7 +21,7 @@ class ShapeReconstructionNode(Node):
         self.bridge = CvBridge()
 
         config_path = os.path.join(
-            get_package_share_directory('9dtact'),
+            get_package_share_directory('tact9d'),
             'shape_reconstruction',
             'shape_config.yaml'
         )

@@ -11,7 +11,7 @@ import ament_index_python.packages
 from ament_index_python.packages import get_package_share_directory
 import numpy as np
 
-package_share = get_package_share_directory('9dtact')
+package_share = get_package_share_directory('tact9d')
 calibration_dir = os.path.join(package_share, 'shape_reconstruction', 'calibration', 'sensor_1', 'camera_calibration')
 
 row_index_path = os.path.join(calibration_dir, 'row_index.npy')
@@ -23,7 +23,7 @@ class SensorPublisher(Node):
         self.bridge = CvBridge()
 
         config_path = os.path.join(
-            ament_index_python.packages.get_package_share_directory('9dtact'),
+            ament_index_python.packages.get_package_share_directory('tact9d'),
             'shape_reconstruction',
             'shape_config.yaml'
         )

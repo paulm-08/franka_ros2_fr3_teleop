@@ -10,7 +10,7 @@ class Sensor(Camera):
 
         if package_share_path is None:
             from ament_index_python.packages import get_package_share_directory
-            package_share_path = get_package_share_directory('9dtact')
+            package_share_path = get_package_share_directory('tact9d')
 
         sensor_id = cfg['sensor_id']
         depth_calibration = cfg['depth_calibration']

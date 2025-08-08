@@ -24,7 +24,7 @@ class Camera:
         else:
             self.cap = None
 
-        package_share = get_package_share_directory('9dtact')
+        package_share = get_package_share_directory('tact9d')
         camera_calibration = cfg['camera_calibration']
 
         self.camera_calibration_dir = os.path.join(
