@@ -36,7 +36,7 @@ from launch.substitutions import (
     PathJoinSubstitution,
     PythonExpression
 )
-from launch.event_handlers import OnProcessStart
+from launch.event_handlers import OnProcessStart, OnShutdown
 
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -341,6 +341,25 @@ def generate_launch_description():
         output='screen'
     )
 
+    cleanup_processes = RegisterEventHandler(
+        event_handler=OnShutdown(
+            on_shutdown=[
+                ExecuteProcess(
+                    cmd=[
+                        "bash", "-c",
+                        """
+                        for p in ros2 servo_node_main servo_pose_tracking realsense2_camera_node fr3_leap_recorder sensor_node; do
+                            killall -9 $p 2>/dev/null || true
+                        done
+                        """
+                    ],
+                    shell=True,
+                )
+            ]
+        )
+    )
+
+
     # Vive pose publisher
     # This node publishes the pose of the Vive trackers to the /target_pose topic and starts the retargeting process
     vive_pose_publisher = ExecuteProcess(
@@ -504,6 +523,7 @@ def generate_launch_description():
         # aruco_tf_publisher,
         # handeye_node,
         # sensor_node
-        # recorder,
+        recorder,
+        cleanup_processes,
     ] + load_controllers
     )

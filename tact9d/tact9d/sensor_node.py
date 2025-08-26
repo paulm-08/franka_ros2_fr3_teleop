@@ -25,7 +25,7 @@ class SensorPublisher(Node):
         config_path = os.path.join(
             ament_index_python.packages.get_package_share_directory('tact9d'),
             'shape_reconstruction',
-            'shape_config.yaml'
+            'shape_config_middle.yaml'
         )
         with open(config_path, 'r', encoding='utf-8') as f:
             cfg = yaml.load(f, Loader=yaml.FullLoader)

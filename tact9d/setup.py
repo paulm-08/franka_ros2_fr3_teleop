@@ -14,12 +14,23 @@ setup(
         ('share/' + package_name, ['package.xml']),
         # INSTALL SHAPE CONFIG FILE
         (os.path.join('share', package_name, 'shape_reconstruction'), 
-         ['tact9d/shape_reconstruction/shape_config.yaml']),
+        glob('tact9d/shape_reconstruction/shape_config*.yaml')),
         # INSTALL CALIBRATION FILES
         (os.path.join('share', package_name, 'shape_reconstruction/calibration/sensor_1/camera_calibration'),
         glob('tact9d/shape_reconstruction/calibration/sensor_1/camera_calibration/*.npy')),
         (os.path.join('share', package_name, 'shape_reconstruction/calibration/sensor_1/depth_calibration'),
         glob('tact9d/shape_reconstruction/calibration/sensor_1/depth_calibration/*.npy')),
+            
+        (os.path.join('share', package_name, 'shape_reconstruction/calibration/sensor_2/camera_calibration'),
+        glob('tact9d/shape_reconstruction/calibration/sensor_2/camera_calibration/*.npy')),
+        (os.path.join('share', package_name, 'shape_reconstruction/calibration/sensor_2/depth_calibration'),
+        glob('tact9d/shape_reconstruction/calibration/sensor_2/depth_calibration/*.npy')),
+
+        (os.path.join('share', package_name, 'shape_reconstruction/calibration/sensor_3/camera_calibration'),
+        glob('tact9d/shape_reconstruction/calibration/sensor_3/camera_calibration/*.npy')),
+        (os.path.join('share', package_name, 'shape_reconstruction/calibration/sensor_3/depth_calibration'),
+        glob('tact9d/shape_reconstruction/calibration/sensor_3/depth_calibration/*.npy')),
+
     ],
     install_requires=['setuptools'],
     zip_safe=True,

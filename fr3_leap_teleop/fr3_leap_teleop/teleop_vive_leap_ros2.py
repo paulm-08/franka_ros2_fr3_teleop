@@ -47,9 +47,11 @@ teleop_mode = "side_to_side"  # "side_to_side" or "mirror"
 
 hand = True  # Whether to use a hand
 ee_id = "leap_hand"  # End effector ID
+hand_control = False  # Whether to control the hand
+arm_control = False  # Whether to control the arm
 
 # Open3D visualization setup
-visualize=True  # Set to True to enable Open3D visualization
+visualize=False  # Set to True to enable Open3D visualization
 if visualize:
     vis = o3d.visualization.Visualizer()
     vis.create_window()
@@ -185,7 +187,10 @@ class LeapNode(Node):
         # self.dxl_client.sync_write(pinch_motors, np.ones(len(pinch_motors)) * 300, 80, 2) # Higher D gain
         # self.dxl_client.sync_write(pinch_motors, np.ones(len(pinch_motors)) * 1300, 102, 2)  # Higher current limit
 
-        self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
+        if hand_control:
+            self.dxl_client.write_desired_pos(self.motors, self.curr_pos)
+        else:
+            logger.info("[WARNING] Hand control is disabled.")
 
     #Receive LEAP pose and directly control the robot
     def set_leap(self, pose):
@@ -389,7 +394,8 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
             end_t = time.time()
             # print(f"time: {end_t - start_t:.4f} s")
         
-            leaphand.set_allegro(qpos_cmd)
+            if hand_control:
+                leaphand.set_allegro(qpos_cmd)
 
             # print("Position: " + str(leaphand.read_pos()))
             # time.sleep(0.02)
@@ -415,8 +421,10 @@ def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None):
 
     # Initialize hand detector
     detector = SingleHandDetector(hand_type="Right", selfie=False)
+    print("[INFO] SingleHandDetector initialized.")
 
     pipeline = rs.pipeline()
+    print("[INFO] RealSense pipeline created.")
     config = rs.config()
     if serial_number:
         print(f"[INFO] Enabling RealSense device with serial: {serial_number}")
@@ -706,7 +714,7 @@ async def main(args=None):
             # --- Process Vive tracker data ---
             vive_poses = vive_protocol.poses
             # print(f"[DEBUG] Received {len(vive_poses)} VIVE poses", flush=True)
-            if vive_poses:
+            if vive_poses and arm_control:
                 # Example: Use the third tracker as the end-effector pose
                 pose = vive_poses[0]
                 # Convert position from VIVE to ROS (MoveIt) coordinates
@@ -773,6 +781,22 @@ async def main(args=None):
                 if node.tracking_enabled:
                     node.publish_relative_pose(position, orientation)
                 # node.publish_twist(position, orientation)
+                
+            elif not arm_control:
+                if loop_counter % 100 == 0:
+                    print("[DEBUG] Arm control disabled, publishing dummy pose", flush=True)
+                position = np.array([0.0, 0.0, 0.0])  # Dummy position
+                orientation = np.array([0.0, 0.0, 0.0, 1.0])  # Dummy orientation (identity quaternion)
+                node.current_tracker_pos = position
+                node.current_tracker_ori = orientation
+                node.publish_pose(position, orientation)
+                if node.tracking_enabled:
+                    node.publish_relative_pose(position, orientation)
+
+            else:
+                if loop_counter % 100 == 0:
+                    print("[DEBUG] No VIVE poses received, skipping this loop", flush=True)
+                continue
             
             rclpy.spin_once(node, timeout_sec=0.01)
 

@@ -7,7 +7,7 @@ import time
 
 class Camera:
     def __init__(self, cfg, calibrated=True, open_camera=True):
-        sensor_id = cfg['sensor_id']
+        self.sensor_id = cfg['sensor_id']
         camera_setting = cfg['camera_setting']
         if open_camera:
             camera_channel = camera_setting['camera_channel']
@@ -77,11 +77,11 @@ class Camera:
         while time.time() - start_time < warmup_time:
             ret, img = self.cap.read()
             if ret:
-                cv2.imshow("Reference image - Raw", img)
+                cv2.imshow(f"Reference image - Raw ({self.sensor_id})", img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("[INFO] Warmup interrupted by user.")
                 break
-        cv2.destroyWindow("Reference image - Raw")
+        cv2.destroyWindow(f"Reference image - Raw ({self.sensor_id})")
 
         print("[INFO] Capturing averaged raw image...")
         img_add = None
@@ -100,11 +100,11 @@ class Camera:
         start_time = time.time()
         while time.time() - start_time < warmup_time:
             img = self.get_rectify_crop_image()
-            cv2.imshow("Reference image - Rectify + Crop", img)
+            cv2.imshow(f"Reference image - Rectify + Crop ({self.sensor_id})", img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("[INFO] Warmup interrupted by user.")
                 break
-        cv2.destroyWindow("Reference image - Rectify + Crop")
+        cv2.destroyWindow(f"Reference image - Rectify + Crop ({self.sensor_id})")
 
         print("[INFO] Capturing averaged rectify+crop image...")
         img_add = None
@@ -120,11 +120,11 @@ class Camera:
         start_time = time.time()
         while time.time() - start_time < warmup_time:
             img = self.get_rectify_image()
-            cv2.imshow("Reference image - Rectify", img)
+            cv2.imshow(f"Reference image - Rectify ({self.sensor_id})", img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("[INFO] Warmup interrupted by user.")
                 break
-        cv2.destroyWindow("Reference image - Rectify")
+        cv2.destroyWindow(f"Reference image - Rectify ({self.sensor_id})")
 
         print("[INFO] Capturing averaged rectify image...")
         img_add = None

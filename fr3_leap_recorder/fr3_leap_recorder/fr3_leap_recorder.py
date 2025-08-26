@@ -94,12 +94,12 @@ def save_frame(
     cv2.imwrite(
         os.path.join(frame_directory, "rthumb_raw_image.jpg"), rthumb_raw_buffer[frame_id]
     )
-    # cv2.imwrite(
-    #     os.path.join(frame_directory, "rindex_raw_image.jpg"), rindex_raw_buffer[frame_id]
-    # )
-    # cv2.imwrite(
-    #     os.path.join(frame_directory, "rmiddle_raw_image.jpg"), rmiddle_raw_buffer[frame_id]
-    # )
+    cv2.imwrite(
+        os.path.join(frame_directory, "rindex_raw_image.jpg"), rindex_raw_buffer[frame_id]
+    )
+    cv2.imwrite(
+        os.path.join(frame_directory, "rmiddle_raw_image.jpg"), rmiddle_raw_buffer[frame_id]
+    )
     # cv2.imwrite(
     #     os.path.join(frame_directory, "rthumb_deform_image.jpg"), rthumb_deform_buffer[frame_id]
     # )
@@ -130,7 +130,7 @@ class RobotRecorder(Node):
         enable_haptic=True,
     ):
         super().__init__("TacExo_Real_Record_Data")
-        self.save = False
+        self.save = True
         self.enable_tactile = enable_tactile
         self.enable_visualization = enable_visualization
         self.enable_haptic = enable_haptic
@@ -223,9 +223,9 @@ class RobotRecorder(Node):
         #     print(r"wait for 2s:%f",time_count)
 
         # cam_front_translation = [1.2867936975704506, 0.032497565951025945, 0.5659742126690214]
-        cam_front_translation = [1.0270583065963617, 0.005978097582262254, 0.8130240632255346]
+        cam_front_translation = [1.0322713516713722, 0.006353275596612362, 0.8234645537660135]
 
-        cam_front_quaternion = [0.19143865895298542, -0.6830097989046205, -0.6752789459794164, 0.20210690135539885]  # [w, x, y, z]
+        cam_front_quaternion = [0.17954778476421387, -0.6799202218980005, -0.690300391513334, 0.17016596109967214]  # [w, x, y, z]
         # Convert quaternion to rotation matrix
         cam_front_rotation_matrix = quat2mat([cam_front_quaternion[0], cam_front_quaternion[1], cam_front_quaternion[2], cam_front_quaternion[3]])
 
@@ -238,7 +238,7 @@ class RobotRecorder(Node):
         [0, -1, 0,  0],  # Maps -y -> z
         [0,  0,  0,  1]   # Homogeneous coordinate unchanged
         ])
-        self.camfront2robot = self.camfront2robot @ T
+        # self.camfront2robot = self.camfront2robot @ T
 
         cam_side_translation = [0.6254128691870716, -0.6593972515411284, 0.2526695484482261]
         cam_side_quaternion = [0.49543508074736786, -0.8686243685292566, 0.0059154078827518, 0.0008916902936986869]  # [w, x, y, z]
@@ -249,7 +249,7 @@ class RobotRecorder(Node):
         self.camside2robot = np.eye(4)
         self.camside2robot[:3, :3] = cam_side_rotation_matrix
         self.camside2robot[:3, 3] = cam_side_translation
-        self.camside2robot = self.camside2robot @ T
+        # self.camside2robot = self.camside2robot @ T
         # self.camfront2robot = np.linalg.inv(self.camside2robot)
 
         self.leap_position_client = self.create_client(LeapPosition, '/leap_position')
@@ -269,9 +269,7 @@ class RobotRecorder(Node):
         if self.enable_tactile:
             # tactile configuration loading and init
             # thumb_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_tacexo_thumb.yaml")
-            thumb_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config.yaml")
-
-            # assert the path exists
+            thumb_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_thumb.yaml")
             if not os.path.exists(thumb_cfg_path):
                 raise FileNotFoundError(f"Configuration file not found: {thumb_cfg_path}")
             thumb_f = open(thumb_cfg_path, 'r+', encoding='utf-8')
@@ -279,17 +277,22 @@ class RobotRecorder(Node):
             self.thumb_tactile_sensor = Sensor(thumb_cfg)
             # self.thumb_tactile_vis  = Visualizer(self.thumb_tactile_sensor.points)
 
-            # index_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_tacexo_index.yaml")
-            # index_f = open(index_cfg_path, 'r+', encoding='utf-8')
-            # index_cfg = yaml.load(index_f, Loader=yaml.FullLoader)
-            # self.index_tactile_sensor = Sensor(index_cfg)
-            # # self.index_tactile_vis  = Visualizer(self.index_tactile_sensor.points)
+            # Process index tactile data
+            index_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_index.yaml")
+            if not os.path.exists(index_cfg_path):
+                raise FileNotFoundError(f"Configuration file not found: {index_cfg_path}")
+            index_f = open(index_cfg_path, 'r+', encoding='utf-8')
+            index_cfg = yaml.load(index_f, Loader=yaml.FullLoader)
+            self.index_tactile_sensor = Sensor(index_cfg)
+            # self.index_tactile_vis  = Visualizer(self.index_tactile_sensor.points)
 
-            # middle_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_tacexo_middle.yaml")
-            # middle_f = open(middle_cfg_path, 'r+', encoding='utf-8')
-            # middle_cfg = yaml.load(middle_f, Loader=yaml.FullLoader)
-            # self.middle_tactile_sensor = Sensor(middle_cfg)
-            # # self.middle_tactile_vis  = Visualizer(self.middle_tactile_sensor.points)
+            middle_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_middle.yaml")
+            if not os.path.exists(middle_cfg_path):
+                raise FileNotFoundError(f"Configuration file not found: {middle_cfg_path}")
+            middle_f = open(middle_cfg_path, 'r+', encoding='utf-8')
+            middle_cfg = yaml.load(middle_f, Loader=yaml.FullLoader)
+            self.middle_tactile_sensor = Sensor(middle_cfg)
+            # self.middle_tactile_vis  = Visualizer(self.middle_tactile_sensor.points)
 
             self.thumb_points = []
             self.index_points = []
@@ -311,7 +314,6 @@ class RobotRecorder(Node):
             # Start threads for each tactile sensor
             self.start_tac_processing()
             # self.visualize_tactile()
-
     
     def haptic_feedback_loop(self):
         try:
@@ -343,11 +345,11 @@ class RobotRecorder(Node):
                     else:
                         pwm_middle = 0.0
 
-                    pwm_vals = [pwm_thumb] * 5
+                    pwm_vals = [pwm_thumb, pwm_index, pwm_middle, 0.0, 0.0]
                     packet = struct.pack('<5f', *pwm_vals)
                     ser.write(packet)
 
-                    print(f"[HAPTIC] Sent PWM: {pwm_vals}")
+                    # print(f"[HAPTIC] Sent PWM: {pwm_vals}")
                     time.sleep(0.01)
 
                 except KeyboardInterrupt:
@@ -384,9 +386,6 @@ class RobotRecorder(Node):
         return raw_img, points, heat_map, height_map
 
     def process_thumb_tactile(self):
-        # Process thumb tactile data
-        # cal procssing time
-        
         while True:
             # start_time = time.time()
             thumb_raw_img, thumb_points, thumb_heat_map, thumb_height_map = self.process_tactile_data(self.thumb_tactile_sensor, (640, 480))
@@ -399,7 +398,6 @@ class RobotRecorder(Node):
                 self.thumb_height_map = thumb_height_map
 
     def process_index_tactile(self):
-        # Process index tactile data
         while True:
             index_raw_img, index_points, index_heat_map, index_height_map = self.process_tactile_data(self.index_tactile_sensor, (640, 480))
 
@@ -410,7 +408,6 @@ class RobotRecorder(Node):
                 self.index_height_map = index_height_map
     
     def process_middle_tactile(self):
-        # Process middle tactile data
         while True:
             middle_raw_img, middle_points, middle_heat_map, middle_height_map = self.process_tactile_data(self.middle_tactile_sensor, (640, 480))
 
@@ -424,21 +421,20 @@ class RobotRecorder(Node):
         # Start threads for each tactile sensor
         self.thumb_thread = threading.Thread(target=self.process_thumb_tactile)
         self.thumb_thread.start()
-        # self.index_thread = threading.Thread(target=self.process_index_tactile)
-        # self.index_thread.start()
-        # self.middle_thread = threading.Thread(target=self.process_middle_tactile)
-        # self.middle_thread.start()
+        self.index_thread = threading.Thread(target=self.process_index_tactile)
+        self.index_thread.start()
+        self.middle_thread = threading.Thread(target=self.process_middle_tactile)
+        self.middle_thread.start()
         
         if self.enable_haptic:
             self.haptic_thread = threading.Thread(target=self.haptic_feedback_loop)
             self.haptic_thread.start()
-        
 
     def close_tac_processing(self):
         # Close threads for each tactile sensor
         self.thumb_thread.join()
-        # self.index_thread.join()
-        # self.middle_thread.join()
+        self.index_thread.join()
+        self.middle_thread.join()
 
         if self.enable_haptic:
             self.haptic_thread.join()
@@ -823,8 +819,8 @@ def main():
     rclpy.init()
 
     robot_recorder = RobotRecorder(
-        total_frame=1000,
-        out_directory="/home/user/dex-retargeting/recorded_data2"
+        total_frame=10000,
+        out_directory="/home/user/recorded_data/test"
         # out_directory="/home/ruiqiang/workspaces/HK_TacExo/ros2_ws/src/data_recorder/recorded_data/ball_pick_hoh_2025_04_09_01_error_corrections"
     )
     # Initialize the MultiThreadedExecutor and add the node
