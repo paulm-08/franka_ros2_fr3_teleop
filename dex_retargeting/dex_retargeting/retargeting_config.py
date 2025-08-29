@@ -50,8 +50,8 @@ class RetargetingConfig:
     huber_delta: float = 2e-2
 
     # DexPilot optimizer parameters
-    project_dist: float = 0.03
-    escape_dist: float = 0.05
+    project_dist: float = 0.06
+    escape_dist: float = 0.07
 
     # Joint limit tag
     has_joint_limits: bool = True
@@ -74,47 +74,27 @@ class RetargetingConfig:
         # Vector retargeting requires: target_origin_link_names + target_task_link_names
         # Position retargeting requires: target_link_names
         if self.type == "vector":
-            if (
-                self.target_origin_link_names is None
-                or self.target_task_link_names is None
-            ):
-                raise ValueError(
-                    "Vector retargeting requires: target_origin_link_names + target_task_link_names"
-                )
+            if self.target_origin_link_names is None or self.target_task_link_names is None:
+                raise ValueError(f"Vector retargeting requires: target_origin_link_names + target_task_link_names")
             if len(self.target_task_link_names) != len(self.target_origin_link_names):
-                raise ValueError(
-                    "Vector retargeting origin and task links dim mismatch"
-                )
-            if self.target_link_human_indices.shape != (
-                2,
-                len(self.target_origin_link_names),
-            ):
-                raise ValueError(
-                    "Vector retargeting link names and link indices dim mismatch"
-                )
+                raise ValueError(f"Vector retargeting origin and task links dim mismatch")
+            if self.target_link_human_indices.shape != (2, len(self.target_origin_link_names)):
+                raise ValueError(f"Vector retargeting link names and link indices dim mismatch")
             if self.target_link_human_indices is None:
-                raise ValueError(
-                    "Vector retargeting requires: target_link_human_indices"
-                )
+                raise ValueError(f"Vector retargeting requires: target_link_human_indices")
 
         elif self.type == "position":
             if self.target_link_names is None:
-                raise ValueError("Position retargeting requires: target_link_names")
+                raise ValueError(f"Position retargeting requires: target_link_names")
             self.target_link_human_indices = self.target_link_human_indices.squeeze()
             if self.target_link_human_indices.shape != (len(self.target_link_names),):
-                raise ValueError(
-                    "Position retargeting link names and link indices dim mismatch"
-                )
+                raise ValueError(f"Position retargeting link names and link indices dim mismatch")
             if self.target_link_human_indices is None:
-                raise ValueError(
-                    "Position retargeting requires: target_link_human_indices"
-                )
+                raise ValueError(f"Position retargeting requires: target_link_human_indices")
 
         elif self.type == "dexpilot":
             if self.finger_tip_link_names is None or self.wrist_link_name is None:
-                raise ValueError(
-                    "Position retargeting requires: finger_tip_link_names + wrist_link_name"
-                )
+                raise ValueError(f"Position retargeting requires: finger_tip_link_names + wrist_link_name")
             if self.target_link_human_indices is not None:
                 print(
                     "\033[33m",
@@ -140,9 +120,7 @@ class RetargetingConfig:
         cls._DEFAULT_URDF_DIR = urdf_dir
 
     @classmethod
-    def load_from_file(
-        cls, config_path: Union[str, Path], override: Optional[Dict] = None
-    ):
+    def load_from_file(cls, config_path: Union[str, Path], override: Optional[Dict] = None):
         path = Path(config_path)
         if not path.is_absolute():
             path = path.absolute()
@@ -155,9 +133,7 @@ class RetargetingConfig:
     @classmethod
     def from_dict(cls, cfg: Dict[str, Any], override: Optional[Dict] = None):
         if "target_link_human_indices" in cfg:
-            cfg["target_link_human_indices"] = np.array(
-                cfg["target_link_human_indices"]
-            )
+            cfg["target_link_human_indices"] = np.array(cfg["target_link_human_indices"])
         if override is not None:
             for key, value in override.items():
                 cfg[key] = value
@@ -174,9 +150,7 @@ class RetargetingConfig:
 
         # Process the URDF with yourdfpy to better find file path
         robot_urdf = urdf.URDF.load(
-            self.urdf_path,
-            add_dummy_free_joints=self.add_dummy_free_joint,
-            build_scene_graph=False,
+            self.urdf_path, add_dummy_free_joints=self.add_dummy_free_joint, build_scene_graph=False
         )
         urdf_name = self.urdf_path.split(os.path.sep)[-1]
         temp_dir = tempfile.mkdtemp(prefix="dex_retargeting-")
@@ -189,11 +163,7 @@ class RetargetingConfig:
         # Add 6D dummy joint to target joint names so that it will also be optimized
         if self.add_dummy_free_joint and self.target_joint_names is not None:
             self.target_joint_names = DUMMY_JOINT_NAMES + self.target_joint_names
-        joint_names = (
-            self.target_joint_names
-            if self.target_joint_names is not None
-            else robot.dof_joint_names
-        )
+        joint_names = self.target_joint_names if self.target_joint_names is not None else robot.dof_joint_names
 
         if self.type == "position":
             optimizer = PositionOptimizer(
@@ -235,9 +205,7 @@ class RetargetingConfig:
             lp_filter = None
 
         # Parse mimic joints and set kinematics adaptor for optimizer
-        has_mimic_joints, source_names, mimic_names, multipliers, offsets = (
-            parse_mimic_joint(robot_urdf)
-        )
+        has_mimic_joints, source_names, mimic_names, multipliers, offsets = parse_mimic_joint(robot_urdf)
         if has_mimic_joints and not self.ignore_mimic_joint:
             adaptor = MimicJointKinematicAdaptor(
                 robot,
@@ -248,6 +216,12 @@ class RetargetingConfig:
                 offsets=offsets,
             )
             optimizer.set_kinematic_adaptor(adaptor)
+            print(
+                "\033[34m",
+                "Mimic joint adaptor enabled. The mimic joint tags in the URDF will be considered during retargeting.\n"
+                "To disable mimic joint adaptor, consider setting ignore_mimic_joint=True in the configuration.",
+                "\033[39m",
+            )
 
         retargeting = SeqRetargeting(
             optimizer,
@@ -262,9 +236,7 @@ def get_retargeting_config(config_path: Union[str, Path]) -> RetargetingConfig:
     return config
 
 
-def parse_mimic_joint(
-    robot_urdf: urdf.URDF,
-) -> Tuple[bool, List[str], List[str], List[float], List[float]]:
+def parse_mimic_joint(robot_urdf: urdf.URDF) -> Tuple[bool, List[str], List[str], List[float], List[float]]:
     mimic_joint_names = []
     source_joint_names = []
     multipliers = []
@@ -276,10 +248,4 @@ def parse_mimic_joint(
             multipliers.append(joint.mimic.multiplier)
             offsets.append(joint.mimic.offset)
 
-    return (
-        len(mimic_joint_names) > 0,
-        source_joint_names,
-        mimic_joint_names,
-        multipliers,
-        offsets,
-    )
+    return len(mimic_joint_names) > 0, source_joint_names, mimic_joint_names, multipliers, offsets

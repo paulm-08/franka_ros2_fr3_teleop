@@ -59,7 +59,7 @@ teleop_mode = "side_to_side"  # "side_to_side" or "mirror"
 
 hand = True  # Whether to use a hand
 ee_id = "leap_hand"  # End effector ID
-hand_control = False  # Whether to control the hand
+hand_control = True  # Whether to control the hand
 arm_control = False  # Whether to control the arm
 
 camera_type = "generic"  # "realsense" or "generic"
@@ -425,6 +425,21 @@ def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visuali
     detector = SingleHandDetector(hand_type="Right", selfie=False)
     print("[INFO] SingleHandDetector initialized.")
 
+    # calib_file = Path(__file__).parent / "fisheye_calib.npz"
+    # calib_file = Path('/home/user/franka_ros2_ws/src/fr3_leap_teleop/fr3_leap_teleop/fisheye_calib.npz')
+    pkg_share_dir = get_package_share_directory('fr3_leap_teleop')
+    calib_file = Path(pkg_share_dir) / "configs" / "fisheye_calib.npz"
+
+    if Path(calib_file).exists():
+        data = np.load(calib_file)
+        K, D = data["K"], data["D"]
+        map1, map2 = None, None  # 延後初始化
+        print("Loaded fisheye calibration.")
+    else:
+        K, D = None, None
+        map1, map2 = None, None
+        print("No fisheye calibration file found. Using raw frames.")
+
     # Open the camera (default: /dev/video0)
     cap = cv2.VideoCapture(camera_path or '/dev/video0')
     if not cap.isOpened():
@@ -441,6 +456,16 @@ def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visuali
                 continue
 
             # Convert BGR → RGB
+            if K is not None and D is not None:
+                h, w = frame.shape[:2]
+                if map1 is None or map2 is None:
+                    new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                        K, D, (w, h), np.eye(3), balance=0.0
+                    )
+                    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+                        K, D, np.eye(3), new_K, (w, h), cv2.CV_16SC2
+                    )
+                frame = cv2.remap(frame, map1, map2, interpolation=cv2.INTER_LINEAR)
             rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Detect hand keypoints

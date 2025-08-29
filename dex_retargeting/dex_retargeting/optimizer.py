@@ -342,8 +342,8 @@ class DexPilotOptimizer(Optimizer):
         norm_delta=4e-3,
         # DexPilot parameters
         # gamma=2.5e-3,
-        project_dist=0.03,
-        escape_dist=0.05,
+        project_dist=0.05,  # overridden in retargeting_config.py
+        escape_dist=0.06,   # overridden in retargeting_config.py
         eta1=1e-4,
         eta2=3e-2,
         scaling=1.0,
@@ -536,12 +536,11 @@ class DexPilotOptimizer(Optimizer):
         ])
         projected_vec = dir_vec * adaptive_eta[:, None]
 
-        # print("Target vector distance:", target_vec_dist[:len_proj])
+        print("Target vector distance:", target_vec_dist[:len_proj])
         # print("Adaptive projected distance:", adaptive_eta)
         # print("Adaptive weight:", weight[:len_proj])
-        # print("Projection indicator:", self.projected)
+        print("Projection indicator:", self.projected)
         # print("Projected vector:", projected_vec)
-
 
         # Compute final reference vector
         reference_vec = np.where(
