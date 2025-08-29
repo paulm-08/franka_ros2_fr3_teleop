@@ -2,7 +2,7 @@ sensor_id: 3
 calibration_root_dir: ../shape_reconstruction/calibration
 
 camera_setting:
-  camera_channel: 22
+  camera_channel: /dev/9dtact_middle
   resolution:
     - 640 # width
     - 480 # height

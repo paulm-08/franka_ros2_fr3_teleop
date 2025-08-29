@@ -71,7 +71,7 @@ class Camera:
     def get_rectify_crop_image(self):
         return self.crop_image(self.get_rectify_image())
 
-    def get_raw_avg_image(self, n=10, warmup_time=4.0):
+    def get_raw_avg_image(self, n=10, warmup_time=2.0):
         print(f"[INFO] Warming up camera (raw image) for {warmup_time:.1f} seconds...")
         start_time = time.time()
         while time.time() - start_time < warmup_time:
@@ -95,7 +95,7 @@ class Camera:
         return (img_add / n).astype(np.uint8)
 
 
-    def get_rectify_crop_avg_image(self, n=10, warmup_time=4.0):
+    def get_rectify_crop_avg_image(self, n=10, warmup_time=2.0):
         print(f"[INFO] Warming up camera (rectify+crop) for {warmup_time:.1f} seconds...")
         start_time = time.time()
         while time.time() - start_time < warmup_time:
@@ -115,7 +115,7 @@ class Camera:
             img_add += img.astype(np.float32)
         return (img_add / n).astype(np.uint8)
 
-    def get_rectify_avg_image(self, n=10, warmup_time=4.0):
+    def get_rectify_avg_image(self, n=10, warmup_time=2.0):
         print(f"[INFO] Warming up camera (rectify) for {warmup_time:.1f} seconds...")
         start_time = time.time()
         while time.time() - start_time < warmup_time:

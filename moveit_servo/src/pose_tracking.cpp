@@ -140,7 +140,7 @@ PoseTrackingStatusCode PoseTracking::moveToPose(const Eigen::Vector3d& positiona
   {
     if (satisfiesPoseTolerance(positional_tolerance, angular_tolerance))
     {
-      RCLCPP_INFO_STREAM(LOGGER, "The target pose is achieved!");
+      //RCLCPP_INFO_STREAM(LOGGER, "The target pose is achieved!");
       // break;
     }
     // Attempt to update robot pose

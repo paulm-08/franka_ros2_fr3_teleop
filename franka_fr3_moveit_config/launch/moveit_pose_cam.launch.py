@@ -359,7 +359,6 @@ def generate_launch_description():
         )
     )
 
-
     # Vive pose publisher
     # This node publishes the pose of the Vive trackers to the /target_pose topic and starts the retargeting process
     vive_pose_publisher = ExecuteProcess(

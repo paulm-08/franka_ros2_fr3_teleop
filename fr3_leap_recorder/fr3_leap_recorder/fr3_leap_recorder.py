@@ -70,11 +70,11 @@ def save_frame(
     os.makedirs(frame_directory, exist_ok=True)
 
     cv2.imwrite(
-        os.path.join(frame_directory, "color_image.jpg"),
+        os.path.join(frame_directory, "color_image1.jpg"),
         color_buffer[frame_id],
     )
     cv2.imwrite(
-        os.path.join(frame_directory, "depth_image.png"), depth_buffer[frame_id]
+        os.path.join(frame_directory, "depth_image1.png"), depth_buffer[frame_id]
     )
 
     cv2.imwrite(
@@ -333,15 +333,15 @@ class RobotRecorder(Node):
                         middle_map = self.middle_height_map.copy()
 
                     if len(thumb_map) > 0:
-                        pwm_thumb = min(np.max(thumb_map) / 3, 0.5)
+                        pwm_thumb = min(np.max(thumb_map) /3, 0.5)
                     else:
                         pwm_thumb = 0.0
                     if len(index_map) > 0:
-                        pwm_index = min(np.max(index_map), 0.5)
+                        pwm_index = min(np.max(index_map) /3, 0.5)
                     else:
                         pwm_index = 0.0
                     if len(middle_map) > 0:
-                        pwm_middle = min(np.max(middle_map), 0.5)
+                        pwm_middle = min(np.max(middle_map) /3, 0.5)
                     else:
                         pwm_middle = 0.0
 
@@ -787,7 +787,14 @@ class RobotRecorder(Node):
             print("Frame processing completed")
             print("saving frames...")
             # input("Press Enter to continue...")
-            if self.save:
+            if self.save:                # Save tactile reference images
+                if self.enable_tactile:
+                    if not os.path.exists(os.path.join(self.out_directory, "tactile_ref")):
+                        os.makedirs(os.path.join(self.out_directory, "tactile_ref"))
+                    cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rthumb_raw_reference.jpg"), self.thumb_tactile_sensor.ref)
+                    cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rindex_raw_reference.jpg"), self.index_tactile_sensor.ref)
+                    cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rmiddle_raw_reference.jpg"), self.middle_tactile_sensor.ref)
+                    print("Tactile reference images saved.")
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     futures = [
                         executor.submit(
@@ -813,7 +820,6 @@ class RobotRecorder(Node):
 
                     for future in concurrent.futures.as_completed(futures):
                         print(future.result(), f" total frame: {frame_count}")
-        return
 
 def main():
     rclpy.init()
