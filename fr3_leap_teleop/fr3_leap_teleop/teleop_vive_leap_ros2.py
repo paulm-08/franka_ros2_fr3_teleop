@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 
-import sys
-sys.path.append("/home/user/dex-retargeting/dex_retargeting")  # Adjust to actual repo path
-sys.path.append("/home/user/dex-retargeting/example/vector_retargeting")
+# import sys
+# sys.path.append("/home/user/dex-retargeting/dex_retargeting")  # Adjust to actual repo path
+# sys.path.append("/home/user/dex-retargeting/example/vector_retargeting")
+
+# import os
+# from launch.actions import SetEnvironmentVariable
+
+# # --- Set PYTHONPATH for dex-retargeting ---
+# SetEnvironmentVariable(
+#     name='PYTHONPATH',
+#     value='/home/user/dex-retargeting:' + os.environ.get('PYTHONPATH', '')
+# )
 
 import multiprocessing
 import asyncio
@@ -21,10 +30,10 @@ from queue import Empty
 from dex_retargeting.constants import RobotName, RetargetingType, HandType, get_default_config_path
 from dex_retargeting.retargeting_config import RetargetingConfig
 
-from single_hand_detector import SingleHandDetector
+from dex_retargeting.single_hand_detector import SingleHandDetector
 
-from leap_hand_utils.dynamixel_client import *
-import leap_hand_utils.leap_hand_utils as lhu
+from dex_retargeting.leap_hand_utils.dynamixel_client import *
+import dex_retargeting.leap_hand_utils.leap_hand_utils as lhu
 from leap_hand.srv import LeapPosition, LeapVelocity, LeapEffort, LeapPosVelEff
 
 import rclpy
@@ -39,6 +48,9 @@ import argparse
 
 import pyrealsense2 as rs
 
+from pathlib import Path
+
+from ament_index_python.packages import get_package_share_directory
 
 # --- Configuration and Initialization ---
 target_rate = 30  # Target loop rate in Hz
@@ -50,12 +62,10 @@ ee_id = "leap_hand"  # End effector ID
 hand_control = False  # Whether to control the hand
 arm_control = False  # Whether to control the arm
 
+camera_type = "generic"  # "realsense" or "generic"
+
 # Open3D visualization setup
-visualize=False  # Set to True to enable Open3D visualization
-if visualize:
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    coordinate_frames = []
+visualize=True  # Set to True to enable Open3D visualization (Vive trackers and hand detection)
 
 # Define a color map for tracker IDs
 tracker_color_map = {
@@ -70,7 +80,7 @@ def get_color_for_tracker(tracker_id):
     """
     return tracker_color_map.get(tracker_id, [0.5, 0.5, 0.5])  # Default to gray if ID is unknown
 
-def update_coordinate_frames(poses):
+def update_coordinate_frames(poses, vis):
     """
     Update the coordinate frames in the Open3D visualizer based on the latest pose data.
     """
@@ -80,7 +90,6 @@ def update_coordinate_frames(poses):
     vis.clear_geometries()
 
     # Add new geometries
-    global coordinate_frames
     coordinate_frames = []
     for pose in poses:
         position = pose["position"]
@@ -402,20 +411,64 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
             # a = input("test")
 
 # --- Camera Producer (runs in a process) ---
-def produce_frame(queue, camera_path=None):
+def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visualize=True):
+    """
+    Captures frames from a generic USB camera, detects hand keypoints, optionally draws skeleton,
+    and pushes RGB frames to a multiprocessing queue.
+
+    Args:
+        queue (multiprocessing.Queue): Queue to send RGB frames.
+        camera_path (str, optional): Path to camera device (e.g., '/dev/video0').
+        visualize (bool): Whether to display frames with drawn skeleton.
+    """
+    # Initialize hand detector
+    detector = SingleHandDetector(hand_type="Right", selfie=False)
+    print("[INFO] SingleHandDetector initialized.")
+
+    # Open the camera (default: /dev/video0)
     cap = cv2.VideoCapture(camera_path or '/dev/video0')
     if not cap.isOpened():
-        print(f"[ERROR] Failed to open camera: {camera_path}")
+        print(f"[ERROR] Failed to open camera: {camera_path or '/dev/video0'}")
         return
-    while cap.isOpened():
-        success, image = cap.read()
-        if not success:
-            continue
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        queue.put(image_rgb)
-        cv2.imshow("Camera", image)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+
+    print(f"[INFO] Camera opened: {camera_path or '/dev/video0'}")
+
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                print("[WARNING] Failed to read frame, retrying...")
+                continue
+
+            # Convert BGR → RGB
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Detect hand keypoints
+            _, _, keypoints, _ = detector.detect(rgb_image)
+
+            # Push RGB frame to queue for LEAP hand control
+            queue.put(rgb_image)
+
+            if visualize:
+                # Draw skeleton if keypoints are detected
+                if keypoints is not None:
+                    annotated_image = SingleHandDetector.draw_skeleton_on_image(
+                        frame, keypoints, style="white"
+                    )
+                else:
+                    annotated_image = frame
+
+                # Show the annotated frame
+                cv2.imshow("USB Camera", annotated_image)
+
+                # Exit on 'q'
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("[INFO] Camera stream stopped.")
 
 def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None):
 
@@ -451,16 +504,19 @@ def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None):
 
             # Detect hand keypoints
             _,_,keypoints,_ = detector.detect(rgb_image)
-            if keypoints is not None:
-                # Draw the skeleton on the original BGR image
-                annotated_image = SingleHandDetector.draw_skeleton_on_image(color_image, keypoints, style="white")
-            else:
-                annotated_image = color_image
-
             queue.put(rgb_image)
-            cv2.imshow("RealSense", annotated_image)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+
+            if visualize:
+                if keypoints is not None:
+                    # Draw the skeleton on the original BGR image
+                    annotated_image = SingleHandDetector.draw_skeleton_on_image(color_image, keypoints, style="white")
+                else:
+                    annotated_image = color_image
+
+                cv2.imshow("RealSense", annotated_image)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
     finally:
         pipeline.stop()
         cv2.destroyAllWindows()
@@ -662,9 +718,16 @@ async def main(args=None):
 
     # Camera setup (multiprocessing)
     queue = multiprocessing.Queue(maxsize=1)
-    camera_path = None  # or set to your camera device
+    camera_path = "/dev/hand"  # or set to your camera device
     d405_serial_number = "218622273562"  # Replace with your D405 serial
-    producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue,d405_serial_number))
+
+    if camera_type == "realsense":
+        producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue,d405_serial_number))
+    elif camera_type == "generic":
+        producer_process = multiprocessing.Process(target=produce_camera_frame, args=(queue, camera_path))
+    else:
+        print(f"[ERROR] Unknown camera type: {camera_type}. Use 'generic' or 'realsense'.")
+        return
 
     # cap = cv2.VideoCapture(camera_path or 0)
     # if cap.isOpened():
@@ -677,19 +740,22 @@ async def main(args=None):
 
     # LEAP Hand setup
     if teleop_mode == "side_to_side":
+        config_path = Path(get_package_share_directory('dex_retargeting')) / 'configs/teleop/leap_hand_right_dexpilot.yml' 
         # config_path = Path(__file__).resolve().parents[2] / "dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml"
-        config_path = Path('/home/user/dex-retargeting/dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml')
+        # config_path = Path('/home/user/franka_ros2_ws/src/dex_retargeting/src/dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml')
     elif teleop_mode == "mirror":
+        config_path = Path(get_package_share_directory('dex_retargeting')) / 'configs/teleop/leap_hand_left_dexpilot.yml' 
         # config_path = Path(__file__).resolve().parents[2] / "dex_retargeting/configs/teleop/leap_hand_left_dexpilot.yml"
-        config_path = Path('/home/user/dex-retargeting/dex_retargeting/configs/teleop/leap_hand_left_dexpilot.yml')
+        # config_path = Path('/home/user/franka_ros2_ws/src/dex_retargeting/src/dex_retargeting/configs/teleop/leap_hand_left_dexpilot.yml')
     else:
         print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
         return
     
     if hand == True and ee_id == "leap_hand":
         leap_hand = LeapNode()
+        robot_dir = Path(get_package_share_directory('dex_retargeting')) / 'assets/robots/hands'
         # robot_dir = Path(__file__).resolve().parents[2] / "assets/robots/hands"
-        robot_dir = Path('/home/user/dex-retargeting/assets/robots/hands')
+        # robot_dir = Path('/home/user/franka_ros2_ws/src/dex_retargeting/assets/robots/hands')
         consumer_process = multiprocessing.Process(
             target=start_retargeting,
             args=(queue, str(robot_dir), str(config_path), leap_hand)
@@ -805,9 +871,11 @@ async def main(args=None):
                 rclpy.spin_once(leap_hand, timeout_sec=0.01)
 
             # --- Visualization ---
-            if visualize:
-                if vive_poses:
-                    update_coordinate_frames(vive_poses)
+            if visualize and vive_poses:
+                if not vis:
+                    vis = o3d.visualization.Visualizer()
+                    vis.create_window()
+                update_coordinate_frames(vive_poses, vis)
                 # await asyncio.sleep(0.01)  # 30 FPS for visualization
 
             # --- Print actual loop rate ---
@@ -841,7 +909,10 @@ async def main(args=None):
         # cap.release()
         cv2.destroyAllWindows()
         if visualize:
-            vis.destroy_window()
+            try:
+                vis.destroy_window()
+            except:
+                pass
         
         if rclpy.ok():
             rclpy.shutdown()
