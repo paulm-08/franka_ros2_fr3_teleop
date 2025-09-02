@@ -1,200 +1,160 @@
-<h1 style="font-size: 3em;">ROS 2 Integration for Franka Robotics Research Robots</h1>
+# Franka FR3 Teleoperation Setup with LEAP Hand and Multimodal Feedback
 
-[![CI](https://github.com/frankaemika/franka_ros2/actions/workflows/ci.yml/badge.svg)](https://github.com/frankaemika/franka_ros2/actions/workflows/ci.yml)
+<!-- ![Franka FR3 + LEAP Hand Setup](docs/images/setup_overview.png) Optional: replace with a real image if available -->
 
-> **Note:** _franka_ros2_ is not officially supported on Windows.
+---
 
-#### Table of Contents
-- [About](#about)
-- [Caution](#caution)
-- [Optional .bashrc Settings](#optional-bashrc-settings)
-- [Setup](#setup)
-  - [Local Machine Installation](#local-machine-installation)
-  - [Docker Container Installation](#docker-container-installation)
-- [Test the Setup](#test-the-setup)
-- [Troubleshooting](#troubleshooting)
-  - [libfranka: UDP receive: Timeout error](#libfranka-udp-receive-timeout-error)
-- [Contributing](#contributing)
-- [License](#license)
-- [Contact](#contact)
+## 📌 Overview
+This repository contains a complete setup for **teleoperating a Franka FR3 robotic arm** combined with a **LEAP Hand**.  
+It integrates **motion tracking, hand retargeting, tactile sensing, visual feedback, and haptic feedback** to create a multimodal teleoperation system.
 
-# About
-The **franka_ros2** repository provides a **ROS 2** integration of **libfranka**, allowing efficient control of the Franka Robotics arm within the ROS 2 framework. This project is designed to facilitate robotic research and development by providing a robust interface for controlling the research versions of Franka Robotics robots.
+Note: The repository extends the official [`franka_ros2`](https://github.com/frankarobotics/franka_ros2) stack and integrates several additional components to enable real-time teleoperation. The original README.md was moved to the franka_ros2 package.
 
-For convenience, we provide Dockerfile and docker-compose.yml files. While it is possible to build **franka_ros2** directly on your local machine, this approach requires manual installation of certain dependencies, while many others will be automatically installed by the **ROS 2** build system (e.g., via **rosdep**). This can result in a large number of libraries being installed on your system, potentially causing conflicts. Using Docker encapsulates these dependencies within the container, minimizing such risks. Docker also ensures a consistent and reproducible build environment across systems. For these reasons, we recommend using Docker.
+---
 
-# Caution
-This package is in rapid development. Users should expect breaking changes and are encouraged to report any bugs via [GitHub Issues page](https://github.com/frankaemika/franka_ros2/issues).
+## ✨ Features
+- **Low-level FR3 control** using [`libfranka`](https://frankarobotics.github.io/docs/libfranka.html) and ROS 2 controllers.
+- **Real-time Cartesian control** via MoveIt Servo.
+- **Wrist-mounted teleoperation device** using:
+  - HTC Vive Ultimate Tracker for 6-DoF wrist tracking.
+  - A camera-based haptic feedback system.
+- **Hand pose tracking and retargeting** from human motion to the LEAP Hand via [DexRetargeting](https://github.com/dexsuite/dex-retargeting).
+- **Visual feedback integration** using an RGB-D camera and ArUco-based hand-eye calibration via [easy_handeye2](https://github.com/marcoesposito1988/easy_handeye2).
+- **Tactile feedback integration** using the [9DTact sensor](https://github.com/linchangyi1/9DTact).
+- **Multimodal data collection** for imitation learning or reinforcement learning.
+- Modular packages for **teleoperation**, **calibration**, **data recording**, and **retargeting**.
 
+## 🛠️ Installation
 
-
-# Setup
-
-
-
-
-
-## Local Machine Installation
-1. **Install ROS2 Development environment**
-
-    _**franka_ros2**_ is built upon _**ROS 2 Humble**_.  
-
-    To set up your ROS 2 environment, follow the official _**humble**_ installation instructions provided [**here**](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html). 
-    The guide discusses two main installation options: **Desktop** and **Bare Bones**.
-
-    #### Choose **one** of the following:
-    - **ROS 2 "Desktop Install"** (`ros-humble-desktop`)  
-      Includes a full ROS 2 installation with GUI tools and visualization packages (e.g., Rviz and Gazebo).  
-      **Recommended** for users who need simulation or visualization capabilities.
-
-    - **"ROS-Base Install (Bare Bones)"** (`ros-humble-ros-base`)  
-      A minimal installation that includes only the core ROS 2 libraries.  
-      Suitable for resource-constrained environments or headless systems.
-
-    ```bash
-    # replace <YOUR CHOICE> with either ros-humble-desktop or ros-humble-ros-base
-    sudo apt install <YOUR CHOICE>  
-    ```
-    ---
-    Also install the **Development Tools** package:
-    ```bash
-    sudo apt install ros-humble-dev-tools
-    ```
-    Installing the **Desktop** or **Bare Bones** should automatically source the **ROS2** environment but, under some circumstances you may need to do this again:
-    ```bash
-    source /opt/ros/humble/setup.bash
-    ```
-
-2. **Create a ROS 2 Workspace:**
-   ```bash
-   mkdir -p ~/franka_ros2_ws/src
-   cd ~/franka_ros2_ws  # not into src
-   ```
-3. **Clone the Repositories:**
-   ```bash
-    git clone https://github.com/frankaemika/franka_ros2.git src
-    ``` 
-4. **Detect and install project dependencies**
-   ```bash
-   rosdep install --from-paths src --ignore-src --rosdistro humble -y
-   ```
-5. **Build**
-   ```bash
-   # use the --symlinks option to reduce disk usage, and facilitate development.
-   colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-   ```
-6. **Adjust Enviroment**
-   ```bash
-   # Adjust environment to recognize packages and dependencies in your newly built ROS 2 workspace.
-   source install/setup.sh
-   ```
-
-## Docker Container Installation
-The **franka_ros2** package includes a `Dockerfile` and a `docker-compose.yml`, which allows you to use `franka_ros2` packages without manually installing **ROS 2**. Also, the support for Dev Containers in Visual Studio Code is provided.
-
-For detailed instructions, on preparing VSCode to use the `.devcontainer` follow the setup guide from [VSCode devcontainer_setup](https://code.visualstudio.com/docs/devcontainers/tutorial).
-
-1. **Clone the Repositories:**
-    ```bash
-    git clone https://github.com/frankaemika/franka_ros2.git
-    cd franka_ros2
-    ```
-    We provide separate instructions for using Docker with Visual Studio Code or the command line. Choose one of the following options:
-
-    Option A: Set up and use Docker from the command line (without Visual Studio Code).
-
-    Option B: Set up and use Docker with Visual Studio Code's Docker support.
-
-#### Option A: using Docker Compose
-
-  2. **Save the current user id into a file:**
-      ```bash
-      echo -e "USER_UID=$(id -u $USER)\nUSER_GID=$(id -g $USER)" > .env
-      ```
-      It is needed to mount the folder from inside the Docker container.
-
-  3. **Build the container:**
-      ```bash
-      docker compose build
-      ```
-  4. **Run the container:**
-      ```bash
-      docker compose up -d
-      ```
-  5. **Open a shell inside the container:**
-      ```bash
-      docker exec -it franka_ros2 /bin/bash
-      ```
-  6. **Build the workspace:**
-      ```bash
-      colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-      ```
-  7. **Source the built workspace:**
-      ```bash
-      source install/setup.bash
-      ```
-  8. **When you are done, you can exit the shell and delete the container**:
-      ```bash
-      docker compose down -t 0
-      ```
-
-#### Option B: using Dev Containers in Visual Studio Code
-
-  2. **Open Visual Studio Code ...**
-  
-        Then, open folder  `franka_ros2`
-
-  3. **Choose `Reopen in container` when prompted.**
-
-      The container will be built automatically, as required.
-
-  4. **Open a terminal and build the workspace:**
-      ```bash
-      colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-      ```
-  5. **Source the built workspace environment:**
-      ```bash
-      source install/setup.bash
-      ```
-
-
-# Test the build
-   ```bash
-   colcon test
-   ```
-> Remember, franka_ros2 is under development.  
-> Warnings can be expected.  
-> Errors? Well, they’re just undocumented features !".
-
-# Run a sample ROS2 application
-
-To verify that your setup works correctly without a robot, you can run the following command to use dummy hardware:
+### 1. Clone the repository
 
 ```bash
-ros2 launch franka_fr3_moveit_config moveit.launch.py robot_ip:=dont-care use_fake_hardware:=true
+git clone https://github.com/paulm-08/franka_ros2_fr3_teleop.git
+````
+
+### 2. Install dependencies
+
+Make sure you have ROS 2 (Humble or Iron) installed.
+Then, install required ROS 2 dependencies:
+
+```bash
+rosdep install --from-paths src --ignore-src -r -y
 ```
 
+> **Tip:** If `diagnostic_updater` or other missing dependencies cause errors, install them manually:
 
-# Troubleshooting
-#### `libfranka: UDP receive: Timeout error`
+```bash
+sudo apt install ros-${ROS_DISTRO}-diagnostic-updater
+```
 
-If you encounter a UDP receive timeout error while communicating with the robot, avoid using Docker Desktop. It may not provide the necessary real-time capabilities required for reliable communication with the robot. Instead, using Docker Engine is sufficient for this purpose.
+### 3. Build the workspace
 
-A real-time kernel is essential to ensure proper communication and to prevent timeout issues. For guidance on setting up a real-time kernel, please refer to the [Franka installation documentation](https://frankaemika.github.io/docs/installation_linux.html#setting-up-the-real-time-kernel).
+```bash
+colcon build --symlink-install
+source install/setup.bash
+```
 
-# Contributing
+---
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/frankaemika/franka_ros2/blob/humble/CONTRIBUTING.md) for more details on how to contribute to this project.
+## 🚀 Usage
 
-## License
+<!-- ### 1. Launch the teleoperation system -->
 
-All packages of franka_ros2 are licensed under the Apache 2.0 license.
+Launch the teleoperation system:
+```bash
+ros2 launch franka_fr3_moveit_config moveit_pose_cam.launch.py
+```
 
-## Contact 
+This will:
 
-For questions or support, please open an issue on the [GitHub Issues](https://github.com/frankaemika/franka_ros2/issues) page.
+* Stream wrist poses from the HTC Vive Ultimate tracker.
+* Retarget human hand poses to the LEAP Hand.
+* Control the Franka FR3 in real time.
+* Record data from the robot pose, camera images and tactile sensor images
+* Enable haptic feedback
 
-See the [Franka Control Interface (FCI) documentation](https://frankaemika.github.io/docs) for more information.
+```bash
+ros2 run fr3_leap_teleop teleop_vive_leap_ros2.py
+```
+
+This will only:
+* Stream wrist poses from the HTC Vive Ultimate tracker.
+* Retarget human hand poses to the LEAP Hand.
+
+<!-- ### 2. Visual feedback
+
+With the [Realsense ROS2 wrapper](https://github.com/IntelRealSense/realsense-ros?tab=readme-ov-file) installed, start a RealSense camera node:
+```bash
+ros2 launch realsense2_camera rs_launch.py
+```
+This publishes image and depth data as well as camera intrinsic parameters to the respective topics:
+/camera/camera/color/camera_info
+/camera/camera/color/image_raw,
+/camera/camera/depth/image_raw
 
 
-[def]: #docker-container-installation
+Start Aruco marker detector:
+```bash
+ros2 run easy_handeye2 aruco_tf_publisher --ros-args \
+  -p marker_id:=0 \
+  -p marker_size:=0.10 \
+  -p camera_frame:=camera_link \
+  -p tracking_marker_frame:=aruco_marker_frame
+```
+This publishes the pose of the marker relative to the camera as a TF transform (e.g., camera_link → aruco_marker).
+
+```bash
+ros2 launch easy_handeye2 aruco_calibration.launch.py
+```
+
+### 3. Tactile feedback
+
+```bash
+ros2 launch tact9d tact_sensor.launch.py
+```
+
+### 4. Data collection
+
+```bash
+ros2 run fr3_leap_recorder fr3_leap_recorder.py
+``` -->
+
+---
+
+## 📦 Included Packages
+
+| Package                 | Description                                                      |
+| ----------------------- | ---------------------------------------------------------------- |
+| **franka\_ros2**        | Official ROS 2 stack for controlling Franka robots.              |
+| **moveit\_servo**       | Real-time Cartesian control for teleoperation.                   |
+| **leap\_hand**          | URDF description and integration for the LEAP Hand end-effector. |
+| **ros2\_module**        | LEAP Hand API ROS 2 wrapper.                                     |
+| **dex\_retargeting**    | Retargets human hand poses to the LEAP Hand kinematics.          |
+| **fr3\_leap\_teleop**   | Publishes wrist and hand pose topics for teleoperation.          |
+| **fr3\_leap\_recorder** | Records multimodal data streams for later analysis or training.  |
+| **easy\_handeye2**      | Visual calibration using ArUco markers and RGB-D camera.         |
+| **tact9d**              | ROS 2 integration of the Daimon Robotics 9DTact tactile sensor.  |
+
+---
+
+## 📖 Documentation
+
+The full **step-by-step guide** is available in [`docs/guide.md`](docs/guide.md) *(optional if you move your guide there)*.
+It covers:
+
+* Hardware setup
+* Software installation
+* Launching teleoperation
+* Integrating visual and tactile feedback
+* Recording and replaying multimodal data
+
+---
+
+## 🧩 Dependencies
+
+* **ROS 2** Humble or Iron
+* **libfranka** ≥ 0.12
+* **MoveIt 2** + MoveIt Servo
+* **RealSense SDK** (optional, for visual feedback)
+* **DexRetargeting** (included and wrapped)
+* **HTC Vive Ultimate Tracker SDK** (for wrist tracking)
