@@ -54,6 +54,11 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
+### 4. Setup other devices
+
+To use the HTC Vive tracker, you need a Windows PC set up to stream Vive poses.
+To use haptic feedback, you need a Multi-Tactile driver running a script to command PWM motors.
+See [Documentation](https://github.com/paulm-08/franka_ros2_fr3_teleop/tree/main?tab=readme-ov-file#-documentation)
 ---
 
 ## 🚀 Usage
@@ -73,6 +78,7 @@ This will:
 * Record data from the robot pose, camera images and tactile sensor images
 * Enable haptic feedback
 
+Or:
 ```bash
 ros2 run fr3_leap_teleop teleop_vive_leap_ros2.py
 ```
@@ -133,28 +139,28 @@ ros2 run fr3_leap_recorder fr3_leap_recorder.py
 | **fr3\_leap\_teleop**   | Publishes wrist and hand pose topics for teleoperation.          |
 | **fr3\_leap\_recorder** | Records multimodal data streams for later analysis or training.  |
 | **easy\_handeye2**      | Visual calibration using ArUco markers and RGB-D camera.         |
-| **tact9d**              | ROS 2 integration of the Daimon Robotics 9DTact tactile sensor.  |
+| **tact9d**              | ROS 2 integration of the 9DTact tactile sensor.  |
 
 ---
 
 ## 📖 Documentation
 
-The full **step-by-step guide** is available in [`docs/guide.md`](docs/guide.md) *(optional if you move your guide there)*.
+The full **step-by-step guide** is available in [`docs/guide.pdf`](docs/guide.pdf).
 It covers:
 
 * Hardware setup
 * Software installation
 * Launching teleoperation
 * Integrating visual and tactile feedback
-* Recording and replaying multimodal data
+* Recording multimodal data
 
 ---
 
-## 🧩 Dependencies
+<!-- ## 🧩 Dependencies
 
 * **ROS 2** Humble or Iron
 * **libfranka** ≥ 0.12
 * **MoveIt 2** + MoveIt Servo
 * **RealSense SDK** (optional, for visual feedback)
 * **DexRetargeting** (included and wrapped)
-* **HTC Vive Ultimate Tracker SDK** (for wrist tracking)
+* **HTC Vive Ultimate Tracker SDK** (for wrist tracking) -->
