@@ -60,7 +60,7 @@ teleop_mode = "side_to_side"  # "side_to_side" or "mirror"
 hand = True  # Whether to use a hand
 ee_id = "leap_hand"  # End effector ID
 hand_control = True  # Whether to control the hand
-arm_control = False  # Whether to control the arm
+arm_control = True  # Whether to control the arm
 
 camera_type = "generic"  # "realsense" or "generic"
 
@@ -737,6 +737,8 @@ async def main(args=None):
         local_addr=(UDP_IP, UDP_PORT),
     )
 
+    vis = None
+
     # ROS2 setup
     rclpy.init(args=args)
     node = ViveToROS2Publisher()
@@ -874,7 +876,7 @@ async def main(args=None):
                 # node.publish_twist(position, orientation)
                 
             elif not arm_control:
-                if loop_counter % 100 == 0:
+                if loop_counter % print_interval == 0:
                     print("[DEBUG] Arm control disabled, publishing dummy pose", flush=True)
                 position = np.array([0.0, 0.0, 0.0])  # Dummy position
                 orientation = np.array([0.0, 0.0, 0.0, 1.0])  # Dummy orientation (identity quaternion)
@@ -885,9 +887,9 @@ async def main(args=None):
                     node.publish_relative_pose(position, orientation)
 
             else:
-                if loop_counter % 100 == 0:
+                if loop_counter % print_interval == 0:
                     print("[DEBUG] No VIVE poses received, skipping this loop", flush=True)
-                continue
+                pass
             
             rclpy.spin_once(node, timeout_sec=0.01)
 
@@ -897,7 +899,7 @@ async def main(args=None):
 
             # --- Visualization ---
             if visualize and vive_poses:
-                if not vis:
+                if vis is None:
                     vis = o3d.visualization.Visualizer()
                     vis.create_window()
                 update_coordinate_frames(vive_poses, vis)

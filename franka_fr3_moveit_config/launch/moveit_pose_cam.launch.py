@@ -341,24 +341,6 @@ def generate_launch_description():
         output='screen'
     )
 
-    cleanup_processes = RegisterEventHandler(
-        event_handler=OnShutdown(
-            on_shutdown=[
-                ExecuteProcess(
-                    cmd=[
-                        "bash", "-c",
-                        """
-                        for p in ros2 servo_node_main servo_pose_tracking realsense2_camera_node fr3_leap_recorder sensor_node; do
-                            killall -9 $p 2>/dev/null || true
-                        done
-                        """
-                    ],
-                    shell=True,
-                )
-            ]
-        )
-    )
-
     # Vive pose publisher
     # This node publishes the pose of the Vive trackers to the /target_pose topic and starts the retargeting process
     vive_pose_publisher = ExecuteProcess(
@@ -486,10 +468,19 @@ def generate_launch_description():
         output='screen',
     )
 
+    out_directory_arg = DeclareLaunchArgument(
+        'out_directory',
+        default_value='/home/user/recorded_data/test',
+        description='Output directory for recorded data'
+    )
+
     # Recorder script
     # This script records the FR3 and LEAP hand joint states, RGB and depth images from the Realsense cameras and 9DTact sensor image 
     recorder = ExecuteProcess(
-        cmd=['ros2', 'run', 'fr3_leap_recorder', 'fr3_leap_recorder'],
+        cmd=[
+            'ros2', 'run', 'fr3_leap_recorder', 'fr3_leap_recorder',
+            '--out_directory', LaunchConfiguration('out_directory')
+        ],
         output='screen',
         condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
     )
@@ -502,7 +493,8 @@ def generate_launch_description():
         use_fake_hardware_arg,
         fake_sensor_commands_arg,
         db_arg,
-        rviz_node,
+        out_directory_arg,
+        # rviz_node,
         robot_state_publisher,
         # run_move_group_node,
         ros2_control_node,
@@ -523,6 +515,5 @@ def generate_launch_description():
         # handeye_node,
         # sensor_node
         recorder,
-        cleanup_processes,
     ] + load_controllers
     )

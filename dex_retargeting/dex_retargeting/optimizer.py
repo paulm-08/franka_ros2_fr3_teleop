@@ -536,10 +536,10 @@ class DexPilotOptimizer(Optimizer):
         ])
         projected_vec = dir_vec * adaptive_eta[:, None]
 
-        print("Target vector distance:", target_vec_dist[:len_proj])
+        # print("Target vector distance:", target_vec_dist[:len_proj])
         # print("Adaptive projected distance:", adaptive_eta)
         # print("Adaptive weight:", weight[:len_proj])
-        print("Projection indicator:", self.projected)
+        # print("Projection indicator:", self.projected)
         # print("Projected vector:", projected_vec)
 
         # Compute final reference vector
@@ -554,7 +554,7 @@ class DexPilotOptimizer(Optimizer):
         torch_target_vec = torch.as_tensor(reference_vec, dtype=torch.float32)
         torch_target_vec.requires_grad_(False)
 
-        print("Reference vector distance:", np.linalg.norm(reference_vec[:len_proj], axis=1))
+        # print("Reference vector distance:", np.linalg.norm(reference_vec[:len_proj], axis=1))
 
         def objective(x: np.ndarray, grad: np.ndarray) -> float:
             qpos[self.idx_pin2target] = x

@@ -42,7 +42,10 @@ from tact9d.shape_reconstruction import Sensor, Visualizer
 from multiprocessing import Process, Manager
 import threading
 
-TACT_BASE_PATH = '/home/user/franka_ros2_ws/src/tact9d/tact9d/shape_reconstruction/'
+from ament_index_python.packages import get_package_share_directory
+
+# TACT_BASE_PATH = '/home/user/franka_ros2_ws/src/tact9d/tact9d/shape_reconstruction/'
+TACT_BASE_PATH = get_package_share_directory('tact9d') + '/shape_reconstruction/'
 
 def save_frame(
     frame_id,
@@ -822,28 +825,41 @@ class RobotRecorder(Node):
                         print(future.result(), f" total frame: {frame_count}")
 
 def main():
+    parser = argparse.ArgumentParser(description="Record FR3 Leap data")
+    parser.add_argument(
+        "-o", "--out_directory",
+        type=str,
+        default="/home/user/recorded_data/test",
+        help="Output directory to save recorded data"
+    )
+    parser.add_argument(
+        "-n", "--total_frame",
+        type=int,
+        default=10000,
+        help="Number of frames to record"
+    )
+    args = parser.parse_args()
     rclpy.init()
-
     robot_recorder = RobotRecorder(
         total_frame=10000,
         out_directory="/home/user/recorded_data/test"
-        # out_directory="/home/ruiqiang/workspaces/HK_TacExo/ros2_ws/src/data_recorder/recorded_data/ball_pick_hoh_2025_04_09_01_error_corrections"
     )
-    # Initialize the MultiThreadedExecutor and add the node
     executor = MultiThreadedExecutor()
     executor.add_node(robot_recorder)
- 
     executor_thread = threading.Thread(target=executor.spin, daemon=True)
     executor_thread.start()
-    print("Start process frame")
-    robot_recorder.process_frame()
-    print("Process frame finished")
-    
-    executor.shutdown()
-    # executor_thread.join()
-    robot_recorder.destroy_node()
-    rclpy.shutdown()
-    
+    try:
+        print("Start process frame")
+        robot_recorder.process_frame()
+        print("Process frame finished")
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received. Shutting down...")
+    finally:
+        executor.shutdown()
+        robot_recorder.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()        # Optionally join the thread if not daemon
+        # executor_thread.join()
     return 0
 
 if __name__ == "__main__":
