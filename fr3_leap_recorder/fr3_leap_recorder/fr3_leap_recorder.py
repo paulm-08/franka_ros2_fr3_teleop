@@ -19,6 +19,8 @@ from sensor_msgs.msg import Image, CameraInfo
 
 from cv_bridge import CvBridge
 import concurrent.futures 
+import queue
+import threading
 
 # for getting point cloud
 from sensor_msgs.msg import PointCloud2
@@ -64,63 +66,75 @@ def save_frame(
     rindex_deform_buffer,
     rmiddle_deform_buffer,
 ):
-    # print if there are content in the buffer
-    if not color_buffer:
-        print("No color buffer")
-    # print("Saving frame ", frame_id)
-    
+    # Each buffer is a single-item list containing the frame data
     frame_directory = os.path.join(out_directory, f"frame_{frame_id}")
     os.makedirs(frame_directory, exist_ok=True)
 
-    cv2.imwrite(
-        os.path.join(frame_directory, "color_image1.jpg"),
-        color_buffer[frame_id],
-    )
-    cv2.imwrite(
-        os.path.join(frame_directory, "depth_image1.png"), depth_buffer[frame_id]
-    )
+    # Save images
+    if color_buffer and color_buffer[0] is not None:
+        cv2.imwrite(
+            os.path.join(frame_directory, "color_image1.jpg"),
+            color_buffer[0],
+        )
+    if depth_buffer and depth_buffer[0] is not None:
+        cv2.imwrite(
+            os.path.join(frame_directory, "depth_image1.png"),
+            depth_buffer[0]
+        )
+    if color_buffer2 and color_buffer2[0] is not None:
+        cv2.imwrite(
+            os.path.join(frame_directory, "color_image2.jpg"),
+            color_buffer2[0],
+        )
+    if depth_buffer2 and depth_buffer2[0] is not None:
+        cv2.imwrite(
+            os.path.join(frame_directory, "depth_image2.png"),
+            depth_buffer2[0]
+        )
 
-    cv2.imwrite(
-        os.path.join(frame_directory, "color_image2.jpg"),
-        color_buffer2[frame_id],
-    )
-    cv2.imwrite(
-        os.path.join(frame_directory, "depth_image2.png"), depth_buffer2[frame_id]
-    )
+    # # point cloud (uncomment if needed)
+    # if pc_buffer and pc_buffer[0] is not None:
+    #     o3d.io.write_point_cloud(os.path.join(frame_directory, "pc.ply"), pc_buffer[0])
+    # if pc2_buffer and pc2_buffer[0] is not None:
+    #     o3d.io.write_point_cloud(os.path.join(frame_directory, "pc2.ply"), pc2_buffer[0])
 
-    # # point cloud
-    # o3d.io.write_point_cloud(os.path.join(frame_directory, "pc.ply"), pc_buffer[frame_id])
-
-    # o3d.io.write_point_cloud(os.path.join(frame_directory, "pc2.ply"), pc2_buffer[frame_id])
-
-    # fingertip tactile info
-    cv2.imwrite(
-        os.path.join(frame_directory, "rthumb_raw_image.jpg"), rthumb_raw_buffer[frame_id]
-    )
-    cv2.imwrite(
-        os.path.join(frame_directory, "rindex_raw_image.jpg"), rindex_raw_buffer[frame_id]
-    )
-    cv2.imwrite(
-        os.path.join(frame_directory, "rmiddle_raw_image.jpg"), rmiddle_raw_buffer[frame_id]
-    )
-    # cv2.imwrite(
-    #     os.path.join(frame_directory, "rthumb_deform_image.jpg"), rthumb_deform_buffer[frame_id]
-    # )
-    # cv2.imwrite(
-    #     os.path.join(frame_directory, "rindex_deform_image.jpg"), rindex_deform_buffer[frame_id]
-    # )
-    # cv2.imwrite(
-    #     os.path.join(frame_directory, "rmiddle_deform_image.jpg"), rmiddle_deform_buffer[frame_id]
-    # )
+    # Fingertip tactile info
+    if rthumb_raw_buffer and rthumb_raw_buffer[0] is not None:
+        cv2.imwrite(
+            os.path.join(frame_directory, "rthumb_raw_image.jpg"), rthumb_raw_buffer[0]
+        )
+    if rindex_raw_buffer and rindex_raw_buffer[0] is not None:
+        cv2.imwrite(
+            os.path.join(frame_directory, "rindex_raw_image.jpg"), rindex_raw_buffer[0]
+        )
+    if rmiddle_raw_buffer and rmiddle_raw_buffer[0] is not None:
+        cv2.imwrite(
+            os.path.join(frame_directory, "rmiddle_raw_image.jpg"), rmiddle_raw_buffer[0]
+        )
+    # Uncomment if you want to save deform images
+    # if rthumb_deform_buffer and rthumb_deform_buffer[0] is not None:
+    #     cv2.imwrite(
+    #         os.path.join(frame_directory, "rthumb_deform_image.jpg"), rthumb_deform_buffer[0]
+    #     )
+    # if rindex_deform_buffer and rindex_deform_buffer[0] is not None:
+    #     cv2.imwrite(
+    #         os.path.join(frame_directory, "rindex_deform_image.jpg"), rindex_deform_buffer[0]
+    #     )
+    # if rmiddle_deform_buffer and rmiddle_deform_buffer[0] is not None:
+    #     cv2.imwrite(
+    #         os.path.join(frame_directory, "rmiddle_deform_image.jpg"), rmiddle_deform_buffer[0]
+    #     )
 
 
     # joint state
-    np.savetxt(
-        os.path.join(frame_directory, "right_arm_joint.txt"),
-        joint_buffer[frame_id]
-    )
+    if joint_buffer and len(joint_buffer) > 0 and joint_buffer[0] is not None:
+        np.savetxt(
+            os.path.join(frame_directory, "right_arm_joint.txt"),
+            joint_buffer[0]
+        )
 
-    return f"frame {frame_id + 1} saved"
+    # print(f"Frame {frame_id + 1} saved.")
+    return
 
 
 class RobotRecorder(Node):
@@ -129,7 +143,7 @@ class RobotRecorder(Node):
         total_frame,
         out_directory=None,
         enable_tactile=True,
-        enable_visualization=True,
+        enable_visualization=False,
         enable_haptic=True,
     ):
         super().__init__("TacExo_Real_Record_Data")
@@ -144,6 +158,11 @@ class RobotRecorder(Node):
 
         # 101622074637
         self.total_frame = total_frame
+
+        if self.save:
+            self.frame_queue = queue.Queue(maxsize=100)  # Limit buffer size to 100 frames
+            self.saving_thread = threading.Thread(target=self.frame_saver, daemon=True)
+            self.saving_thread.start()
 
         self.joint_state = None
 
@@ -326,7 +345,7 @@ class RobotRecorder(Node):
             return
 
         try:
-            while True:
+            while not self.stop_event.is_set():
                 try:
                     with self.tac_thumb_lock:
                         thumb_map = self.thumb_height_map.copy()
@@ -353,7 +372,7 @@ class RobotRecorder(Node):
                     ser.write(packet)
 
                     # print(f"[HAPTIC] Sent PWM: {pwm_vals}")
-                    time.sleep(0.01)
+                    time.sleep(0.03)
 
                 except KeyboardInterrupt:
                     print("[HAPTIC] Keyboard interrupt received.")
@@ -371,25 +390,26 @@ class RobotRecorder(Node):
         heat_map = []
         raw_img = []
         points = []
+        height_map = []
     
         raw_img = sensor.get_rectify_crop_image()
         img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
         height_map = sensor.raw_image_2_height_map(img_GRAY)
         height_map = sensor.expand_image(height_map)
-        heat_map_input = cv2.normalize(height_map, None, 0, 255, cv2.NORM_MINMAX)
-        heat_map_input = np.uint8(heat_map_input)
-        heat_map = cv2.applyColorMap(heat_map_input, cv2.COLORMAP_JET)
-        # Add subtitles to each image
-        cv2.putText(heat_map, "Thumb", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        # Resize images for display
-        target_size = img_size
-        heat_map = cv2.resize(heat_map, target_size, interpolation=cv2.INTER_LINEAR)
-        points, gradients = sensor.height_map_2_point_cloud_gradients(height_map)
+        # heat_map_input = cv2.normalize(height_map, None, 0, 255, cv2.NORM_MINMAX)
+        # heat_map_input = np.uint8(heat_map_input)
+        # heat_map = cv2.applyColorMap(heat_map_input, cv2.COLORMAP_JET)
+        # # Add subtitles to each image
+        # cv2.putText(heat_map, "Thumb", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        # # Resize images for display
+        # target_size = img_size
+        # heat_map = cv2.resize(heat_map, target_size, interpolation=cv2.INTER_LINEAR)
+        # points, gradients = sensor.height_map_2_point_cloud_gradients(height_map)
 
         return raw_img, points, heat_map, height_map
 
     def process_thumb_tactile(self):
-        while True:
+        while not self.stop_event.is_set():  # ✅ Check for stop request
             # start_time = time.time()
             thumb_raw_img, thumb_points, thumb_heat_map, thumb_height_map = self.process_tactile_data(self.thumb_tactile_sensor, (640, 480))
             # print(f"Thumb processing time: {time.time() - start_time:.4f} seconds")
@@ -401,7 +421,7 @@ class RobotRecorder(Node):
                 self.thumb_height_map = thumb_height_map
 
     def process_index_tactile(self):
-        while True:
+        while not self.stop_event.is_set():  # ✅ Check for stop request
             index_raw_img, index_points, index_heat_map, index_height_map = self.process_tactile_data(self.index_tactile_sensor, (640, 480))
 
             with self.tac_index_lock:
@@ -411,7 +431,7 @@ class RobotRecorder(Node):
                 self.index_height_map = index_height_map
     
     def process_middle_tactile(self):
-        while True:
+        while not self.stop_event.is_set():  # ✅ Check for stop request
             middle_raw_img, middle_points, middle_heat_map, middle_height_map = self.process_tactile_data(self.middle_tactile_sensor, (640, 480))
 
             with self.tac_middle_lock:
@@ -421,33 +441,41 @@ class RobotRecorder(Node):
                 self.middle_height_map = middle_height_map
 
     def start_tac_processing(self):
-        # Start threads for each tactile sensor
-        self.thumb_thread = threading.Thread(target=self.process_thumb_tactile)
-        self.thumb_thread.start()
-        self.index_thread = threading.Thread(target=self.process_index_tactile)
-        self.index_thread.start()
-        self.middle_thread = threading.Thread(target=self.process_middle_tactile)
-        self.middle_thread.start()
-        
-        if self.enable_haptic:
-            self.haptic_thread = threading.Thread(target=self.haptic_feedback_loop)
-            self.haptic_thread.start()
+        self.stop_event = threading.Event()
+        self.threads = []
 
-    def close_tac_processing(self):
-        # Close threads for each tactile sensor
-        self.thumb_thread.join()
-        self.index_thread.join()
-        self.middle_thread.join()
+        def start_thread(name, target):
+            thread = threading.Thread(target=target, name=name, daemon=False)
+            thread.start()
+            self.threads.append(thread)
+            self.get_logger().info(f"Started thread: {name}")
+
+        start_thread("thumb_tactile", self.process_thumb_tactile)
+        start_thread("index_tactile", self.process_index_tactile)
+        start_thread("middle_tactile", self.process_middle_tactile)
 
         if self.enable_haptic:
-            self.haptic_thread.join()
+            start_thread("haptic_feedback", self.haptic_feedback_loop)
+
+    def stop_tac_processing(self):
+        # Signal all threads to stop
+        if hasattr(self, "stop_event"):
+            self.stop_event.set()
+
+        # Wait for all threads to exit
+        if hasattr(self, "threads"):
+            for t in self.threads:
+                t.join(timeout=2)
+                if t.is_alive():
+                    self.get_logger().warn(f"Thread {t.name} did not exit cleanly.")
+
 
     def get_current_leap_position(self):
         # Create a request for the LeapPosition service
         # self.get_logger().info("Requesting current Leap position...")
         req = LeapPosition.Request()
         future = self.leap_position_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
         if future.result() is not None:
             return list(future.result().position)
         else:
@@ -502,8 +530,8 @@ class RobotRecorder(Node):
         self.vis = None
 
         # Initialize Open3D visualization
-        print("Initializing Open3D visualization...")
         if self.enable_visualization:
+            print("Initializing Open3D visualization...")
             self.vis = o3d.visualization.Visualizer()
             self.vis.create_window()
             self.vis.get_view_control().change_field_of_view(step=1.0)
@@ -568,8 +596,6 @@ class RobotRecorder(Node):
     def test_callback(self, joint_state_msg, leap_hand_msg):
         self.new_msg_received_flag  = True
         print("Synchronized data received")
-        
-
     
     
     def sync_callback(self, joint_state_msg, thumb_raw_msg, index_raw_msg, middle_raw_msg, thumb_deform_msg, index_deform_msg, middle_deform_msg):
@@ -695,11 +721,27 @@ class RobotRecorder(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to save joint buffer: {e}")
     
+    def frame_saver(self):
+        while True:
+            frame = self.frame_queue.get()
+            try:
+                frame_id, frame_data = frame
+                if frame_id is None:  # sentinel
+                    return
+                save_frame(frame_id, self.out_directory, *frame_data)
+                self.get_logger().info(f"Frame {frame_id + 1} saved.")
+            except Exception as e:
+                # Log but keep the pipeline moving
+                self.get_logger().error(f"Error saving frame {frame_id}: {e}")
+            finally:
+                # Always mark this item done (including the sentinel)
+                self.frame_queue.task_done()
+
 
     def process_frame(self):
         self.configure_stream()
         frame_count = 0
-        time.sleep(1)
+        time.sleep(0.1)
         self.first_frame = True
         o3d_depth_intrinsic = o3d.camera.PinholeCameraIntrinsic(self.intrinsics.width, self.intrinsics.height, self.intrinsics.fx, self.intrinsics.fy, self.intrinsics.ppx, self.intrinsics.ppy)
         o3d_depth_intrinsic2 = o3d.camera.PinholeCameraIntrinsic(self.intrinsics2.width, self.intrinsics2.height, self.intrinsics2.fx, self.intrinsics2.fy, self.intrinsics2.ppx, self.intrinsics2.ppy)
@@ -720,7 +762,6 @@ class RobotRecorder(Node):
                 self.new_msg_received_flag = False
                 self.leap_hand_positions = self.get_current_leap_position()
                 self.joint = np.concatenate((self.joint_positions, self.leap_hand_positions))
-
 
                 rgbd, self.depth, self.color = self.get_rgbd_frame_from_realsense(enable_visualization=self.enable_visualization)
                 rgbd2, self.depth2, self.color2 = self.get_rgbd_frame_from_realsense_cam2(enable_visualization=self.enable_visualization)
@@ -754,22 +795,23 @@ class RobotRecorder(Node):
                         self.vis.update_renderer()
                         
                 if self.save:
-                    self.color_buffer.append(copy.deepcopy(self.color))
-                    self.depth_buffer.append(copy.deepcopy(self.depth))
-                    self.color_buffer2.append(copy.deepcopy(self.color2))
-                    self.depth_buffer2.append(copy.deepcopy(self.depth2))
-
-                    # self.pc_buffer.append(copy.deepcopy(self.pc))
-                    # self.pc2_buffer.append(copy.deepcopy(self.pc2))
-                    self.joint_buffer.append(copy.deepcopy(self.joint))
-
-                    self.rthumb_raw_buffer.append(copy.deepcopy(self.thumb_raw_img))
-                    self.rindex_raw_buffer.append(copy.deepcopy(self.index_raw_img))
-                    self.rmiddle_raw_buffer.append(copy.deepcopy(self.middle_raw_img))
-
-                    self.rthumb_deform_buffer.append(copy.deepcopy(self.thumb_deform_img))
-                    self.rindex_deform_buffer.append(copy.deepcopy(self.index_deform_img))
-                    self.rmiddle_deform_buffer.append(copy.deepcopy(self.middle_deform_img))
+                    frame_data = (
+                        [copy.deepcopy(self.color)],
+                        [copy.deepcopy(self.depth)],
+                        [copy.deepcopy(self.color2)],
+                        [copy.deepcopy(self.depth2)],
+                        [copy.deepcopy(self.pc)],
+                        [copy.deepcopy(self.pc2)],
+                        [copy.deepcopy(self.joint)],
+                        [copy.deepcopy(self.thumb_raw_img)],
+                        [copy.deepcopy(self.index_raw_img)],
+                        [copy.deepcopy(self.middle_raw_img)],
+                        [copy.deepcopy(self.thumb_deform_img)],
+                        [copy.deepcopy(self.index_deform_img)],
+                        [copy.deepcopy(self.middle_deform_img)],
+                    )
+                    self.frame_queue.put((frame_count, frame_data))
+                    # print(f"Enqueued frame {frame_count + 1} for saving.")
 
                 time_end = time.perf_counter()
                 time_sleep = max(0, self.sample_period - (time_end - time_start))
@@ -787,10 +829,7 @@ class RobotRecorder(Node):
             print("An error occurred while processing frames")
             print(e)
         finally:
-            print("Frame processing completed")
-            print("saving frames...")
-            # input("Press Enter to continue...")
-            if self.save:                # Save tactile reference images
+            if self.save:
                 if self.enable_tactile:
                     if not os.path.exists(os.path.join(self.out_directory, "tactile_ref")):
                         os.makedirs(os.path.join(self.out_directory, "tactile_ref"))
@@ -798,31 +837,9 @@ class RobotRecorder(Node):
                     cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rindex_raw_reference.jpg"), self.index_tactile_sensor.ref)
                     cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rmiddle_raw_reference.jpg"), self.middle_tactile_sensor.ref)
                     print("Tactile reference images saved.")
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    futures = [
-                        executor.submit(
-                            save_frame,
-                            frame_id,
-                            self.out_directory,
-                            self.color_buffer,
-                            self.depth_buffer,
-                            self.color_buffer2,
-                            self.depth_buffer2,
-                            self.pc_buffer,
-                            self.pc2_buffer,
-                            self.joint_buffer,
-                            self.rthumb_raw_buffer,
-                            self.rindex_raw_buffer,
-                            self.rmiddle_raw_buffer,
-                            self.rthumb_deform_buffer,
-                            self.rindex_deform_buffer,
-                            self.rmiddle_deform_buffer
-                        )
-                        for frame_id in range(frame_count)
-                    ]
-
-                    for future in concurrent.futures.as_completed(futures):
-                        print(future.result(), f" total frame: {frame_count}")
+                # Send sentinel to stop the saver thread
+                self.frame_queue.put((None, None))
+                self.saving_thread.join()
 
 def main():
     parser = argparse.ArgumentParser(description="Record FR3 Leap data")
@@ -840,10 +857,12 @@ def main():
     )
     args = parser.parse_args()
     rclpy.init()
+
     robot_recorder = RobotRecorder(
-        total_frame=10000,
-        out_directory="/home/user/recorded_data/test"
+        total_frame=args.total_frame,
+        out_directory=args.out_directory,
     )
+
     executor = MultiThreadedExecutor()
     executor.add_node(robot_recorder)
     executor_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -855,11 +874,13 @@ def main():
     except KeyboardInterrupt:
         print("KeyboardInterrupt received. Shutting down...")
     finally:
+        robot_recorder.stop_tac_processing()
         executor.shutdown()
         robot_recorder.destroy_node()
+        executor_thread.join(timeout=1.0)
+
         if rclpy.ok():
             rclpy.shutdown()        # Optionally join the thread if not daemon
-        # executor_thread.join()
     return 0
 
 if __name__ == "__main__":

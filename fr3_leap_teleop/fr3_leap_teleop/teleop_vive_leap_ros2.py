@@ -38,6 +38,9 @@ from leap_hand.srv import LeapPosition, LeapVelocity, LeapEffort, LeapPosVelEff
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+import threading
+
 from geometry_msgs.msg import PoseStamped, TwistStamped
 
 from scipy.spatial.transform import Rotation as R
@@ -65,7 +68,7 @@ arm_control = True  # Whether to control the arm
 camera_type = "generic"  # "realsense" or "generic"
 
 # Open3D visualization setup
-visualize=True  # Set to True to enable Open3D visualization (Vive trackers and hand detection)
+visualize=False  # Set to True to enable Open3D visualization (Vive trackers and hand detection)
 
 # Define a color map for tracker IDs
 tracker_color_map = {
@@ -223,6 +226,7 @@ class LeapNode(Node):
         return self.dxl_client.read_pos()
     # Service that reads and returns the pos of the robot in regular LEAP Embodiment scaling.
     def pos_srv(self, request, response):
+        # self.get_logger().info("Received /leap_position request")
         response.position = self.dxl_client.read_pos().tolist()
         return response
     #read velocity
@@ -231,8 +235,20 @@ class LeapNode(Node):
     #read current
     def read_cur(self):
         return self.dxl_client.read_cur()
+    def cleanup(self):
+        # Send relax command to all motors
+        try:
+            pwm_vals = [0.] * 16
+            self.dxl_client.write_desired_pos(self.motors, pwm_vals)
+            self.dxl_client.set_torque_enabled(self.motors, False)
+            print("[LEAP] Motors relaxed.")
+        except Exception as e:
+            print(f"[LEAP] Failed to relax motors: {e}")
 
-def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path: str, leaphand :LeapNode):
+def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path: str, shutdown_event):
+    rclpy.init()
+    leaphand = LeapNode()
+
     RetargetingConfig.set_default_urdf_dir(str(robot_dir))
     logger.info(f"Start retargeting with config {config_path}")
     retargeting = RetargetingConfig.load_from_file(config_path).build()
@@ -249,166 +265,159 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
     # retargeting_joint_names = retargeting.joint_names
     # retargeting_to_sapien = np.array([retargeting_joint_names.index(name) for name in sapien_joint_names]).astype(int)
 
-    while True:
-        start_t = time.time()
-        try:
-            rgb = queue.get(timeout=50)
-        except Empty:
-            logger.error(f"Fail to fetch image from camera in 50 secs. Please check your web camera device.")
-            return
+    # Start executor in a background thread so services/callbacks run
+    executor = MultiThreadedExecutor()
+    executor.add_node(leaphand)
+    executor_thread = threading.Thread(target=executor.spin, daemon=True)
+    executor_thread.start()
+    
+    # time.sleep(1)
+    # logger.info(f"Executor thread alive? {executor_thread.is_alive()}")
 
-        _, joint_pos, _, _ = detector.detect(rgb)
-        if joint_pos is None:
-            # logger.warning(f"{hand_type} hand is not detected.")
-            pass
-        else:
-            retargeting_type = retargeting.optimizer.retargeting_type
-            indices = retargeting.optimizer.target_link_human_indices
-            if retargeting_type == "POSITION":
-                indices = indices
-                ref_value = joint_pos[indices, :]
-            else:
-                origin_indices = indices[0, :]
-                task_indices = indices[1, :]
-                ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
-            qpos = retargeting.retarget(ref_value) # ,np.array([-0.3,-1.0])) # fixed q_pos
-            # logger.info(f"Link names: {retargeting.optimizer.link_names}\n")
-            # logger.info(f"Computed link names: {retargeting.optimizer.computed_link_names}\n")
-            # logger.info(f"Origin link names: {retargeting.optimizer.origin_link_names}\n")
-            # logger.info(f"Task link names: {retargeting.optimizer.task_link_names}\n")
-            # logger.info(f"Projected: {retargeting.optimizer.projected}\n")
-            # logger.info(f"Project index origin: {retargeting.optimizer.s2_project_index_origin}\n")
-            # logger.info(f"Project index task: {retargeting.optimizer.s2_project_index_task}\n")
-            # logger.info(f"Projected dist: {retargeting.optimizer.projected_dist}\n")
-            # logger.info(f"Target vector: {retargeting.optimizer.target_vec_dist}\n")
-            # logger.info(f"qpos: {qpos}\n")
-            # print("qpos: " + ", ".join(f"{pos:.4f}" for pos in qpos))
-
-            # logger.info(f"Body position: {retargeting.optimizer.body_pos}")
-            # if retargeting.optimizer.forward_parallel_loss is not None:
-            #     logger.info(f"forward parallelism loss: {retargeting.optimizer.forward_parallel_loss}")
-            # if retargeting.optimizer.side_parallel_loss is not None:
-            #     logger.info(f"side parallelism loss: {retargeting.optimizer.side_parallel_loss}")
-            # logger.info(f"Huber distance loss: {retargeting.optimizer.huber_distance}")
-
-            qpos_cmd = np.zeros(16)
-            # current_pos = leaphand.read_pos()
-            # diff = (qpos[0]- current_pos[0] + 3.14) 
-            # if  abs(diff)> 0.001:
-            #     diff = np.sign(diff) * 0.001
-                 
-            # qpos_cmd[0] =  current_pos[0] +  diff 
-
-            # qpos_cmd[0] = qpos[0]
-            # qpos_cmd[1] = qpos[1]
-            # qpos_cmd[2] = qpos[2]
-            # qpos_cmd[3] = qpos[3]
-
-            # qpos_cmd[4] = qpos[8] # thumb - middle
-            # qpos_cmd[5] = qpos[9]
-            # qpos_cmd[6] = qpos[10]
-            # qpos_cmd[7] = qpos[11]
-
-            # qpos_cmd[8] = qpos[12] # none
-            # qpos_cmd[9] = qpos[13]
-            # qpos_cmd[10] = qpos[14]
-            # qpos_cmd[11] = qpos[15]
-
-            # qpos_cmd[12] = qpos[4] # thumb - middle 
-            # qpos_cmd[13] = qpos[5]
-            # qpos_cmd[14] = qpos[6]
-            # qpos_cmd[15] = qpos[7]
-
-            # ['1', '0', '2', '3', '12', '13', '14', '15', '5', '4', '6', '7', '9', '8', '10', '11']
-
-            if teleop_mode == "side_to_side":
-                # #Index
-                # qpos_cmd[0] = qpos[1] # rotation
-                # qpos_cmd[1] = qpos[0] # base
-                # qpos_cmd[2] = qpos[2] # middle
-                # qpos_cmd[3] = -0.3 #qpos[3]-1.4 # tip
-
-                # # Middle finger
-                # qpos_cmd[4] = qpos[9] # rotation
-                # qpos_cmd[5] = qpos[8] # base
-                # qpos_cmd[6] = qpos[10] # middle
-                # qpos_cmd[7] = qpos[11]
-
-                # # Pinky 
-                # qpos_cmd[8] = qpos[13] # rotation
-                # qpos_cmd[9] = qpos[12] # base
-                # qpos_cmd[10] = qpos[14] # middle
-                # qpos_cmd[11] = qpos[15] # tip
-
-                # # Thumb
-                # qpos_cmd[12] = qpos[4] # base 
-                # qpos_cmd[13] = qpos[5] # rotation
-                # qpos_cmd[14] = qpos[6]#+0.3 # middle
-                # qpos_cmd[15] = -1.0 # tip
-                                
-                #Index
-                qpos_cmd[0] = qpos[1] # rotation
-                qpos_cmd[1] = qpos[0] # base
-                qpos_cmd[2] = qpos[2] # middle
-                qpos_cmd[3] = qpos[3] # tip
-
-                # Middle finger
-                qpos_cmd[4] = qpos[9] # rotation
-                qpos_cmd[5] = qpos[8] # base
-                qpos_cmd[6] = qpos[10] # middle
-                qpos_cmd[7] = qpos[11] # tip
-
-                # Pinky 
-                qpos_cmd[8] = qpos[13] # rotation
-                qpos_cmd[9] = qpos[12] # base
-                qpos_cmd[10] = qpos[14] # middle
-                qpos_cmd[11] = qpos[15] # tip
-
-                # Thumb
-                qpos_cmd[12] = qpos[4] # base 
-                qpos_cmd[13] = qpos[5] # rotation
-                qpos_cmd[14] = qpos[6] # middle
-                qpos_cmd[15] = qpos[7] # tip
-
-            elif teleop_mode == "mirror":
-                qpos_cmd[0] = -qpos[1]
-                qpos_cmd[1] = qpos[0]
-                qpos_cmd[2] = qpos[2]
-                qpos_cmd[3] = qpos[3]
-
-                qpos_cmd[4] = -qpos[9] # thumb - middle
-                qpos_cmd[5] = qpos[8]
-                qpos_cmd[6] = qpos[10]
-                qpos_cmd[7] = qpos[11]
-
-                qpos_cmd[8] = -qpos[13] # none
-                qpos_cmd[9] = qpos[12]
-                qpos_cmd[10] = qpos[14]
-                qpos_cmd[11] = qpos[15]
-
-                qpos_cmd[12] = -qpos[4] # thumb - middle 
-                qpos_cmd[13] = qpos[5]
-                qpos_cmd[14] = qpos[6]
-                qpos_cmd[15] = qpos[7]
-            
-            else:
-                print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
+    try:
+        while not shutdown_event.is_set():
+            start_t = time.time()
+            try:
+                rgb = queue.get(timeout=5)
+            except Empty:
+                logger.error(f"Fail to fetch image from camera in 5 secs. Please check your web camera device.")
                 continue
 
-            # qpos_cmd[8] = qpos[8]        
+            _, joint_pos, _, _ = detector.detect(rgb)
+            if joint_pos is None:
+                # logger.warning(f"{hand_type} hand is not detected.")
+                pass
+            else:
+                retargeting_type = retargeting.optimizer.retargeting_type
+                indices = retargeting.optimizer.target_link_human_indices
+                if retargeting_type == "POSITION":
+                    indices = indices
+                    ref_value = joint_pos[indices, :]
+                else:
+                    origin_indices = indices[0, :]
+                    task_indices = indices[1, :]
+                    ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
+                qpos = retargeting.retarget(ref_value) # ,np.array([-0.3,-1.0])) # fixed q_pos
+                # logger.info(f"Link names: {retargeting.optimizer.link_names}\n")
+                # logger.info(f"Computed link names: {retargeting.optimizer.computed_link_names}\n")
+                # logger.info(f"Origin link names: {retargeting.optimizer.origin_link_names}\n")
+                # logger.info(f"Task link names: {retargeting.optimizer.task_link_names}\n")
+                # logger.info(f"Projected: {retargeting.optimizer.projected}\n")
+                # logger.info(f"Project index origin: {retargeting.optimizer.s2_project_index_origin}\n")
+                # logger.info(f"Project index task: {retargeting.optimizer.s2_project_index_task}\n")
+                # logger.info(f"Projected dist: {retargeting.optimizer.projected_dist}\n")
+                # logger.info(f"Target vector: {retargeting.optimizer.target_vec_dist}\n")
+                # logger.info(f"qpos: {qpos}\n")
+                # print("qpos: " + ", ".join(f"{pos:.4f}" for pos in qpos))
 
-            # qpos_cmd = qpos
-            # print(f"{qpos_cmd[1]:.4f}")
-            # print("qpos_cmd: " + ", ".join(f"{pos:.4f}" for pos in qpos_cmd))
-            end_t = time.time()
-            # print(f"time: {end_t - start_t:.4f} s")
-        
-            if hand_control:
-                leaphand.set_allegro(qpos_cmd)
+                # logger.info(f"Body position: {retargeting.optimizer.body_pos}")
+                # if retargeting.optimizer.forward_parallel_loss is not None:
+                #     logger.info(f"forward parallelism loss: {retargeting.optimizer.forward_parallel_loss}")
+                # if retargeting.optimizer.side_parallel_loss is not None:
+                #     logger.info(f"side parallelism loss: {retargeting.optimizer.side_parallel_loss}")
+                # logger.info(f"Huber distance loss: {retargeting.optimizer.huber_distance}")
 
-            # print("Position: " + str(leaphand.read_pos()))
-            # time.sleep(0.02)
-            # a = input("test")
+                qpos_cmd = np.zeros(16)
+
+                if teleop_mode == "side_to_side":
+                                    
+                    #Index
+                    qpos_cmd[0] = qpos[1] # rotation
+                    qpos_cmd[1] = qpos[0] # base
+                    qpos_cmd[2] = qpos[2] # middle
+                    qpos_cmd[3] = qpos[3] # tip
+
+                    # Middle finger
+                    qpos_cmd[4] = qpos[9] # rotation
+                    qpos_cmd[5] = qpos[8] # base
+                    qpos_cmd[6] = qpos[10] # middle
+                    qpos_cmd[7] = qpos[11] # tip
+
+                    # Pinky 
+                    qpos_cmd[8] = qpos[13] # rotation
+                    qpos_cmd[9] = qpos[12] # base
+                    qpos_cmd[10] = qpos[14] # middle
+                    qpos_cmd[11] = qpos[15] # tip
+
+                    # Thumb
+                    qpos_cmd[12] = qpos[4] # base 
+                    qpos_cmd[13] = qpos[5] # rotation
+                    qpos_cmd[14] = qpos[6] # middle
+                    qpos_cmd[15] = qpos[7] # tip
+
+                elif teleop_mode == "mirror":
+                    qpos_cmd[0] = -qpos[1]
+                    qpos_cmd[1] = qpos[0]
+                    qpos_cmd[2] = qpos[2]
+                    qpos_cmd[3] = qpos[3]
+
+                    qpos_cmd[4] = -qpos[9] # thumb - middle
+                    qpos_cmd[5] = qpos[8]
+                    qpos_cmd[6] = qpos[10]
+                    qpos_cmd[7] = qpos[11]
+
+                    qpos_cmd[8] = -qpos[13] # none
+                    qpos_cmd[9] = qpos[12]
+                    qpos_cmd[10] = qpos[14]
+                    qpos_cmd[11] = qpos[15]
+
+                    qpos_cmd[12] = -qpos[4] # thumb - middle 
+                    qpos_cmd[13] = qpos[5]
+                    qpos_cmd[14] = qpos[6]
+                    qpos_cmd[15] = qpos[7]
+                
+                else:
+                    print(f"[ERROR] Unknown teleop mode: {teleop_mode}. Use 'mirror' or 'side_to_side'.")
+                    continue
+
+                # qpos_cmd[8] = qpos[8]        
+
+                # qpos_cmd = qpos
+                # print(f"{qpos_cmd[1]:.4f}")
+                # print("qpos_cmd: " + ", ".join(f"{pos:.4f}" for pos in qpos_cmd))
+                end_t = time.time()
+                # print(f"time: {end_t - start_t:.4f} s")
+            
+                if hand_control:
+                    leaphand.set_allegro(qpos_cmd)
+
+            # logger.info(f"Executor thread alive? {executor_thread.is_alive()}")
+    
+    except Exception:
+        logger.exception("Exception in child retargeting loop")
+
+    finally:
+        # orderly shutdown in child:
+        try:
+            executor.shutdown(timeout_sec=1.0)
+        except Exception:
+            logger.exception("Executor shutdown failed in child")
+        try:
+            executor_thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+        # try to disable motors cleanly
+        try:
+            if hasattr(leaphand, "dxl_client") and leaphand.dxl_client is not None:
+                try:
+                    leaphand.dxl_client.set_torque_enabled(leaphand.motors, False)
+                except Exception:
+                    logger.exception("Failed to disable torque in child")
+        except Exception:
+            pass
+
+        try:
+            leaphand.cleanup()
+        except Exception:
+            pass
+
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+        logger.info("start_retargeting: child exiting cleanly")
 
 # --- Camera Producer (runs in a process) ---
 def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visualize=True):
@@ -495,7 +504,7 @@ def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visuali
         cv2.destroyAllWindows()
         print("[INFO] Camera stream stopped.")
 
-def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None):
+def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None, visualize=True):
 
     # Initialize hand detector
     detector = SingleHandDetector(hand_type="Right", selfie=False)
@@ -739,6 +748,12 @@ async def main(args=None):
 
     vis = None
 
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # start method already set
+        pass
+
     # ROS2 setup
     rclpy.init(args=args)
     node = ViveToROS2Publisher()
@@ -749,20 +764,13 @@ async def main(args=None):
     d405_serial_number = "218622273562"  # Replace with your D405 serial
 
     if camera_type == "realsense":
-        producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue,d405_serial_number))
+        producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue, d405_serial_number, visualize))
     elif camera_type == "generic":
-        producer_process = multiprocessing.Process(target=produce_camera_frame, args=(queue, camera_path))
+        producer_process = multiprocessing.Process(target=produce_camera_frame, args=(queue, camera_path, visualize))
     else:
         print(f"[ERROR] Unknown camera type: {camera_type}. Use 'generic' or 'realsense'.")
         return
 
-    # cap = cv2.VideoCapture(camera_path or 0)
-    # if cap.isOpened():
-    #     producer_process = multiprocessing.Process(target=produce_frame, args=(queue, camera_path))
-    # else:
-    #     print("[INFO] Webcam not found, trying RealSense D405.")
-    #     producer_process = multiprocessing.Process(target=produce_realsense_frame, args=(queue,d405_serial_number))
-    
     producer_process.start()
 
     # LEAP Hand setup
@@ -779,17 +787,16 @@ async def main(args=None):
         return
     
     if hand == True and ee_id == "leap_hand":
-        leap_hand = LeapNode()
         robot_dir = Path(get_package_share_directory('dex_retargeting')) / 'assets/robots/hands'
         # robot_dir = Path(__file__).resolve().parents[2] / "assets/robots/hands"
         # robot_dir = Path('/home/user/franka_ros2_ws/src/dex_retargeting/assets/robots/hands')
+        shutdown_event = multiprocessing.Event()
         consumer_process = multiprocessing.Process(
             target=start_retargeting,
-            args=(queue, str(robot_dir), str(config_path), leap_hand)
+            args=(queue, str(robot_dir), str(config_path), shutdown_event)
         )
         consumer_process.start()
     else:
-        leap_hand = None
         consumer_process = None
         print(f"[INFO] LEAP hand control is disabled (ee_id: {ee_id})")
 
@@ -893,9 +900,9 @@ async def main(args=None):
             
             rclpy.spin_once(node, timeout_sec=0.01)
 
-            # NEW: also spin LeapNode so it handles the service
-            if leap_hand is not None:
-                rclpy.spin_once(leap_hand, timeout_sec=0.01)
+            # # NEW: also spin LeapNode so it handles the service
+            # if leap_hand is not None:
+            #     rclpy.spin_once(leap_hand, timeout_sec=0.01)
 
             # --- Visualization ---
             if visualize and vive_poses:
@@ -930,19 +937,42 @@ async def main(args=None):
         print(f"[ERROR] An error occurred: {e}", flush=True)
         logger.exception("Exception in main loop")
     finally:
-        producer_process.terminate()
+        # 1) signal child processes to stop
+        try:
+            shutdown_event.set()
+        except Exception:
+            pass
+
+        # 2) give consumer a short grace period to exit
         if consumer_process is not None:
-            consumer_process.terminate()
-        # cap.release()
-        cv2.destroyAllWindows()
-        if visualize:
-            try:
+            consumer_process.join(timeout=2.0)
+            if consumer_process.is_alive():
+                # force-kill only if needed
+                consumer_process.terminate()
+                consumer_process.join(timeout=1.0)
+
+        # 3) stop producer (camera) more gracefully if possible
+        try:
+            producer_process.terminate()
+            producer_process.join(timeout=1.0)
+        except Exception:
+            pass
+
+        # 4) destroy visual windows etc.
+        try:
+            cv2.destroyAllWindows()
+            if visualize and vis is not None:
                 vis.destroy_window()
-            except:
-                pass
-        
-        if rclpy.ok():
-            rclpy.shutdown()
+        except Exception:
+            pass
+
+        # 5) Now safe to shutdown rclpy in parent
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
+
 
 def run():
     asyncio.run(main())
