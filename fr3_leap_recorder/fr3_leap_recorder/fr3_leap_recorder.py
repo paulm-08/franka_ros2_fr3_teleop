@@ -5,6 +5,8 @@ import copy         # deep copy, preventing unintended changes to original data
 import numpy as np
 import os
 from os import path
+import re
+
 import cv2   # cv2.imwrite
 
 # ROS2 for ExoHand
@@ -21,6 +23,8 @@ from cv_bridge import CvBridge
 import concurrent.futures 
 import queue
 import threading
+
+from sensor_msgs.msg import Image
 
 # for getting point cloud
 from sensor_msgs.msg import PointCloud2
@@ -52,6 +56,7 @@ TACT_BASE_PATH = get_package_share_directory('tact9d') + '/shape_reconstruction/
 def save_frame(
     frame_id,
     out_directory,
+    starting_frame,
     color_buffer,
     depth_buffer,
     color_buffer2,
@@ -66,6 +71,10 @@ def save_frame(
     rindex_deform_buffer,
     rmiddle_deform_buffer,
 ):
+    """Save a single frame's data to disk."""
+    
+    frame_id = frame_id + starting_frame
+
     # Each buffer is a single-item list containing the frame data
     frame_directory = os.path.join(out_directory, f"frame_{frame_id}")
     os.makedirs(frame_directory, exist_ok=True)
@@ -143,7 +152,7 @@ class RobotRecorder(Node):
         total_frame,
         out_directory=None,
         enable_tactile=True,
-        enable_visualization=False,
+        enable_visualization=True,
         enable_haptic=True,
     ):
         super().__init__("TacExo_Real_Record_Data")
@@ -152,6 +161,8 @@ class RobotRecorder(Node):
         self.enable_visualization = enable_visualization
         self.enable_haptic = enable_haptic
         self.out_directory = out_directory or "recorded_data"
+        self.starting_frame = self.get_next_frame_id(out_directory)
+
         self.bridge = CvBridge()
         self.sample_rate = 20 # 20 Hz (make it a constant in hyperparameters.py or in input arguments in the furture)
         self.sample_period = 1.0 / self.sample_rate # 1/30 = 0.0333s
@@ -289,6 +300,11 @@ class RobotRecorder(Node):
 
         # Tactile sensors
         if self.enable_tactile:
+            if enable_visualization:
+                self.thumb_pub = self.create_publisher(Image, "/tactile/thumb", 10)
+                self.index_pub = self.create_publisher(Image, "/tactile/index", 10)
+                self.middle_pub = self.create_publisher(Image, "/tactile/middle", 10)
+    
             # tactile configuration loading and init
             # thumb_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_tacexo_thumb.yaml")
             thumb_cfg_path = os.path.join(TACT_BASE_PATH, "shape_config_thumb.yaml")
@@ -336,24 +352,62 @@ class RobotRecorder(Node):
             # Start threads for each tactile sensor
             self.start_tac_processing()
             # self.visualize_tactile()
+
+            self.bridge = CvBridge()
+
+    def get_next_frame_id(self, out_directory):
+        """
+        Find the next frame_id to use by checking existing frame directories.
+        """
+        if not os.path.exists(out_directory):
+            self.get_logger().info("No existing directory found. Starting from frame 0.")
+            return 0
+
+        # Find all existing frame directories
+        frame_dirs = [
+            d for d in os.listdir(out_directory)
+            if os.path.isdir(os.path.join(out_directory, d)) and re.match(r"^frame_\d+$", d)
+        ]
+
+        if not frame_dirs:
+            self.get_logger().info("No existing frame directories found. Starting from frame 0.")
+            return 0
+
+        # Extract numeric IDs from directory names and get the max
+        existing_ids = [int(d.split("_")[1]) for d in frame_dirs]
+        self.get_logger().info(f"Existing directory found: {out_directory}. Starting from frame {max(existing_ids) + 1}.")
+        return max(existing_ids) + 1
     
     def haptic_feedback_loop(self):
+        
         try:
             ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
         except serial.SerialException as e:
             print(f"[HAPTIC] Serial connection failed: {e}")
             return
+        
+        ser.reset_input_buffer()  # discard any leftover bytes
+        time.sleep(0.5)  # Let ESP32 boot
+
+        CROP_TOP = 30
+        CROP_BOTTOM = 30
+        CROP_LEFT = 30
+        CROP_RIGHT = 30
 
         try:
             while not self.stop_event.is_set():
                 try:
                     with self.tac_thumb_lock:
-                        thumb_map = self.thumb_height_map.copy()
+                        thumb_map = np.array(self.thumb_height_map)
+                        thumb_map = thumb_map[CROP_TOP:thumb_map.shape[0] - CROP_BOTTOM, CROP_LEFT:thumb_map.shape[1] - CROP_RIGHT].copy()
                     with self.tac_index_lock:
-                        index_map = self.index_height_map.copy()
-                    with self.tac_middle_lock:
-                        middle_map = self.middle_height_map.copy()
+                        index_map = np.array(self.index_height_map)
+                        index_map = index_map[CROP_TOP:index_map.shape[0] - CROP_BOTTOM, CROP_LEFT:index_map.shape[1] - CROP_RIGHT].copy()
 
+                    with self.tac_middle_lock:
+                        middle_map = np.array(self.middle_height_map)
+                        middle_map = middle_map[CROP_TOP:middle_map.shape[0] - CROP_BOTTOM, CROP_LEFT:middle_map.shape[1] - CROP_RIGHT].copy()
+                        
                     if len(thumb_map) > 0:
                         pwm_thumb = min(np.max(thumb_map) /3, 0.5)
                     else:
@@ -371,18 +425,21 @@ class RobotRecorder(Node):
                     packet = struct.pack('<5f', *pwm_vals)
                     ser.write(packet)
 
-                    # print(f"[HAPTIC] Sent PWM: {pwm_vals}")
-                    time.sleep(0.03)
+                    self.get_logger().info(f"[HAPTIC] Sent PWM: {pwm_vals}")
+                    time.sleep(0.1)
 
                 except KeyboardInterrupt:
-                    print("[HAPTIC] Keyboard interrupt received.")
+                    self.get_logger().info("[HAPTIC] Keyboard interrupt received.")
                     break
+                except Exception as e:
+                    self.get_logger().info(f"[HAPTIC] Exception in haptic loop: {e}")
+                    continue
 
         finally:
             pwm_vals = [0.] * 5
             packet = struct.pack('<5f', *pwm_vals)
             ser.write(packet)
-            print("[HAPTIC] Motors stopped.")
+            self.get_logger().info("[HAPTIC] Motors stopped.")
             ser.close()
 
 
@@ -395,7 +452,30 @@ class RobotRecorder(Node):
         raw_img = sensor.get_rectify_crop_image()
         img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
         height_map = sensor.raw_image_2_height_map(img_GRAY)
-        height_map = sensor.expand_image(height_map)
+
+        if self.enable_visualization:
+            CROP_TOP = 30
+            CROP_BOTTOM = 30
+            CROP_LEFT = 30
+            CROP_RIGHT = 30
+
+            height_map_cropped = height_map[CROP_TOP:height_map.shape[0] - CROP_BOTTOM,
+                                CROP_LEFT:height_map.shape[1] - CROP_RIGHT]
+
+            height_map_cropped = sensor.expand_image(height_map_cropped)
+
+            height_map_normalized = cv2.normalize(height_map_cropped, None, 0, 255, cv2.NORM_MINMAX)
+            height_map_uint8 = height_map_normalized.astype(np.uint8)
+            height_map_color = cv2.applyColorMap(height_map_uint8, cv2.COLORMAP_JET)
+
+            img_msg = self.bridge.cv2_to_imgmsg(height_map_color, encoding="bgr8")
+            if sensor.sensor_id == 1:
+                self.thumb_pub.publish(img_msg)
+            elif sensor.sensor_id == 2:
+                self.index_pub.publish(img_msg)
+            elif sensor.sensor_id == 3:
+                self.middle_pub.publish(img_msg)
+
         # heat_map_input = cv2.normalize(height_map, None, 0, 255, cv2.NORM_MINMAX)
         # heat_map_input = np.uint8(heat_map_input)
         # heat_map = cv2.applyColorMap(heat_map_input, cv2.COLORMAP_JET)
@@ -440,6 +520,41 @@ class RobotRecorder(Node):
                 self.middle_heat_map = middle_heat_map
                 self.middle_height_map = middle_height_map
 
+    def visualize_tactile(self):
+        while not self.stop_event.is_set():
+            imgs_to_show = []
+
+            with self.tac_thumb_lock:
+                if hasattr(self, "thumb_raw_img"):
+                    imgs_to_show.append(("Thumb Raw", self.thumb_raw_img))
+                if hasattr(self, "thumb_height_map"):
+                    imgs_to_show.append(("Thumb Height", self.thumb_height_map))
+
+            with self.tac_index_lock:
+                if hasattr(self, "index_raw_img"):
+                    imgs_to_show.append(("Index Raw", self.index_raw_img))
+                if hasattr(self, "index_height_map"):
+                    imgs_to_show.append(("Index Height", self.index_height_map))
+
+            with self.tac_middle_lock:
+                if hasattr(self, "middle_raw_img"):
+                    imgs_to_show.append(("Middle Raw", self.middle_raw_img))
+                if hasattr(self, "middle_height_map"):
+                    imgs_to_show.append(("Middle Height", self.middle_height_map))
+
+            # Show images if any available
+            for win_name, img in imgs_to_show:
+                cv2.imshow(win_name, img)
+
+            # IMPORTANT: this makes imshow work!
+            if imgs_to_show:
+                # Exit on 'q'
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    self.stop_event.set()
+
+        # Cleanup when stopping
+        cv2.destroyAllWindows()
+
     def start_tac_processing(self):
         self.stop_event = threading.Event()
         self.threads = []
@@ -456,6 +571,9 @@ class RobotRecorder(Node):
 
         if self.enable_haptic:
             start_thread("haptic_feedback", self.haptic_feedback_loop)
+
+        # if self.enable_visualization:
+        #     start_thread("tactile_visualization", self.visualize_tactile)
 
     def stop_tac_processing(self):
         # Signal all threads to stop
@@ -485,12 +603,17 @@ class RobotRecorder(Node):
     # for converting plam lower pose to denso end link ( a predefined tf)
 
     def configure_stream(self):
-        print("Configuring Realsense stream...")
+        self.get_logger().info("Configuring Realsense stream...")
         camera_serials = {
             'camera1': '151422254571',
             'camera2': '036522072607',
             # Add more cameras as needed
         }
+
+        # ctx = rs.context()
+        # devices = ctx.query_devices()
+        # for dev in devices:
+        #     dev.hardware_reset()
 
         # Create a pipeline for d435i
         # Config Camera 1
@@ -502,7 +625,7 @@ class RobotRecorder(Node):
         # config.enable_stream(rs.stream.color, 640, 480, rs.format.rgb8, 30)
         pipeline_profile = self.pipeline.start(config)
         self.intrinsics = pipeline_profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        print(f"Intrinsics for Camera 1: {self.intrinsics}")
+        self.get_logger().info(f"Intrinsics for Camera 1: {self.intrinsics}")
         # a = input("Enter")
         # depth_sensor = pipeline_profile.get_device().first_depth_sensor()
         # depth_sensor.set_option(rs.option.visual_preset, Preset.HighAccuracy)
@@ -517,12 +640,11 @@ class RobotRecorder(Node):
         config2.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
         config2.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         pipeline_profile2 = self.pipeline_cam2.start(config2)
-        # print(f"Started streaming from Camera 2 with serial number {camera_serials['camera2']}")
+        # self.get_logger().info(f"Started streaming from Camera 2 with serial number {camera_serials['camera2']}")
 
         # Get intrinsics for Camera 2
         self.intrinsics2 = pipeline_profile2.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        self.intrinsics_cam2 = self.intrinsics2
-        print(f"Intrinsics for Camera 2: {self.intrinsics2}")
+        self.get_logger().info(f"Intrinsics for Camera 2: {self.intrinsics2}")
 
         # Align depth to color frame for Camera 2
         self.align_cam2 = rs.align(rs.stream.color)
@@ -531,7 +653,7 @@ class RobotRecorder(Node):
 
         # Initialize Open3D visualization
         if self.enable_visualization:
-            print("Initializing Open3D visualization...")
+            self.get_logger().info("Initializing Open3D visualization...")
             self.vis = o3d.visualization.Visualizer()
             self.vis.create_window()
             self.vis.get_view_control().change_field_of_view(step=1.0)
@@ -546,7 +668,7 @@ class RobotRecorder(Node):
         depth_frame = aligned_frames.get_depth_frame()
         color_frame = aligned_frames.get_color_frame()
         if not depth_frame or not color_frame:
-            print("Error: No depth or color frame detected")
+            self.get_logger().info("Error: No depth or color frame detected")
             return None, None, None  # Return None values to indicate error
 
         color_image = np.asanyarray(color_frame.get_data())
@@ -577,7 +699,7 @@ class RobotRecorder(Node):
         depth_frame = aligned_frames.get_depth_frame()
         color_frame = aligned_frames.get_color_frame()
         if not depth_frame or not color_frame:
-            print("Error: No depth or color frame detected")
+            self.get_logger().info("Error: No depth or color frame detected")
             return None, None, None
         color_image = np.asanyarray(color_frame.get_data())
         depth_image = np.asanyarray(depth_frame.get_data())
@@ -595,7 +717,7 @@ class RobotRecorder(Node):
 
     def test_callback(self, joint_state_msg, leap_hand_msg):
         self.new_msg_received_flag  = True
-        print("Synchronized data received")
+        self.get_logger().info("Synchronized data received")
     
     
     def sync_callback(self, joint_state_msg, thumb_raw_msg, index_raw_msg, middle_raw_msg, thumb_deform_msg, index_deform_msg, middle_deform_msg):
@@ -728,7 +850,7 @@ class RobotRecorder(Node):
                 frame_id, frame_data = frame
                 if frame_id is None:  # sentinel
                     return
-                save_frame(frame_id, self.out_directory, *frame_data)
+                save_frame(frame_id, self.out_directory, self.starting_frame, *frame_data)
                 self.get_logger().info(f"Frame {frame_id + 1} saved.")
             except Exception as e:
                 # Log but keep the pipeline moving
@@ -772,7 +894,7 @@ class RobotRecorder(Node):
 
 
                 if self.first_frame:
-                    if self.enable_visualization:
+                    if self.enable_visualization and self.vis is not None:
                         pcd_vis = self.pc
                         pcd_vis2 = self.pc2
                         self.vis.add_geometry(pcd_vis)
@@ -784,7 +906,7 @@ class RobotRecorder(Node):
                         self.vis.add_geometry(robot_base)
                         self.first_frame = False
                 else:
-                    if self.enable_visualization:
+                    if self.enable_visualization and self.vis is not None:
                         pcd_vis.points = self.pc.points
                         pcd_vis.colors = self.pc.colors
                         pcd_vis2.points = self.pc2.points
@@ -826,9 +948,13 @@ class RobotRecorder(Node):
                 frame_count += 1
 
         except Exception as e:
-            print("An error occurred while processing frames")
-            print(e)
+            self.get_logger().info("An error occurred while processing frames")
+            self.get_logger().info(e)
+            
         finally:
+            if self.enable_visualization and self.vis is not None:
+                self.vis.destroy_window()
+
             if self.save:
                 if self.enable_tactile:
                     if not os.path.exists(os.path.join(self.out_directory, "tactile_ref")):
@@ -836,7 +962,7 @@ class RobotRecorder(Node):
                     cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rthumb_raw_reference.jpg"), self.thumb_tactile_sensor.ref)
                     cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rindex_raw_reference.jpg"), self.index_tactile_sensor.ref)
                     cv2.imwrite(os.path.join(self.out_directory, "tactile_ref/rmiddle_raw_reference.jpg"), self.middle_tactile_sensor.ref)
-                    print("Tactile reference images saved.")
+                    self.get_logger().info("Tactile reference images saved.")
                 # Send sentinel to stop the saver thread
                 self.frame_queue.put((None, None))
                 self.saving_thread.join()
