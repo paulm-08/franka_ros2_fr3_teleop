@@ -1,54 +1,61 @@
 from machine import Pin, PWM
 import sys
 import struct
-import time
 
-motor_pwm_pins = [20, 14, 6, 0, 4]
-motor_en_pins  = [21, 15, 7, 1, 5]
-motor_ns_pins  = [19]
 
-# Enable drivers
+# Define PWM and EN pin mappings
+motor_pwm_pins = [20, 14, 6, 0, 4]   # M1–M5 PWM
+motor_en_pins  = [21, 15, 7, 1, 5]   # M1–M5 EN
+motor_ns_pins  = [19]   # NSLEEP
+
+
+# Initial EN Pin
 for pin in motor_en_pins:
-    Pin(pin, Pin.OUT).value(1)
+   en = Pin(pin, Pin.OUT)
+   en.value(1)
+
+
+# Initial NSLEEP Pin
 for pin in motor_ns_pins:
-    Pin(pin, Pin.OUT).value(1)
+   ns = Pin(pin, Pin.OUT)
+   ns.value(1) # No sleep
 
-# PWM setup
-pwms = [PWM(Pin(pin), freq=200) for pin in motor_pwm_pins]
-for pwm in pwms:
-    pwm.duty(0)
 
-# Serial receive buffer
-buf = b""
+# Initialize EN pins (set to HIGH to enable motor drivers)
+for pin in motor_en_pins:
+   en = Pin(pin, Pin.OUT)
+   en.value(1)  # Enable motor driver
 
+
+# Initialize PWM objects
+pwms = []
+for pin in motor_pwm_pins:
+   pwm = PWM(Pin(pin), freq=200)   # 200Hz suitable for ERM vibration motors
+   pwm.duty(0)                     # Start with 0% duty
+   pwms.append(pwm)
+
+
+# Main loop: receive 5 float32 values (20 bytes) and update PWM
 while True:
-    # Read any available bytes from stdin
-    try:
-        chunk = sys.stdin.buffer.read(20)  # read up to 20 bytes
-        if chunk:
-            buf += chunk
-            last_update = time.ticks_ms()
-    except:
-        print("Buffer read failed")
-        continue
+#    print("🚀 Ready to receive PWM values from host...")
+   try:
+       data = sys.stdin.buffer.read(20)
+   except:
+       continue   
 
-    # Process all complete packets
-    while len(buf) >= 20:
-        packet = buf[:20]
-        buf = buf[20:]  # remove processed packet
 
-        try:
-            values = struct.unpack('<5f', packet)
-        except:
-            continue
+   if not data or len(data) < 20:
+       continue
 
-        for i in range(5):
-            val = max(0.0, min(1.0, values[i]))
-            duty = int(val * 1023)
-            pwms[i].duty(duty)
 
-    # # failsafe
-    # if time.ticks_diff(time.ticks_ms(), last_update) > 200:
-    #     for p in pwms:
-    #         p.duty(0)
-    #         break
+   try:
+       values = struct.unpack('<5f', data)
+   except:
+       continue
+
+
+   for i in range(5):
+       # Clamp input to [0.0, 1.0], then map to duty cycle 0–1023
+       val = max(0.0, min(1.0, values[i]))
+       duty = int(val * 1023)
+       pwms[i].duty(duty)

@@ -55,6 +55,8 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 
+from sensor_msgs.msg import JointState
+
 # --- Configuration and Initialization ---
 target_rate = 30  # Target loop rate in Hz
 
@@ -67,7 +69,7 @@ arm_control = True  # Whether to control the arm
 
 camera_type = "generic"  # "realsense" or "generic"
 
-# Open3D visualization setup
+# Open3D and hand detector visualization setup
 visualize=False  # Set to True to enable Open3D visualization (Vive trackers and hand detection)
 
 # Define a color map for tracker IDs
@@ -204,6 +206,10 @@ class LeapNode(Node):
         else:
             logger.info("[WARNING] Hand control is disabled.")
 
+        self.publisher_ = self.create_publisher(JointState, '/leap_hand_joint_cmd', 10)
+        self.publisher2_ = self.create_publisher(JointState, '/leap_hand_joint_state', 10)
+        self._joint_names = [f"leap_joint_{i}" for i in range(16)]
+
     #Receive LEAP pose and directly control the robot
     def set_leap(self, pose):
         self.prev_pos = self.curr_pos
@@ -257,8 +263,8 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
     logger.info(f"Retargeting type: {retargeting.optimizer.retargeting_type}")
     logger.info(f"Num fingers: {retargeting.optimizer.num_fingers}")
 
-    hand_type = "Right" if "right" in config_path.lower() else "Left"
-    detector = SingleHandDetector(hand_type=hand_type, selfie=False)
+    # hand_type = "Right" if "right" in config_path.lower() else "Left"
+    # detector = SingleHandDetector(hand_type=hand_type, selfie=False)
 
     # Different robot loader may have different orders for joints
     # sapien_joint_names = [joint.get_name() for joint in robot.get_active_joints()]
@@ -275,15 +281,25 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
     # logger.info(f"Executor thread alive? {executor_thread.is_alive()}")
 
     try:
+        loop_counter = 0
+        print_interval = 100  # Print every 100 loops
+        last_print_time = time.time()
         while not shutdown_event.is_set():
-            start_t = time.time()
             try:
-                rgb = queue.get(timeout=5)
-            except Empty:
-                logger.error(f"Fail to fetch image from camera in 5 secs. Please check your web camera device.")
-                continue
+                start = time.time()
+                joint_pos = queue.get(timeout=5)
+                queue_time = time.time() - start
 
-            _, joint_pos, _, _ = detector.detect(rgb)
+            except Empty:
+                # logger.error(f"Fail to fetch image from camera in 5 secs. Please check your web camera device.")
+                print("[ERROR] No hand keypoints received in 5 seconds, retrying...")
+                continue
+            
+            start = time.time()
+            # _, joint_pos, _, _ = detector.detect(rgb)
+
+            detect_time = time.time() - start
+
             if joint_pos is None:
                 # logger.warning(f"{hand_type} hand is not detected.")
                 pass
@@ -297,7 +313,13 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
                     origin_indices = indices[0, :]
                     task_indices = indices[1, :]
                     ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
+
+                start = time.time()
                 qpos = retargeting.retarget(ref_value) # ,np.array([-0.3,-1.0])) # fixed q_pos
+                retarget_time = time.time() - start
+
+                # print(f"[DEBUG] detect={detect_time*1000:.1f} ms, retarget={retarget_time*1000:.1f} ms, queue={queue_time*1000:.1f} ms, total={(retarget_time+detect_time+queue_time)*1000:.1f} ms")
+
                 # logger.info(f"Link names: {retargeting.optimizer.link_names}\n")
                 # logger.info(f"Computed link names: {retargeting.optimizer.computed_link_names}\n")
                 # logger.info(f"Origin link names: {retargeting.optimizer.origin_link_names}\n")
@@ -372,15 +394,30 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
 
                 # qpos_cmd[8] = qpos[8]        
 
-                # qpos_cmd = qpos
-                # print(f"{qpos_cmd[1]:.4f}")
-                # print("qpos_cmd: " + ", ".join(f"{pos:.4f}" for pos in qpos_cmd))
-                end_t = time.time()
-                # print(f"time: {end_t - start_t:.4f} s")
-            
+                # --- Print actual loop rate ---
+                if loop_counter % print_interval == 0:
+                    now = time.time()
+                    elapsed = now - last_print_time
+                    rate = print_interval / elapsed if elapsed > 0 else 0
+                    print(f"[INFO] Retargeting publishing rate: {rate:.2f} Hz over last {print_interval} loops", flush=True)
+                    last_print_time = now
+                    
+                loop_counter += 1   
+
                 if hand_control:
                     leaphand.set_allegro(qpos_cmd)
 
+                # msg = JointState()
+                # msg.header.stamp = leaphand.get_clock().now().to_msg()
+                # msg.name = leaphand._joint_names
+                # msg.position = qpos_cmd.tolist()
+                # leaphand.publisher_.publish(msg)
+
+                # msg2 = JointState()
+                # msg2.header.stamp = leaphand.get_clock().now().to_msg()
+                # msg2.name = leaphand._joint_names
+                # msg2.position = leaphand.read_pos().tolist()
+                # leaphand.publisher2_.publish(msg2)
             # logger.info(f"Executor thread alive? {executor_thread.is_alive()}")
     
     except Exception:
@@ -450,16 +487,32 @@ def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visuali
         print("No fisheye calibration file found. Using raw frames.")
 
     # Open the camera (default: /dev/video0)
-    cap = cv2.VideoCapture(camera_path or '/dev/video0')
+    cap = cv2.VideoCapture(camera_path or '/dev/video0', cv2.CAP_V4L2)
     if not cap.isOpened():
         print(f"[ERROR] Failed to open camera: {camera_path or '/dev/video0'}")
         return
+    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # cap.set(cv2.CAP_PROP_FPS, 25)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
+    # print(cap.get(cv2.CAP_PROP_AUTO_EXPOSURE))
+    # cap.set(cv2.CAP_PROP_GAIN, 200) 
+    # print(cap.get(cv2.CAP_PROP_GAIN))
+    cap.set(cv2.CAP_PROP_EXPOSURE, 200)  
+    # print(cap.get(cv2.CAP_PROP_EXPOSURE))
 
     print(f"[INFO] Camera opened: {camera_path or '/dev/video0'}")
 
+    print("FPS:", cap.get(cv2.CAP_PROP_FPS))
+
+
     try:
         while True:
+            start_time = time.time()
             success, frame = cap.read()
+            read_time = time.time() - start_time
+            # print(f"[DEBUG] Frame read time: {read_time*1000:.1f} ms")
+
             if not success:
                 print("[WARNING] Failed to read frame, retrying...")
                 continue
@@ -478,10 +531,10 @@ def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visuali
             rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Detect hand keypoints
-            _, _, keypoints, _ = detector.detect(rgb_image)
+            _, joint_pos, keypoints, _ = detector.detect(rgb_image)
 
-            # Push RGB frame to queue for LEAP hand control
-            queue.put(rgb_image)
+            # Push keypoints to queue for LEAP hand control
+            queue.put(joint_pos)
 
             if visualize:
                 # Draw skeleton if keypoints are detected
@@ -498,6 +551,9 @@ def produce_camera_frame(queue: multiprocessing.Queue, camera_path=None, visuali
                 # Exit on 'q'
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+
+    except Exception as e:
+        print(f"[ERROR] Exception in camera loop: {e}")
 
     finally:
         cap.release()
@@ -537,7 +593,7 @@ def produce_realsense_frame(queue: multiprocessing.Queue, serial_number=None, vi
             rgb_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
 
             # Detect hand keypoints
-            _,_,keypoints,_ = detector.detect(rgb_image)
+            _,joint_pos,keypoints,_ = detector.detect(rgb_image)
             queue.put(rgb_image)
 
             if visualize:

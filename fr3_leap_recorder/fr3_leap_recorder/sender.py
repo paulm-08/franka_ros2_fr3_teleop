@@ -8,16 +8,19 @@ ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
 # ser.reset_input_buffer()  # discard any leftover bytes
 
 try:
-    for i in range(80):
-        # Example: oscillating intensities
-        val=0.25 + 0.25*np.sin(i/10.0)
-        if val<0.05:
-            val=0.
-        pwm_vals = [val] * 5
-        packet = struct.pack('<5f', *pwm_vals)
-        ser.write(packet)
-        time.sleep(0.2)  # 20 Hz update rate
-        print("✅ Sent:", pwm_vals)
+    for m in range(5):
+
+        for i in range(20):
+            # Example: oscillating intensities
+            val=0.25 + 0.25*np.sin(i/2.0)
+            # if val<0.05:
+            #     val=0.
+            pwm_vals = [0.] * 5
+            pwm_vals[m] = val
+            packet = struct.pack('<5f', *pwm_vals)
+            ser.write(packet)
+            time.sleep(0.1)  # 30 Hz update rate
+            print("✅ Sent:", pwm_vals)
 finally:
     time.sleep(2.0)
     pwm_vals = [0.] * 5

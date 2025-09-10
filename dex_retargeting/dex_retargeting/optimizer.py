@@ -512,7 +512,7 @@ class DexPilotOptimizer(Optimizer):
 
         # --- MOD ---
         # Adaptive projected distance function
-        def adaptive_projected_distance(d, d0=0.03, min_eta=1e-4, d_max=self.escape_dist, max_eta=self.escape_dist):
+        def adaptive_projected_distance(d, d0=0.03, min_eta=1e-4, d_max=self.escape_dist, max_eta=self.escape_dist*self.scaling):
             # Linearly interpolate between min_eta and max_eta depending on d
             # Below d0 → use min_eta, above escape_dist → use max_eta
             if d <= d0:
@@ -520,11 +520,10 @@ class DexPilotOptimizer(Optimizer):
             elif d >= d_max:
                 return max_eta
             else:
-                t = (d - d0) / (0.05 - d0)
+                t = (d - d0) / max(1e-12, (d_max - d0))
+                # t = np.clip(t, 0.0, 1.0)
                 return min_eta + t * (max_eta - min_eta)
         # --- MOD ---
-
-
 
         # Compute reference distance vector
         normal_vec = target_vector * self.scaling  # (10, 3)
@@ -634,7 +633,7 @@ class DexPilotOptimizer(Optimizer):
             cos_sim_side = torch.sum(normed_side_vec[0] * normed_side_vec[1])
 
             forward_weight = 0.5  # Weight for the forward parallelism loss
-            side_weight = 0.2 # Weight for the side parallelism loss
+            side_weight = 0.0 # Weight for the side parallelism loss
 
             # Turn into a loss: penalize deviation from 1 (parallel)
             if self.projected[0]:

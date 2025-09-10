@@ -12,14 +12,14 @@ class Sensor(Camera):
             from ament_index_python.packages import get_package_share_directory
             package_share_path = get_package_share_directory('tact9d')
 
-        sensor_id = cfg['sensor_id']
+        self.sensor_id = cfg['sensor_id']
         depth_calibration = cfg['depth_calibration']
 
         self.depth_calibration_dir = os.path.join(
             package_share_path,
             'shape_reconstruction',
             'calibration',
-            f'sensor_{sensor_id}',
+            f'sensor_{self.sensor_id}',
             depth_calibration['depth_calibration_dir']
         )
 
