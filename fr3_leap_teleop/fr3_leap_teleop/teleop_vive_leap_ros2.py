@@ -69,9 +69,6 @@ arm_control = True  # Whether to control the arm
 
 camera_type = "generic"  # "realsense" or "generic"
 
-# Open3D and hand detector visualization setup
-visualize=False  # Set to True to enable Open3D visualization (Vive trackers and hand detection)
-
 # Define a color map for tracker IDs
 tracker_color_map = {
     "left_elbow": [1.0, 0.0, 0.0],  # Red
@@ -791,7 +788,7 @@ class ViveToROS2Publisher(Node):
         return filtered
 
 # --- Main Async Loop ---
-async def main(args=None):
+async def main(visualize=True, optimizer='adapted'):
     # UDP setup
     UDP_IP = "0.0.0.0"
     UDP_PORT = 5005
@@ -811,7 +808,7 @@ async def main(args=None):
         pass
 
     # ROS2 setup
-    rclpy.init(args=args)
+    rclpy.init()
     node = ViveToROS2Publisher()
 
     # Camera setup (multiprocessing)
@@ -831,7 +828,10 @@ async def main(args=None):
 
     # LEAP Hand setup
     if teleop_mode == "side_to_side":
-        config_path = Path(get_package_share_directory('dex_retargeting')) / 'configs/teleop/leap_hand_right_dexpilot.yml' 
+        if optimizer == 'adapted':
+            config_path = Path(get_package_share_directory('dex_retargeting')) / 'configs/teleop/leap_hand_right_dexpilot_adapted.yml'
+        elif optimizer == 'original':
+            config_path = Path(get_package_share_directory('dex_retargeting')) / 'configs/teleop/leap_hand_right_dexpilot.yml'
         # config_path = Path(__file__).resolve().parents[2] / "dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml"
         # config_path = Path('/home/user/franka_ros2_ws/src/dex_retargeting/src/dex_retargeting/configs/teleop/leap_hand_right_dexpilot.yml')
     elif teleop_mode == "mirror":
@@ -1031,7 +1031,22 @@ async def main(args=None):
 
 
 def run():
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Teleoperate a Franka robot using VIVE trackers and LEAP Hand with hand tracking.")
+    parser.add_argument(
+        "-v", "--visualize",
+        type=str,
+        default="true",
+        help="Visualize the camera feed and VIVE trackers (true/false)"
+    )
+    parser.add_argument(
+        "-o", "--optimizer",
+        type=str,
+        default="adapted",
+        help="Retargeting optimizer to use (e.g., 'adapted', 'original', etc.)"
+    )
+    args = parser.parse_args()
+
+    asyncio.run(main(args.visualize.lower() == "true", args.optimizer))
 
 if __name__ == "__main__":
     run()

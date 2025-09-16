@@ -1,5 +1,5 @@
 retargeting:
-  type: DexPilot
+  type: DexPilotAdapted
   urdf_path: leap_hand/leap_hand_right.urdf
 
   # Target refers to the retargeting target, which is the robot hand

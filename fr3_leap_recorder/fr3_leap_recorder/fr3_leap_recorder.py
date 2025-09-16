@@ -981,12 +981,27 @@ def main():
         default=10000,
         help="Number of frames to record"
     )
+    parser.add_argument(
+        "--haptic",
+        type=bool,
+        default=True,
+        help="Enable haptic feedback"
+    )
+    parser.add_argument(
+        "-v", "--visualize",
+        type=bool,
+        default=False,
+        help="Enable visualization"
+    )
+
     args = parser.parse_args()
     rclpy.init()
 
     robot_recorder = RobotRecorder(
         total_frame=args.total_frame,
         out_directory=args.out_directory,
+        enable_haptic=args.haptic,
+        enable_visualization=args.visualize,
     )
 
     executor = MultiThreadedExecutor()

@@ -809,6 +809,7 @@
     <child link="ring_tip_head"/>
     <origin rpy="0 0 0" xyz="0 -0.048 0.015"/>
   </joint>
+
   <link name="wrist"/>
   <joint name="wrist_joint" type="fixed">
     <parent link="base"/>
@@ -827,16 +828,28 @@
     <child link="thumb_side"/>
     <origin rpy="0 0 0" xyz="0 0 -0.1"/>
   </joint>
-  <link name="index_forward"/>
-  <joint name="index_forward_joint" type="fixed">
+  <link name="index_normal"/>
+  <joint name="index_normal_joint" type="fixed">
     <parent link="index_tip_head"/>
-    <child link="index_forward"/>
+    <child link="index_normal"/>
     <origin rpy="0 0 0" xyz="0.1 0 0"/>
   </joint>
-  <link name="thumb_forward"/>
-  <joint name="thumb_forward_joint" type="fixed">
+  <link name="thumb_normal"/>
+  <joint name="thumb_normal_joint" type="fixed">
     <parent link="thumb_tip_head"/>
-    <child link="thumb_forward"/>
-    <origin rpy="0 0 0" xyz="-0.1 0 0"/>
+    <child link="thumb_normal"/>
+    <origin rpy="0 0 0" xyz="0.1 0 0"/>
+  </joint>
+  <link name="middle_side"/>
+  <joint name="middle_side_joint" type="fixed">
+    <parent link="middle_tip_head"/>
+    <child link="middle_side"/>
+    <origin rpy="0 0 0" xyz="0 0 0.1"/>
+  </joint>
+  <link name="middle_normal"/>
+  <joint name="middle_normal_joint" type="fixed">
+    <parent link="middle_tip_head"/>
+    <child link="middle_normal"/>
+    <origin rpy="0 0 0" xyz="0.1 0 0"/>
   </joint>
 </robot>

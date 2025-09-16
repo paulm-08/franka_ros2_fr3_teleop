@@ -341,10 +341,27 @@ def generate_launch_description():
         output='screen'
     )
 
+    viualize_arg = DeclareLaunchArgument(
+        'visualize',
+        default_value='true',
+        description='Enable visualization'
+    )
+
+    optimizer_arg = DeclareLaunchArgument(
+        'optimizer',
+        default_value='adapted',
+        description='Type of optimizer to use: "original" for DexPilot, "adapted" for DexPilotAdapted'
+    )
+
     # Vive pose publisher
     # This node publishes the pose of the Vive trackers to the /target_pose topic and starts the retargeting process
     vive_pose_publisher = ExecuteProcess(
-        cmd=['ros2', 'run', 'fr3_leap_teleop', 'teleop_vive_leap_ros2'],
+        cmd=['ros2', 'run', 'fr3_leap_teleop', 'teleop_vive_leap_ros2',
+            #  '--hand', LaunchConfiguration('hand'),
+            #  '--ee_id', LaunchConfiguration('ee_id'),
+             '--optimizer', LaunchConfiguration('optimizer'),
+            #  '--camera', 'generic',
+             '--visualize', LaunchConfiguration('visualize'),],
         output='screen',
         condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
     )
@@ -474,12 +491,20 @@ def generate_launch_description():
         description='Output directory for recorded data'
     )
 
+    haptic_arg = DeclareLaunchArgument(
+        'haptic',
+        default_value='true',
+        description='Enable haptic feedback'
+    )
+
     # Recorder script
     # This script records the FR3 and LEAP hand joint states, RGB and depth images from the Realsense cameras and 9DTact sensor image 
     recorder = ExecuteProcess(
         cmd=[
             'ros2', 'run', 'fr3_leap_recorder', 'fr3_leap_recorder',
-            '--out_directory', LaunchConfiguration('out_directory')
+            '--out_directory', LaunchConfiguration('out_directory'),
+            '--haptic', LaunchConfiguration('haptic'),
+            '--visualize', LaunchConfiguration('visualize'),
         ],
         output='screen',
         condition=UnlessCondition(PythonExpression(["'", mode, "' == 'replay'"]))
@@ -493,7 +518,10 @@ def generate_launch_description():
         use_fake_hardware_arg,
         fake_sensor_commands_arg,
         db_arg,
+        optimizer_arg,
+        viualize_arg,
         out_directory_arg,
+        haptic_arg,
         # rviz_node,
         robot_state_publisher,
         # run_move_group_node,

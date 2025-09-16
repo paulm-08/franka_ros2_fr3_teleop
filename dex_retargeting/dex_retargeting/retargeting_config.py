@@ -62,7 +62,7 @@ class RetargetingConfig:
     # Low pass filter
     low_pass_alpha: float = 0.1
 
-    _TYPE = ["vector", "position", "dexpilot"]
+    _TYPE = ["vector", "position", "dexpilot", "dexpilotadapted"]
     _DEFAULT_URDF_DIR = "./"
 
     def __post_init__(self):
@@ -92,7 +92,7 @@ class RetargetingConfig:
             if self.target_link_human_indices is None:
                 raise ValueError(f"Position retargeting requires: target_link_human_indices")
 
-        elif self.type == "dexpilot":
+        elif self.type == "dexpilot" or self.type == "dexpilotadapted":
             if self.finger_tip_link_names is None or self.wrist_link_name is None:
                 raise ValueError(f"Position retargeting requires: finger_tip_link_names + wrist_link_name")
             if self.target_link_human_indices is not None:
@@ -145,6 +145,7 @@ class RetargetingConfig:
             VectorOptimizer,
             PositionOptimizer,
             DexPilotOptimizer,
+            DexPilotOptimizerAdapted,
         )
         import tempfile
 
@@ -196,7 +197,18 @@ class RetargetingConfig:
                 project_dist=self.project_dist,
                 escape_dist=self.escape_dist,
             )
-        else:
+        elif self.type == "dexpilotadapted":
+            optimizer = DexPilotOptimizerAdapted(
+                robot,
+                joint_names,
+                finger_tip_link_names=self.finger_tip_link_names,
+                wrist_link_name=self.wrist_link_name,
+                target_link_human_indices=self.target_link_human_indices,
+                scaling=self.scaling_factor,
+                project_dist=self.project_dist,
+                escape_dist=self.escape_dist,
+            )
+        else:    
             raise RuntimeError()
 
         if 0 <= self.low_pass_alpha <= 1:
