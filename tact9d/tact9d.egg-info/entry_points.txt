@@ -1,3 +1,0 @@
-[console_scripts]
-sensor_node = tact9d.sensor_node:main
-shape_reconstruction_node = tact9d.shape_reconstruction_node:main
