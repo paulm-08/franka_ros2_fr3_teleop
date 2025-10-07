@@ -3,13 +3,19 @@ import cv2
 from .camera import Camera
 import yaml
 import os
+import pathlib
 
 class Sensor(Camera):
     def __init__(self, cfg, package_share_path=None, calibrated=True, ref=None, open_camera=True):
         super().__init__(cfg, calibrated=calibrated, open_camera=open_camera)
 
         if package_share_path is None:
-            from ament_index_python.packages import get_package_share_directory
+            try:
+                from ament_index_python.packages import get_package_share_directory
+            except ImportError:
+                def get_package_share_directory(_):
+                        return str(pathlib.Path(__file__).resolve().parents[1])
+
             package_share_path = get_package_share_directory('tact9d')
 
         self.sensor_id = cfg['sensor_id']

@@ -1,7 +1,13 @@
 import numpy as np
 import cv2
 import yaml
-from ament_index_python.packages import get_package_share_directory
+import pathlib
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    def get_package_share_directory(_):
+        return str(pathlib.Path(__file__).resolve().parents[1])
+
 import os
 import time
 
