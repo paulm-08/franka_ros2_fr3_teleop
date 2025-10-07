@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: tact9d
+Version: 0.0.1
+Summary: ROS 2 interface for tact9d sensor
+Maintainer: Paul Maestre
+Maintainer-email: maestre.paul.antoine.q8@dc.tohoku.ac.jp
+License: MIT
+Requires-Dist: setuptools
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

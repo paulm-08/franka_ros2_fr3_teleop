@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: model_pipeline
+Version: 0.0.1
+Summary: ML pipeline for tactile dataset: preprocessing, training, rollout
+Maintainer: Maestre Paul
+Maintainer-email: maestre.paul.antoine.q8@dc.tohoku.ac.jp
+License: MIT
+Requires-Dist: numpy
+Requires-Dist: opencv-python
+Requires-Dist: scikit-learn
+Requires-Dist: matplotlib
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

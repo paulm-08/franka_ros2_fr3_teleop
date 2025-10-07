@@ -1,0 +1,4 @@
+[console_scripts]
+build_dataset = model_pipeline.dataset:main
+tactile_feature_extractor = model_pipeline.tactile_features:main
+train_bc = model_pipeline.train:main
