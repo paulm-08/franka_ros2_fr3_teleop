@@ -50,8 +50,10 @@ class RetargetingConfig:
     huber_delta: float = 2e-2
 
     # DexPilot optimizer parameters
-    project_dist: float = 0.06
-    escape_dist: float = 0.07
+    project_dist: Optional[float] = 0.06
+    escape_dist: Optional[float] = 0.07
+    eta1: float = 1e-2
+    eta2: float = 3e-2
 
     # Joint limit tag
     has_joint_limits: bool = True
@@ -61,6 +63,10 @@ class RetargetingConfig:
 
     # Low pass filter
     low_pass_alpha: float = 0.1
+
+    # Progressive projected distance for DexPilotAdapted optimizer
+    progressive: bool = True
+    parallel: bool = True
 
     _TYPE = ["vector", "position", "dexpilot", "dexpilotadapted"]
     _DEFAULT_URDF_DIR = "./"
@@ -196,6 +202,8 @@ class RetargetingConfig:
                 scaling=self.scaling_factor,
                 project_dist=self.project_dist,
                 escape_dist=self.escape_dist,
+                eta1=self.eta1,
+                eta2=self.eta2,
             )
         elif self.type == "dexpilotadapted":
             optimizer = DexPilotOptimizerAdapted(
@@ -207,6 +215,10 @@ class RetargetingConfig:
                 scaling=self.scaling_factor,
                 project_dist=self.project_dist,
                 escape_dist=self.escape_dist,
+                eta1=self.eta1,
+                eta2=self.eta2,
+                progressive=self.progressive,
+                parallel=self.parallel,
             )
         else:    
             raise RuntimeError()

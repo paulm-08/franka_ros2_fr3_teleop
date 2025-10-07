@@ -9,3 +9,12 @@ retargeting:
 
   # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency
   low_pass_alpha: 0.15
+
+  project_dist: 0.06
+  escape_dist: 0.07
+
+  eta1: 0.0001
+  eta2: 0.03
+
+  progressive: true
+  parallel: true

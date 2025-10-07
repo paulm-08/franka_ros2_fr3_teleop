@@ -60,6 +60,16 @@ class SingleHandDetector:
                 image, keypoint_2d, mp.solutions.hands.HAND_CONNECTIONS, landmark_style, connection_style
             )
 
+            import cv2
+            
+            # --- Add landmark indices on top of each point ---
+            h, w, _ = image.shape
+            for idx, lm in enumerate(keypoint_2d.landmark):
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                cv2.putText(image, str(idx), (cx + 5, cy - 5), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+
+
         return image
 
     def detect(self, rgb):

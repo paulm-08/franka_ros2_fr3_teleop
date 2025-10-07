@@ -9,3 +9,8 @@ build/
 install/
 log/
 libfranka
+fr3_leap_recorder/fr3_leap_recorder/fr3_leap_recorder_backup.py
+fr3_leap_teleop/fr3_leap_teleop/test.py
+fr3_leap_recorder/fr3_leap_recorder/main_old.py
+fr3_leap_recorder/fr3_leap_recorder/colormap.py
+dex_retargeting/dex_retargeting/optimizer_backup.py

@@ -249,6 +249,73 @@ class LeapNode(Node):
             print(f"[LEAP] Failed to relax motors: {e}")
 
 def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path: str, shutdown_event):
+
+    def unit(v):
+        n = np.linalg.norm(v)
+        if n < 1e-12:
+            return np.zeros_like(v)
+        return v / n
+
+    def fingertip_frame_from_keypoints(tip, dip=None, pip=None, mcp=None, palm_normal=None):
+        """
+        Estimate fingertip frame (normal, side, axis) from available keypoints.
+        Keypoints: tip, dip, pip, mcp are 3D numpy arrays or None if unavailable.
+
+        Strategy:
+        - Axis is always defined as tip->dip if dip is given, else tip->pip, else fallback to tip->mcp.
+        - Secondary vector is chosen from (dip->mcp, dip->pip, pip->tip) in that priority.
+        - Normal is cross(axis, secondary).
+        - If palm_normal is given, flip sign to be consistent.
+        - Side is cross(normal, axis).
+        """
+
+        # --- Step 1: axis (tip direction) ---
+        if dip is not None:
+            axis = unit(tip - dip)
+        elif pip is not None:
+            axis = unit(tip - pip)
+        elif mcp is not None:
+            axis = unit(tip - mcp)
+        else:
+            raise ValueError("At least one of dip, pip, or mcp must be provided to define axis.")
+
+        # --- Step 2: choose secondary vector ---
+        candidates = []
+        if dip is not None and mcp is not None:
+            candidates.append(dip - mcp)
+        if dip is not None and pip is not None:
+            candidates.append(dip - pip)
+        if pip is not None:
+            candidates.append(tip - pip)  # fallback: along axis itself
+
+        # Pick candidate giving largest cross product magnitude
+        best_n = None
+        best_mag = -1.0
+        for b in candidates:
+            n = np.cross(axis, b)
+            mag = np.linalg.norm(n)
+            if mag > best_mag:
+                best_mag = mag
+                best_n = n
+
+        if best_n is None or best_mag < 1e-6:
+            # Fallback: if everything is collinear, use palm_normal if available
+            if palm_normal is None:
+                raise ValueError("Unable to estimate normal: insufficient or collinear keypoints.")
+            normal = unit(palm_normal)
+        else:
+            normal = unit(best_n)
+
+        # --- Step 3: flip with palm_normal if available ---
+        if palm_normal is not None:
+            if np.dot(normal, palm_normal) < 0:
+                normal = -normal
+
+        # --- Step 4: compute side vector ---
+        side = unit(np.cross(normal, axis))
+
+        return normal, side, axis
+
     rclpy.init()
     leaphand = LeapNode()
 
@@ -309,9 +376,42 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
                     origin_indices = indices[0, :]
                     task_indices = indices[1, :]
                     ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
+                    orientation_targets = None
+                    
+                    if retargeting_type == "DEXPILOTADAPTED":
+                        # --- Extract human fingertip orientations ---
+                        # indices for hand keypoints
+                        index_mcp_idx, index_pip_idx, index_dip_idx, index_tip_idx = 5, 6, 7, 8  # index MCP, PIP, DIP, tip
+                        thumb_mcp_idx, thumb_ip_idx, thumb_tip_idx = 1, 2, 3  # thumb MCP, IP, tip
+                        # assume joint_pos is Nx3 array of human keypoints
+                        tip_thumb = joint_pos[thumb_tip_idx]
+                        ip_thumb = joint_pos[thumb_ip_idx]
+                        mcp_thumb = joint_pos[thumb_mcp_idx]
+                        tip_index = joint_pos[index_tip_idx]
+                        dip_index = joint_pos[index_dip_idx]
+                        pip_index = joint_pos[index_pip_idx]
+                        mcp_index = joint_pos[index_mcp_idx]
+                        # palm_normal = compute_palm_normal(...)  # from wrist/palm keypoints
+                        # palm_normal = unit(np.cross(mcp_index - mcp_thumb, pip_index - mcp_thumb))
+                        palm_normal = None  # not used for now
+
+                        n_t, s_t, a_t = fingertip_frame_from_keypoints(tip=tip_thumb, dip=ip_thumb, mcp=mcp_thumb, palm_normal=palm_normal)
+                        n_i, s_i, a_i = fingertip_frame_from_keypoints(tip=tip_index, dip=dip_index, pip=pip_index, mcp=mcp_index, palm_normal=palm_normal)
+
+                        alpha_h = np.arccos(np.clip(np.dot(n_t, n_i), -1.0, 1.0))
+                        # compute beta_h via projection/atan2 as described above
+                        beta_h = compute_twist_angle(n_t, s_t, n_i, s_i)
+
+                        orientation_targets = {
+                        'normal': [n_t.tolist(), n_i.tolist()],
+                        'side':   [s_t.tolist(), s_i.tolist()],
+                        'rel_angles': [float(alpha_h), float(beta_h)],
+                        # 'confidence': float(confidence)
+                        }
+                        qpos = retargeting.retarget(ref_value, orientation_targets)
 
                 start = time.time()
-                qpos = retargeting.retarget(ref_value) # ,np.array([-0.3,-1.0])) # fixed q_pos
+                qpos = retargeting.retarget(ref_value, orientation_targets=None) # ,np.array([-0.3,-1.0])) # fixed q_pos
                 retarget_time = time.time() - start
 
                 # print(f"[DEBUG] detect={detect_time*1000:.1f} ms, retarget={retarget_time*1000:.1f} ms, queue={queue_time*1000:.1f} ms, total={(retarget_time+detect_time+queue_time)*1000:.1f} ms")

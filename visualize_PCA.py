@@ -26,7 +26,6 @@ def show_tactile_with_pca(img_path, ref_img_path):
     plt.title("Difference image")
     plt.imshow(diff_raw, cmap="gray")
     plt.axis('off')
-    plt.show()
 
     # Thresholding to remove small lighting differences
     lighting_threshold = 2
@@ -34,13 +33,17 @@ def show_tactile_with_pca(img_path, ref_img_path):
     diff_raw[diff_raw < 0] = 0
 
     # Binarize contact region
-    _, mask = cv2.threshold(diff_raw.astype(np.uint8), 50, 255, cv2.THRESH_BINARY)
+    _, mask = cv2.threshold(diff_raw.astype(np.uint8), 2, 255, cv2.THRESH_BINARY)
+    plt.figure(figsize=(6,6))
+    plt.title("Contact mask")
+    plt.imshow(mask, cmap="gray")
+    plt.axis('off')
 
     coords = np.column_stack(np.where(mask > 0))
+
     if len(coords) < 10:
         print("No contact detected")
         plt.imshow(img[..., ::-1])  # show RGB version of tactile image
-        plt.show()
         return None, None
 
     # Centroid of contact
@@ -65,6 +68,7 @@ def show_tactile_with_pca(img_path, ref_img_path):
 
     plt.legend()
     plt.title(f"PCA angle = {np.degrees(angle):.1f}°")
+    plt.axis('off')
     plt.show()
 
     return centroid, angle

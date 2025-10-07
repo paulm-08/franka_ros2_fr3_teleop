@@ -4,6 +4,7 @@ from typing import List, Optional
 import nlopt
 import numpy as np
 import torch
+import math
 
 from dex_retargeting.kinematics_adaptor import (
     KinematicAdaptor,
@@ -75,7 +76,7 @@ class Optimizer:
             )
             self.idx_pin2fixed = new_fixed_id
 
-    def retarget(self, ref_value, fixed_qpos, last_qpos):
+    def retarget(self, ref_value, fixed_qpos, last_qpos, orientation_targets=None):
         """
         Compute the retargeting results using non-linear optimization
         Args:
@@ -91,7 +92,7 @@ class Optimizer:
                 f"Optimizer has {len(self.idx_pin2fixed)} joints but non_target_qpos {fixed_qpos} is given"
             )
         objective_fn = self.get_objective_function(
-            ref_value, fixed_qpos, np.array(last_qpos).astype(np.float32)
+            ref_value, fixed_qpos, np.array(last_qpos).astype(np.float32), orientation_targets
         )
 
         self.opt.set_min_objective(objective_fn)
@@ -104,7 +105,7 @@ class Optimizer:
 
     @abstractmethod
     def get_objective_function(
-        self, ref_value: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray
+        self, ref_value: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray, orientation_targets = None
     ):
         pass
 
@@ -620,9 +621,11 @@ class DexPilotOptimizerAdapted(Optimizer):
         # gamma=2.5e-3,
         project_dist=0.05,  # overridden in retargeting_config.py
         escape_dist=0.06,   # overridden in retargeting_config.py
-        eta1=1e-4,
-        eta2=3e-2,
+        eta1: float = 1e-4,
+        eta2: float = 3e-2,
         scaling=1.0,
+        parallel=True,
+        progressive=True,
     ):
         if len(finger_tip_link_names) < 2 or len(finger_tip_link_names) > 5:
             raise ValueError(
@@ -655,6 +658,8 @@ class DexPilotOptimizerAdapted(Optimizer):
         self.escape_dist = escape_dist
         self.eta1 = eta1
         self.eta2 = eta2
+        self.parallel = parallel
+        self.progressive = progressive
 
         # Computation cache for better performance
         # For one link used in multiple vectors, e.g. hand palm, we do not want to compute it multiple times
@@ -731,7 +736,7 @@ class DexPilotOptimizerAdapted(Optimizer):
         return projected, s2_project_index_origin, s2_project_index_task, projected_dist
 
     def get_objective_function(
-        self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray
+        self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray, orientation_targets = None
     ):
         qpos = np.zeros(self.num_joints)
         qpos[self.idx_pin2fixed] = fixed_qpos
@@ -788,7 +793,7 @@ class DexPilotOptimizerAdapted(Optimizer):
 
         # --- MOD ---
         # Adaptive projected distance function
-        def adaptive_projected_distance(d, d0=0.03, min_eta=1e-4, d_max=self.escape_dist, max_eta=self.escape_dist*self.scaling):
+        def adaptive_projected_distance(d, d0=0.03, min_eta=self.eta1, d_max=self.escape_dist, max_eta=self.escape_dist*self.scaling):
             # Linearly interpolate between min_eta and max_eta depending on d
             # Below d0 → use min_eta, above escape_dist → use max_eta
             if d <= d0:
@@ -805,12 +810,14 @@ class DexPilotOptimizerAdapted(Optimizer):
         normed_vec = target_vector * self.scaling  # (10, 3)
         dir_vec = target_vector[:len_proj] / (target_vec_dist[:, None] + 1e-6)  # (6, 3)
 
-        projected_vec = dir_vec * self.projected_dist[:, None]  # (6, 3)
-        adaptive_eta = np.array([
-            adaptive_projected_distance(d)
-            for d in target_vec_dist[:len_proj]
-        ])
-        projected_vec = dir_vec * adaptive_eta[:, None]
+        if not self.progressive:
+            projected_vec = dir_vec * self.projected_dist[:, None]  # (6, 3)
+        else:
+            adaptive_eta = np.array([
+                adaptive_projected_distance(d)
+                for d in target_vec_dist[:len_proj]
+            ])
+            projected_vec = dir_vec * adaptive_eta[:, None]
 
         # print("Target vector distance:", target_vec_dist[:len_proj])
         # print("Adaptive projected distance:", adaptive_eta)
@@ -906,47 +913,62 @@ class DexPilotOptimizerAdapted(Optimizer):
             side_vec = torch_body_pos[side_indices_local,:] - torch_body_pos[tip_indices_local, :]            # Normalize the side vectors
             normed_side_vec = torch.nn.functional.normalize(side_vec, dim=1)
 
-            # Compute cosine similarity (1 = perfectly parallel)
-            cos_sim_normal = torch.sum(-normed_normal_vec[0] * normed_normal_vec[1])
-            cos_sim_side = torch.sum(-normed_side_vec[0] * normed_side_vec[1])
+            # ---- NEW: orientation_targets handling ----
+            use_orientation_targets = orientation_targets is not None
+            # print("[DEBUG] Using orientation targets:", use_orientation_targets)
+            # print("[DEBUG] Orientation targets:", orientation_targets)
+            normal_weight_val = 0.5
 
-            normal_weight = 0.5  # Weight for the normal parallelism loss
-            side_weight = 0.0 # Weight for the side parallelism loss
+            if use_orientation_targets and "theta" in orientation_targets:
+                device = normed_normal_vec.device
+                theta_h = torch.tensor(orientation_targets["theta"], dtype=torch.float32, device=device)
 
-            # Dot products: normal vs tip-to-tip vector
-            # Determine if the normals are facing each other or facing outward
-            dot_thumb = torch.sum(normed_normal_vec[0] * robot_vec[0])
-            dot_index = torch.sum(normed_normal_vec[1] * (-robot_vec[0]))
+                # Robot relative angle between thumb and index normals
+                dot_rel = torch.sum(normed_normal_vec[0] * normed_normal_vec[1])
+                dot_rel = torch.clamp(dot_rel, -1.0, 1.0)
+                theta_robot = torch.acos(dot_rel)
 
-            # Penalties for outward-facing normals
-            outward_penalty = ((dot_thumb < 0).float() + (dot_index < 0).float())
+                # Loss: squared difference between human and robot relative angle
+                normal_loss = normal_weight_val * (theta_robot - theta_h) ** 2
+                side_loss = torch.tensor(0.0, device=device)
 
-            # Binary mask from `self.projected[0]`
-            proj_mask = torch.tensor(float(self.projected[0]), device=cos_sim_normal.device)
+                self.normal_parallel_loss = normal_loss
+                self.side_parallel_loss = side_loss
+                print("[DEBUG] normal loss (theta):", normal_loss.item())
 
-            # Losses (masked, branch-free)
-            self.normal_parallel_loss = proj_mask * (
-                (1.0 - cos_sim_normal).pow(2) * normal_weight
-                + outward_penalty * normal_weight * 5
-            )
+            else:
+                # FALLBACK: previous desired-angle based formulation (keeps compatibility)
+                cos_sim_normal = torch.sum(-normed_normal_vec[0] * normed_normal_vec[1])
+                cos_sim_side = torch.sum(-normed_side_vec[0] * normed_side_vec[1])
+                desired_normal_angle = 0.0
+                desired_side_angle = 0.0
+                desired_cos_normal = math.cos(desired_normal_angle)
+                desired_cos_side = math.cos(desired_side_angle)
 
-            self.side_parallel_loss = proj_mask * (
-                (1.0 - cos_sim_side).pow(2) * side_weight
-                + outward_penalty * side_weight * 5
-            )
+                dot_thumb = torch.sum(normed_normal_vec[0] * robot_vec[0])
+                dot_index = torch.sum(normed_normal_vec[1] * (-robot_vec[0]))
 
-            # # Turn into a loss: penalize deviation from 1 (parallel)                
-            # if self.projected[0]:
-            #     self.normal_parallel_loss = (1.0 - cos_sim_normal)**2 * normal_weight
-            #     self.side_parallel_loss = (1.0 - cos_sim_side)**2 * side_weight
-            # else:
-            #     self.normal_parallel_loss = (1.0 - cos_sim_normal)**2 * 0.0
-            #     self.side_parallel_loss = (1.0 - cos_sim_side)**2 * 0.0
+                outward_penalty = ( (dot_thumb < 0).float() + (dot_index < 0).float() )
 
-            # print("normal vecs:", normal_vec.detach().numpy())
-            # print("Side vecs:", side_vec.detach().numpy())
-            # print("cos_sim_normal:", cos_sim_normal.item())
-            # print("cos_sim_side:", cos_sim_side.item())
+                normal_weight = 0.5
+                side_weight = 0.0
+
+                cos_normal_diff = (cos_sim_normal - desired_cos_normal)
+                cos_side_diff   = (cos_sim_side   - desired_cos_side)
+                normal_loss = normal_weight * (cos_normal_diff ** 2)
+                side_loss   = side_weight * (cos_side_diff ** 2)
+
+                outward_scale = 5.0
+                normal_loss = normal_loss + outward_scale * normal_weight * outward_penalty
+                side_loss = side_loss + outward_scale * side_weight * outward_penalty
+
+                proj_mask = torch.tensor(float(self.projected[0]), device=cos_sim_normal.device)
+                self.normal_parallel_loss = proj_mask * normal_loss
+                self.side_parallel_loss = proj_mask * side_loss
+                # print("normal vecs:", normal_vec.detach().numpy())
+                # print("Side vecs:", side_vec.detach().numpy())
+                # print("cos_sim_normal:", cos_sim_normal.item())
+                # print("cos_sim_side:", cos_sim_side.item())
 
             # ---- MOD ----
 
@@ -964,7 +986,7 @@ class DexPilotOptimizerAdapted(Optimizer):
 
             # ---- MOD ----
             # Add the normal and side parallelism loss to the total loss
-            result = self.huber_distance + self.normal_parallel_loss + self.side_parallel_loss
+            result = self.huber_distance + (self.normal_parallel_loss + self.side_parallel_loss)*self.parallel
             # ---- MOD ----
 
 

@@ -156,6 +156,12 @@ class Sensor(Camera):
 
         return img_expand
 
+    def update_ref(self, ref=None):
+        if ref is not None:
+            self.ref = ref
+        else:
+            self.ref = self.get_rectify_crop_avg_image()
+        self.ref_GRAY = cv2.cvtColor(self.ref, cv2.COLOR_BGR2GRAY)
 
 if __name__ == '__main__':
     f = open("shape_config.yaml", 'r+', encoding='utf-8')

@@ -109,7 +109,7 @@ class SeqRetargeting:
 
         self.is_warm_started = True
 
-    def retarget(self, ref_value, fixed_qpos=np.array([])):
+    def retarget(self, ref_value, fixed_qpos=np.array([]), orientation_targets=None):
         tic = time.perf_counter()
 
         qpos = self.optimizer.retarget(
@@ -118,6 +118,7 @@ class SeqRetargeting:
             last_qpos=np.clip(
                 self.last_qpos, self.joint_limits[:, 0], self.joint_limits[:, 1]
             ),
+            orientation_targets=orientation_targets,
         )
         self.accumulated_time += time.perf_counter() - tic
         self.num_retargeting += 1

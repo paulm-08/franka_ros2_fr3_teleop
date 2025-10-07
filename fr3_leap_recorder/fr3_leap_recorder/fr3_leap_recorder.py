@@ -159,7 +159,9 @@ class RobotRecorder(Node):
         self.save = True
         self.enable_tactile = enable_tactile
         self.enable_visualization = enable_visualization
+        print("Visualization:", self.enable_visualization)
         self.enable_haptic = enable_haptic
+        print("Haptic feedback:", self.enable_haptic)
         self.out_directory = out_directory or "recorded_data"
         self.starting_frame = self.get_next_frame_id(out_directory)
 
@@ -449,32 +451,40 @@ class RobotRecorder(Node):
         points = []
         height_map = []
     
-        raw_img = sensor.get_rectify_crop_image()
-        img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
-        height_map = sensor.raw_image_2_height_map(img_GRAY)
+        try:
+            raw_img = sensor.get_rectify_crop_image()
+            if raw_img is None:
+                raise RuntimeError("Tactile camera returned None")
+            
 
-        if self.enable_visualization:
-            CROP_TOP = 30
-            CROP_BOTTOM = 30
-            CROP_LEFT = 30
-            CROP_RIGHT = 30
+            img_GRAY = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
+            height_map = sensor.raw_image_2_height_map(img_GRAY)
 
-            height_map_cropped = height_map[CROP_TOP:height_map.shape[0] - CROP_BOTTOM,
-                                CROP_LEFT:height_map.shape[1] - CROP_RIGHT]
+            if self.enable_visualization:
+                CROP_TOP = 30
+                CROP_BOTTOM = 30
+                CROP_LEFT = 30
+                CROP_RIGHT = 30
 
-            height_map_cropped = sensor.expand_image(height_map_cropped)
+                height_map_cropped = height_map[CROP_TOP:height_map.shape[0] - CROP_BOTTOM,
+                                    CROP_LEFT:height_map.shape[1] - CROP_RIGHT]
 
-            height_map_normalized = cv2.normalize(height_map_cropped, None, 0, 255, cv2.NORM_MINMAX)
-            height_map_uint8 = height_map_normalized.astype(np.uint8)
-            height_map_color = cv2.applyColorMap(height_map_uint8, cv2.COLORMAP_JET)
+                height_map_cropped = sensor.expand_image(height_map_cropped)
 
-            img_msg = self.bridge.cv2_to_imgmsg(height_map_color, encoding="bgr8")
-            if sensor.sensor_id == 1:
-                self.thumb_pub.publish(img_msg)
-            elif sensor.sensor_id == 2:
-                self.index_pub.publish(img_msg)
-            elif sensor.sensor_id == 3:
-                self.middle_pub.publish(img_msg)
+                height_map_normalized = cv2.normalize(height_map_cropped, None, 0, 255, cv2.NORM_MINMAX)
+                height_map_uint8 = height_map_normalized.astype(np.uint8)
+                height_map_color = cv2.applyColorMap(height_map_uint8, cv2.COLORMAP_JET)
+
+                img_msg = self.bridge.cv2_to_imgmsg(height_map_color, encoding="bgr8")
+                if sensor.sensor_id == 1:
+                    self.thumb_pub.publish(img_msg)
+                elif sensor.sensor_id == 2:
+                    self.index_pub.publish(img_msg)
+                elif sensor.sensor_id == 3:
+                    self.middle_pub.publish(img_msg)
+        
+        except Exception as e:
+            self.get_logger().error(f"Exception in processing tactile data: {e}")
 
         # heat_map_input = cv2.normalize(height_map, None, 0, 255, cv2.NORM_MINMAX)
         # heat_map_input = np.uint8(heat_map_input)
@@ -981,15 +991,16 @@ def main():
         default=10000,
         help="Number of frames to record"
     )
+
     parser.add_argument(
         "--haptic",
-        type=bool,
+        type=str,
         default=True,
         help="Enable haptic feedback"
     )
     parser.add_argument(
-        "-v", "--visualize",
-        type=bool,
+        "--visualize",
+        type=str,
         default=False,
         help="Enable visualization"
     )
@@ -1000,8 +1011,8 @@ def main():
     robot_recorder = RobotRecorder(
         total_frame=args.total_frame,
         out_directory=args.out_directory,
-        enable_haptic=args.haptic,
-        enable_visualization=args.visualize,
+        enable_haptic=args.haptic.lower() in ("yes", "true", "t", "1"),
+        enable_visualization=args.visualize.lower() in ("yes", "true", "t", "1")
     )
 
     executor = MultiThreadedExecutor()
