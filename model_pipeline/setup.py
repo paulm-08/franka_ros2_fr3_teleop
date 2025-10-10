@@ -24,6 +24,7 @@ setup(
     ],
     entry_points={
         'console_scripts': [
+            'tactile_features = model_pipeline.tactile_features:main',
             'dataset_builder = model_pipeline.dataset_builder:main',
             'split_dataset = model_pipeline.split_dataset:main',
             'train = model_pipeline.train:main',

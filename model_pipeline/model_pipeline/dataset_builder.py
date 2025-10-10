@@ -1,373 +1,368 @@
+"""
+dataset_builder.py (Revised)
+
+- Processes raw multimodal data (tactile, visual, proprio) from demonstrations.
+- Uses the revised tactile_features script to get rich 8D features.
+- Correctly handles multiple clips and demonstrations as separate trajectories.
+- Saves the final dataset as a list of trajectories in a .pkl file to preserve
+  boundaries, which is critical for correct data splitting.
+"""
 import os
 import glob
 import cv2
 import numpy as np
 import logging
 import argparse
-import yaml
-import platform
+import pickle
 from pathlib import Path
 import json
 import torch
 
 from model_pipeline.visual_embedder import VisualEmbedder
-from model_pipeline.tactile_features import process_tactile_image
+# Import the revised feature extractor and its dimension constant
+from model_pipeline.tactile_features import process_tactile_image, TACTILE_FEATURE_DIM
 from model_pipeline.utils import load_frame_paths, load_actions, get_cfg_path, init_sensor
-from tact9d.shape_reconstruction.sensor import Sensor   # if you rename 9dtact → tact9d
 
-# ---------------- Logger ----------------
+# It's good practice to define sensor names for consistent ordering
+SENSOR_ORDER = ["rindex", "rmiddle", "rthumb"]
+
+# --- Logger Setup ---
 logging.basicConfig(
     level=logging.INFO,
-    # format="%(asctime)s [%(levelname)s] %(message)s",
     format="[%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
 
-# ---------------- Path setup ----------------
-# Detect the platform
-IS_WINDOWS = platform.system().lower().startswith("win")
-
-# Hardcode the repo root based on the OS
-if IS_WINDOWS:
-    REPO_ROOT = Path("C:/Users/paulm/franka_ros2_ws/src")
-else:
-    REPO_ROOT = Path("/home/user/franka_ros2_ws/src")
-
-# Define useful paths
-DEFAULT_DATA_DIR = REPO_ROOT / "model_pipeline" / "dataset_real_full"
-
-def build_npz_dataset(
-    data_dir="dataset",
-    out_file="data/processed/dataset_features.npz",
-    use_height_map=False
-):
+def compute_global_depth_range(data_dirs, percentile=99.5):
     """
-    Build dataset for rollout-style model training:
-        tactile_t + visual_t + joints_t → joints_t+1
-    Saves .npz with arrays:
-        tactile (N, T_dim)
-        visual (N, V_dim)
-        actions (N, 7)
+    (Memory-Efficient Version)
+    Iterates through all depth images to find a robust global min and max value
+    using a histogram to avoid loading all data into memory.
     """
+    logging.info("Calculating global depth range (memory-efficient)...")
 
-    # === Setup ===
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    embedder = VisualEmbedder(backbone="resnet18", device=device, pretrained=True, out_dim=256)
-    logging.info(f"Visual embedder initialized on {device} with out_dim={embedder.out_dim}")
+    all_depth_paths = []
+    for data_dir in data_dirs:
+        all_depth_paths.extend(glob.glob(os.path.join(data_dir, "frame_*", "depth_image*.png")))
 
-    # === Clip management ===
-    clip_marks_path = os.path.join(data_dir, "clip_marks.json")
-    if os.path.exists(clip_marks_path):
-        with open(clip_marks_path, "r") as f:
-            clip_marks = json.load(f)
-        logging.info("Using clip_marks.json → filtering frames and per-clip references")
+    if not all_depth_paths:
+        logging.warning("No depth images found.")
+        return 0, 1000
 
-        if isinstance(clip_marks, list):
-            clip_ranges = [(c["start"], c["end"]) for c in clip_marks]
-        elif isinstance(clip_marks, dict):
-            clip_ranges = [(v["start"], v["end"]) for v in clip_marks.values()]
-        else:
-            raise ValueError("clip_marks.json must be a list or dict")
+    # Initialize statistics
+    min_val = float('inf')
+    # Create a histogram to store the distribution of depth values.
+    # The range is 0-65536 for 16-bit images.
+    num_bins = 65536
+    hist_range = (0, num_bins)
+    global_hist = np.zeros(num_bins, dtype=np.int64) # Use 64-bit int to prevent overflow
+    total_pixel_count = 0
 
-        all_frame_dirs = load_frame_paths(data_dir)
-        frame_names = [os.path.basename(f) for f in all_frame_dirs]
-        frame_dirs, ref_frames = [], []
+    # --- Streaming Pass: Process one image at a time ---
+    for path in all_depth_paths:
+        depth_img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if depth_img is not None:
+            # Filter out invalid zero-value pixels
+            valid_pixels = depth_img[depth_img > 0]
+            if valid_pixels.size > 0:
+                # Update the running minimum
+                min_val = min(min_val, np.min(valid_pixels))
 
-        for start, end in clip_ranges:
-            try:
-                i_start = frame_names.index(start)
-                i_end = frame_names.index(end)
-                frame_dirs.extend(all_frame_dirs[i_start:i_end + 1])
-                ref_frames.append(all_frame_dirs[i_start])
-            except ValueError:
-                logging.warning(f"Clip range ({start} → {end}) not found, skipping.")
-    else:
-        frame_dirs = load_frame_paths(data_dir)
-        ref_frames = [frame_dirs[0]]
-        logging.info("No clip_marks.json found → using all frames and global reference")
+                # Update the global histogram with this image's data
+                local_hist, _ = np.histogram(valid_pixels, bins=num_bins, range=hist_range)
+                global_hist += local_hist
+                total_pixel_count += valid_pixels.size
 
-    # === Load actions ===
+    if total_pixel_count == 0:
+        logging.warning("No valid depth pixels found. Using default range [0, 1000].")
+        return 0, 1000
+
+    # --- Calculate Percentile from the Final Histogram ---
+    # Find the pixel count that corresponds to the desired percentile
+    percentile_threshold = total_pixel_count * (percentile / 100.0)
+
+    # Find the bin where the cumulative sum of pixels exceeds the threshold
+    cumulative_hist = np.cumsum(global_hist)
+    # np.searchsorted finds the index where the threshold would be inserted to maintain order
+    max_val = np.searchsorted(cumulative_hist, percentile_threshold)
+
+    logging.info(f"✅ Robust global depth range found: min={min_val:.0f}, max={max_val:.0f} (at {percentile}th percentile)")
+    return min_val, max_val
+
+def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, embedder):
+    """
+    Processes a single continuous trajectory (a clip or a full demonstration).
+
+    Returns:
+        A dictionary containing the processed data for this trajectory, or None if invalid.
+    """
+    logging.info(f"Processing trajectory of length {len(frame_dirs)} with reference {os.path.basename(ref_frame_dir)}")
+
+    # --- Load actions for this specific trajectory ---
     actions = np.array(load_actions(frame_dirs), dtype=np.float32)
+    if len(actions) < 2:
+        logging.warning("Trajectory too short (< 2 frames), skipping.")
+        return None
 
-    # === Initialize reference tactile images ===
-    ref_dir = ref_frames[0]
+    # --- Initialize sensors with the reference frame for this trajectory ---
     ref_tactile = {
         os.path.basename(p): cv2.imread(p, cv2.IMREAD_UNCHANGED)
-        for p in glob.glob(os.path.join(ref_dir, "*raw_image.jpg"))
+        for p in glob.glob(os.path.join(ref_frame_dir, "*raw_image.jpg"))
     }
 
-    if use_height_map and ref_tactile:
-        logging.info("Using reference tactile images for height map preprocessing")
-        index_sensor = init_sensor(
-            cfg_path=get_cfg_path("index"),
-            calibrated=True,
-            ref=ref_tactile.get("rindex_raw_image.jpg"),
-            open_camera=False,
-        )
-        middle_sensor = init_sensor(
-            cfg_path=get_cfg_path("middle"),
-            calibrated=True,
-            ref=ref_tactile.get("rmiddle_raw_image.jpg"),
-            open_camera=False,
-        )
-        thumb_sensor = init_sensor(
-            cfg_path=get_cfg_path("thumb"),
-            calibrated=True,
-            ref=ref_tactile.get("rthumb_raw_image.jpg"),
-            open_camera=False,
-        )
-    elif use_height_map:
-        logging.warning("No reference tactile images found; disabling height map preprocessing")
-        use_height_map = False
-
-    # === Feature extraction ===
-    tactile_list = []
-    visual_list = []
-    current_ref_dir = ref_dir
-
+    sensors = {}
+    if use_height_map:
+        for sensor_name in SENSOR_ORDER:
+            cfg_path = get_cfg_path(sensor_name.replace("r", ""))
+            ref_img = ref_tactile.get(f"{sensor_name}_raw_image.jpg")
+            if ref_img is not None:
+                sensors[sensor_name] = init_sensor(cfg_path=cfg_path, calibrated=True, ref=ref_img)
+            else:
+                logging.warning(f"Reference image for {sensor_name} not found.")
+                sensors[sensor_name] = None
+    
+    # --- Per-frame feature extraction ---
+    tactile_list, visual_list = [], []
     for frame_dir in frame_dirs:
-        # --- Update reference if new clip ---
-        if frame_dir in ref_frames and frame_dir != current_ref_dir:
-            logging.info(f"Updating reference to {frame_dir}")
-            ref_tactile = {
-                os.path.basename(p): cv2.imread(p, cv2.IMREAD_UNCHANGED)
-                for p in glob.glob(os.path.join(frame_dir, "*raw_image.jpg"))
-            }
-            if use_height_map:
-                index_sensor.update_ref(ref_tactile.get("rindex_raw_image.jpg"))
-                middle_sensor.update_ref(ref_tactile.get("rmiddle_raw_image.jpg"))
-                thumb_sensor.update_ref(ref_tactile.get("rthumb_raw_image.jpg"))
-            current_ref_dir = frame_dir
-
-        # --- Tactile features ---
-        tactile_imgs = glob.glob(os.path.join(frame_dir, "*raw_image.jpg"))
+        # --- Tactile Features (with guaranteed order) ---
         frame_feats = []
+        # Sort glob results to ensure consistent feature order
+        tactile_img_paths = sorted(glob.glob(os.path.join(frame_dir, "*raw_image.jpg")))
 
-        for img_path in tactile_imgs:
-            fname = os.path.basename(img_path)
-            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-            ref = ref_tactile.get(fname, None)
+        # Create a map for quick path lookup
+        path_map = {os.path.basename(p): p for p in tactile_img_paths}
 
-            if use_height_map:
-                if "rindex" in fname.lower():
-                    sensor = index_sensor
-                elif "rmiddle" in fname.lower():
-                    sensor = middle_sensor
-                elif "rthumb" in fname.lower():
-                    sensor = thumb_sensor
-                else:
-                    sensor = None
+        for sensor_name in SENSOR_ORDER:
+            fname = f"{sensor_name}_raw_image.jpg"
+            img_path = path_map.get(fname)
+            
+            if img_path:
+                img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                ref = ref_tactile.get(fname)
+                sensor = sensors.get(sensor_name) if use_height_map else None
+
+                # Use the new feature extractor (visualization is off for speed)
+                feature_vector, _ = process_tactile_image(
+                    img, ref_img=ref, use_height_map=use_height_map, sensor=sensor, generate_visualization=False
+                )
+                frame_feats.extend(feature_vector)
             else:
-                sensor = None
-
-            _, _, centroid, major = process_tactile_image(
-                img, ref_img=ref, use_height_map=use_height_map, sensor=sensor
-            )
-
-            if centroid is None or major is None:
-                frame_feats.extend([0.0, 0.0, 0.0, 0.0])
-            else:
-                frame_feats.extend([centroid[0], centroid[1], major[0], major[1]])
-
+                # If a sensor image is missing for this frame, append zeros
+                frame_feats.extend(np.zeros(TACTILE_FEATURE_DIM, dtype=np.float32))
+        
         tactile_list.append(frame_feats)
 
-        # --- Visual embeddings ---
+        # --- Visual Embeddings (RGB + Depth) ---
         color1_path = os.path.join(frame_dir, "color_image1.jpg")
+        depth1_path = os.path.join(frame_dir, "depth_image1.png") # Or .tiff, .npy, etc.
         color2_path = os.path.join(frame_dir, "color_image2.jpg")
+        depth2_path = os.path.join(frame_dir, "depth_image2.png")
 
+        # Load images, using IMREAD_UNCHANGED for depth to preserve bit depth (e.g., 16-bit)
         color1 = cv2.imread(color1_path)
+        depth1 = cv2.imread(depth1_path, cv2.IMREAD_UNCHANGED)
         color2 = cv2.imread(color2_path)
+        depth2 = cv2.imread(depth2_path, cv2.IMREAD_UNCHANGED)
+        
+        # Generate embeddings for each modality
+        rgb_emb1 = embedder.embed_rgb(color1)
+        depth_emb1 = embedder.embed_depth(depth1)
+        rgb_emb2 = embedder.embed_rgb(color2)
+        depth_emb2 = embedder.embed_depth(depth2)
 
-        emb1 = embedder.embed_rgb(color1) if color1 is not None else None
-        emb2 = embedder.embed_rgb(color2) if color2 is not None else None
-
-        if emb1 is None and emb2 is None:
-            visual_vec = np.zeros(embedder.out_dim, dtype=np.float32)
-        elif emb1 is None:
-            visual_vec = emb2.astype(np.float32)
-        elif emb2 is None:
-            visual_vec = emb1.astype(np.float32)
+        # Create a combined feature vector for each camera
+        visual_vecs = []
+        if rgb_emb1 is not None and depth_emb1 is not None:
+            visual_vecs.append(np.concatenate([rgb_emb1, depth_emb1]))
+        if rgb_emb2 is not None and depth_emb2 is not None:
+            visual_vecs.append(np.concatenate([rgb_emb2, depth_emb2]))
+        
+        # Robustly average the feature vectors from all available cameras
+        if not visual_vecs:
+            # The total dimension is now RGB_dim + Depth_dim
+            total_visual_dim = embedder.out_dim['rgb'] + embedder.out_dim['depth']
+            visual_vec = np.zeros(total_visual_dim, dtype=np.float32)
         else:
-            visual_vec = ((emb1 + emb2) / 2.0).astype(np.float32)
+            visual_vec = np.mean(visual_vecs, axis=0).astype(np.float32)
 
         visual_list.append(visual_vec)
 
-    # === Convert to arrays ===
+    # --- Convert lists to numpy arrays ---
     tactile_feats = np.array(tactile_list, dtype=np.float32)
     visual_feats = np.stack(visual_list, axis=0)
-    logging.info(f"Tactile features: {tactile_feats.shape}")
-    logging.info(f"Visual features: {visual_feats.shape}")
-    logging.info(f"Actions: {actions.shape}")
 
+    # --- Create State-Action pairs ---
+    # State at time t (s_t)
     joints_t = actions[:-1]
-    joints_t1 = actions[1:]
-    delta_q = joints_t1 - joints_t
-    logging.info(f"joints_t: {joints_t.shape}, joints_t1: {joints_t1.shape}, delta_q: {delta_q.shape}")
-    tactile_feats = tactile_feats[:-1]
-    visual_feats = visual_feats[:-1]
+    tactile_t = tactile_feats[:-1]
+    visual_t = visual_feats[:-1]
 
-    # === Save ===
-    os.makedirs(os.path.dirname(out_file), exist_ok=True)
-    np.savez(
-        "data/processed/dataset_features.npz",
-        tactile_t=np.array(tactile_feats),   # (N, 12)
-        visual_t=np.array(visual_feats),     # (N, 256)
-        joints_t=np.array(joints_t),            # (N, 23)
-        delta_q=np.array(delta_q)           # (N, 23)
-    )
+    # Action at time t (a_t)
+    delta_q = actions[1:] - actions[:-1]
 
-    logging.info(f"💾 Saved dataset → {out_file}")
+    # After concatenating tactile, visual, and joint features
+    expected_dim = (len(SENSOR_ORDER) * TACTILE_FEATURE_DIM) + visual_vec.shape[0] + joints_t.shape[1]
+    assert tactile_t.shape[1] + visual_t.shape[1] + joints_t.shape[1] == expected_dim, "State vector dimension mismatch!"
 
-# ---------------- Browsing ----------------
-def interactive_browse(data_dir="C:\\Users\\paulm\\franka_ros2_ws\\src\\model_pipeline\\dataset_real_full", use_height_map=False):
-    import json
+    return {
+        "tactile_t": tactile_t,
+        "visual_t": visual_t,
+        "joints_t": joints_t,
+        "delta_q": delta_q,
+    }
 
-    # --- Handle clip marks if present ---
-    clip_marks_path = os.path.join(data_dir, "clip_marks.json")
-    if os.path.exists(clip_marks_path):
-        with open(clip_marks_path, "r") as f:
-            clip_marks = json.load(f)
-        logging.info("Using clip_marks.json → filtering frames and per-clip reference")
+def generate_dataset_summary(all_trajectories):
+    """
+    Calculates and prints a statistical summary of the entire dataset.
+    """
+    if not all_trajectories:
+        logging.warning("Cannot generate summary for an empty dataset.")
+        return
 
-        if isinstance(clip_marks, list):
-            clip_ranges = [(c["start"], c["end"]) for c in clip_marks]
-        elif isinstance(clip_marks, dict):
-            clip_ranges = [(v["start"], v["end"]) for v in clip_marks.values()]
+    logging.info("\n" + "="*60)
+    logging.info("          🤖 DATASET STATISTICAL SUMMARY 🤖")
+    logging.info("="*60)
+
+    # --- Aggregate all data into single arrays for analysis ---
+    all_tactile = np.concatenate([traj['tactile_t'] for traj in all_trajectories], axis=0)
+    all_visual = np.concatenate([traj['visual_t'] for traj in all_trajectories], axis=0)
+    all_joints = np.concatenate([traj['joints_t'] for traj in all_trajectories], axis=0)
+    all_actions = np.concatenate([traj['delta_q'] for traj in all_trajectories], axis=0)
+    traj_lengths = [len(traj['joints_t']) for traj in all_trajectories]
+    
+    total_samples = all_joints.shape[0]
+
+    # --- Overall Summary ---
+    logging.info(f"Number of trajectories: {len(all_trajectories)}")
+    logging.info(f"Total number of samples (state-action pairs): {total_samples}")
+    logging.info(f"Trajectory Lengths | Min: {min(traj_lengths)}, Max: {max(traj_lengths)}, Avg: {np.mean(traj_lengths):.1f}")
+
+    # --- Per-Modality Summary ---
+    def print_stats(name, data):
+        logging.info(f"\n--- {name} (Shape: {data.shape}) ---")
+        # Check for NaN or Inf values
+        if np.isnan(data).any() or np.isinf(data).any():
+            logging.error(f"  ❌ Found NaN or Inf values in {name} data!")
         else:
-            raise ValueError("clip_marks.json must be a list or dict")
+            logging.info(f"  ✅ No NaN or Inf values detected.")
+        
+        # Calculate and print stats
+        min_vals = np.min(data, axis=0)
+        max_vals = np.max(data, axis=0)
+        mean_vals = np.mean(data, axis=0)
+        std_vals = np.std(data, axis=0)
+        
+        logging.info(f"  Min value (overall): {np.min(min_vals):.4f}")
+        logging.info(f"  Max value (overall): {np.max(max_vals):.4f}")
+        logging.info(f"  Mean value (overall): {np.mean(mean_vals):.4f}")
+        logging.info(f"  Std Dev (overall): {np.mean(std_vals):.4f}")
 
+    print_stats("Tactile Features", all_tactile)
+    print_stats("Visual Features", all_visual)
+    print_stats("Joint States (Proprioception)", all_joints)
+    print_stats("Joint Actions (delta_q)", all_actions)
+    logging.info("="*60)
+
+def build_dataset(data_dirs, out_file, use_height_map, config):
+    """
+    Builds a dataset from multiple raw data directories.
+
+    Args:
+        data_dirs (list): List of paths to the raw demonstration directories.
+        out_file (str): Path to save the output .pkl file.
+        use_height_map (bool): Whether to use the height map for tactile processing.
+        config (dict): A configuration dictionary.
+    """
+    if config.get("global_depth_range"):
+        logging.info("Using pre-computed depth range from config.")
+        global_depth_range = config["global_depth_range"]
+    else:
+        # Only compute if not already provided
+        global_depth_range = compute_global_depth_range(data_dirs)
+        
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # The corrected call (just remove the out_dim line)
+    embedder = VisualEmbedder(
+        backbone=config.get("backbone", "resnet18"),
+        device=device,
+        pretrained=True,
+        global_depth_range=global_depth_range
+    )
+    logging.info(f"Visual embedder initialized on {device} with out_dim={embedder.out_dim}")
+
+    all_trajectories = []
+    for data_dir in data_dirs:
+        logging.info(f"📂 Processing dataset: {data_dir}")
         all_frame_dirs = load_frame_paths(data_dir)
         frame_names = [os.path.basename(f) for f in all_frame_dirs]
-        frame_dirs = []
-        ref_frames = []
+        
+        clip_marks_path = Path(data_dir) / "clip_marks.json"
+        if clip_marks_path.exists():
+            with open(clip_marks_path, "r") as f:
+                clip_marks = json.load(f)
+            logging.info("Found clip_marks.json, processing clips as separate trajectories.")
+            
+            clips = clip_marks if isinstance(clip_marks, list) else clip_marks.values()
+            for clip in clips:
+                start_frame, end_frame = clip["start"], clip["end"]
+                try:
+                    i_start = frame_names.index(start_frame)
+                    i_end = frame_names.index(end_frame)
+                    
+                    clip_frame_dirs = all_frame_dirs[i_start : i_end + 1]
+                    ref_frame_dir = all_frame_dirs[i_start] # Use first frame of clip as reference
+                    
+                    trajectory_data = process_single_trajectory(clip_frame_dirs, ref_frame_dir, use_height_map, embedder)
+                    if trajectory_data:
+                        all_trajectories.append(trajectory_data)
 
-        for start, end in clip_ranges:
-            try:
-                i_start = frame_names.index(start)
-                i_end = frame_names.index(end)
-                frame_dirs.extend(all_frame_dirs[i_start:i_end + 1])
-                ref_frames.append(all_frame_dirs[i_start])
-            except ValueError:
-                logging.warning(f"Clip range ({start} → {end}) not found, skipping.")
-    else:
-        frame_dirs = load_frame_paths(data_dir)
-        ref_frames = [frame_dirs[0]]
-        logging.info("No clip_marks.json found → using all frames and global reference")
-
-    if not frame_dirs:
-        logging.error(f"No frames found in {data_dir}")
-        return
-
-    # --- Initial reference tactile images ---
-    ref_dir = ref_frames[0]
-    ref_tactile = {os.path.basename(p): cv2.imread(p, cv2.IMREAD_UNCHANGED)
-                   for p in glob.glob(os.path.join(ref_dir, "*raw_image.jpg"))}
-
-    if use_height_map and ref_tactile:
-        logging.info("Using reference tactile images for preprocessing")
-        index_sensor = init_sensor(
-            cfg_path=get_cfg_path("index"),
-            calibrated=True,
-            ref=ref_tactile.get("rindex_raw_image.jpg"),
-            open_camera=False)
-        middle_sensor = init_sensor(
-            cfg_path=get_cfg_path("middle"),
-            calibrated=True,
-            ref=ref_tactile.get("rmiddle_raw_image.jpg"),
-            open_camera=False)
-        thumb_sensor = init_sensor(
-            cfg_path=get_cfg_path("thumb"),
-            calibrated=True,
-            ref=ref_tactile.get("rthumb_raw_image.jpg"),
-            open_camera=False)
-    elif use_height_map:
-        logging.warning("No reference tactile images found; cannot use height map preprocessing")
-        use_height_map = False
-
-    idx = 0
-    current_ref_dir = ref_dir
-
-    while True:
-        frame_dir = frame_dirs[idx]
-
-        # If we reached the start of a new clip, update reference
-        if frame_dir in ref_frames and frame_dir != current_ref_dir:
-            logging.info(f"Updating reference → {frame_dir}")
-            ref_tactile = {os.path.basename(p): cv2.imread(p, cv2.IMREAD_UNCHANGED)
-                           for p in glob.glob(os.path.join(frame_dir, "*raw_image.jpg"))}
-            if use_height_map:
-                index_sensor.update_ref(ref_tactile.get("rindex_raw_image.jpg"))
-                middle_sensor.update_ref(ref_tactile.get("rmiddle_raw_image.jpg"))
-                thumb_sensor.update_ref(ref_tactile.get("rthumb_raw_image.jpg"))
-            current_ref_dir = frame_dir
-
-        tactile_imgs = glob.glob(os.path.join(frame_dir, "*raw_image.jpg"))
-        vis_list = []
-
-        logging.info(f"Frame {idx+1}/{len(frame_dirs)} | 'n': next, 'p': prev, 'q': quit")
-
-        for img_path in tactile_imgs:
-            logging.info(f" Processing {img_path.replace(frame_dir, '')}")
-            fname = os.path.basename(img_path)
-            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-            ref = ref_tactile.get(fname, None)
-
-            if use_height_map:
-                if "rindex" in fname.lower():
-                    sensor = index_sensor
-                elif "rmiddle" in fname.lower():
-                    sensor = middle_sensor
-                elif "rthumb" in fname.lower():
-                    sensor = thumb_sensor
-                else:
-                    sensor = None
-            else:
-                sensor = None
-
-            vis_raw, vis_res, _, _ = process_tactile_image(img, ref_img=ref, use_height_map=use_height_map, sensor=sensor)
-            if vis_raw is not None:
-                combined = np.hstack([vis_raw, vis_res])
-                vis_list.append(combined)
-
-        if vis_list:
-            canvas = np.vstack(vis_list)
-            max_width = 1000
-            scale = max_width / canvas.shape[1]
-            if scale < 1.0:
-                canvas = cv2.resize(canvas, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            cv2.imshow("Tactile PCA (browse)", canvas)
+                except ValueError:
+                    logging.warning(f"Clip range ({start_frame} -> {end_frame}) not found in {data_dir}, skipping.")
         else:
-            logging.warning(f"No tactile images found in {frame_dir}")
+            logging.info("No clip_marks.json found, processing entire directory as one trajectory.")
+            ref_frame_dir = all_frame_dirs[0]
+            trajectory_data = process_single_trajectory(all_frame_dirs, ref_frame_dir, use_height_map, embedder)
+            if trajectory_data:
+                all_trajectories.append(trajectory_data)
 
-        key = cv2.waitKey(0) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("n"):
-            idx = (idx + 10) % len(frame_dirs)
-        elif key == ord("p"):
-            idx = (idx - 10) % len(frame_dirs)
+    # --- Generate and print dataset summary ---
+    generate_dataset_summary(all_trajectories)
 
-    cv2.destroyAllWindows()
+    # --- Save the dataset as a list of trajectories ---
+    # This format is crucial for correct splitting later on.
+    out_path = Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(all_trajectories, f)
 
-    # ---------------- Main ----------------
+    logging.info(f"✅ Successfully built dataset with {len(all_trajectories)} trajectories.")
+    logging.info(f"💾 Saved dataset -> {out_path}")
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["browse", "export"], default="browse")
-    parser.add_argument("--data_dir", type=str, default=str(DEFAULT_DATA_DIR))
-    parser.add_argument("--out_file", default="data/processed/dataset_features.npz")
-    parser.add_argument("--height_map", action="store_true",
-                        help="Use 9DTact height map instead of raw image")
+    parser = argparse.ArgumentParser(description="Build a robot learning dataset from raw demonstrations.")
+    # For simplicity, main arguments are here. For a real project, use a YAML config file.
+    parser.add_argument("--data_dirs", nargs="+", required=True, help="List of dataset directories to process.")
+    parser.add_argument("--out_file", type=str, required=True, help="Path to the output .pkl dataset file.")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to a YAML config file.")
+    parser.add_argument("--height_map", action="store_true", help="Use 9DTact height map instead of raw image.")
     args = parser.parse_args()
-
-    data_dir = Path(args.data_dir).expanduser().resolve()
-    if not data_dir.exists():
-        logging.error(f"Data directory not found: {data_dir}")
-        return
-
-    if args.mode == "browse":
-        interactive_browse(str(data_dir), use_height_map=args.height_map)
-    elif args.mode == "export":
-        build_npz_dataset(str(data_dir), args.out_file, use_height_map=args.height_map)
+    
+    # In a real pipeline, you would load a config.yaml file here
+    # For now, we'll use a default dictionary
+    config = {
+        "backbone": "resnet18",
+        "visual_dim": 256,
+        "global_depth_range": [154, 2826],
+        # Add other params like frame stacking window K here
+    }
+    
+    data_dirs = [Path(d).expanduser().resolve() for d in args.data_dirs]
+    for d in data_dirs:
+        if not d.exists():
+            logging.error(f"Data directory not found: {d}")
+            return
+            
+    build_dataset(data_dirs, args.out_file, args.height_map, config)
 
 if __name__ == "__main__":
     main()
