@@ -6,7 +6,7 @@ import logging, os, argparse, pickle, random
 from pathlib import Path
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-from model_pipeline.train import build_model # Assuming train.py is in the same package
+from model_pipeline.train import build_model, MLPPolicy, LSTMPolicy, GRUPolicy, TransformerPolicy  # Assuming train.py is in the same package
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -16,6 +16,7 @@ def to_np(tensor):
 # In evaluate_policy.py
 
 def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_stack_k, device):
+    """Performs a plausible closed-loop rollout on a single trajectory, compatible with all model types."""
     X_mean, X_std, y_mean, y_std = norm_stats
     joint_min, joint_max = joint_limits
 
@@ -34,20 +35,30 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
     q_pred_history = X_traj_unstacked[:frame_stack_k, JOINT_START_IDX:].clone()
     predicted_q_trajectory = []
 
+    # Check if the loaded model is an MLP to decide how to format data
+    is_sequence_model = not isinstance(model, MLPPolicy)
+
     for i in range(rollout_steps):
         t = i + frame_stack_k - 1
         sensory_gt_stack = X_traj_unstacked[t - frame_stack_k + 1 : t + 1, :JOINT_START_IDX]
-        
-        # --- FIX: Do NOT flatten the state for sequence models ---
         state_window = torch.cat([sensory_gt_stack, q_pred_history], dim=1)
         
-        # Normalize each frame in the sequence
-        x_in_norm = (state_window - X_mean) / X_std
+        # --- FIX: Prepare input batch correctly based on model type ---
+        if is_sequence_model:
+            # For LSTM/GRU, normalize each frame and keep the sequence shape
+            state_norm = (state_window - X_mean) / X_std
+            state_norm = state_norm.unsqueeze(0) # Add batch dimension -> (1, K, D)
+        else: # For MLP
+            # For MLP, flatten the sequence and then normalize
+            state_flattened = state_window.flatten()
+            X_mean_stacked = X_mean.repeat(frame_stack_k)
+            X_std_stacked = X_std.repeat(frame_stack_k)
+            state_norm = (state_flattened - X_mean_stacked) / X_std_stacked
+            state_norm = state_norm.unsqueeze(0) # Add batch dimension -> (1, K*D)
         
         with torch.no_grad():
-            # Model expects (Batch=1, K, D), so we add a batch dimension
-            pred_norm = model(x_in_norm.unsqueeze(0)).squeeze(0)
-            delta_q_pred = (pred_norm * y_std) + y_mean
+            pred_norm = model(state_norm)
+            delta_q_pred = (pred_norm.view(-1) * y_std) + y_mean
             
         q_pred_next = q_pred_history[-1] + delta_q_pred
         q_pred_next = torch.clamp(q_pred_next, min=joint_min, max=joint_max)
@@ -80,23 +91,21 @@ def main():
     # --- Load Model, Stats, and Data ---
     checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     frame_stack_k = checkpoint.get("frame_stack", 1)
-    logging.info(f"Model was trained with frame_stack K={frame_stack_k}. Evaluating accordingly.")
+    model_type = checkpoint["model_type"]
+    logging.info(f"Model was trained with K={frame_stack_k}, type='{model_type}'. Evaluating accordingly.")
     
-    # FIX: Pass width as a keyword argument to build_model
-    model = build_model(
-        checkpoint["model_type"], 
-        checkpoint["input_dim"], 
-        checkpoint["output_dim"], 
-        width=args.width
-    ).to(device)
+    model = build_model(model_type, checkpoint["input_dim"], checkpoint["output_dim"], width=args.width).to(device)
     model.load_state_dict(checkpoint["state_dict"]); model.eval()
-    logging.info(f"Loaded model from {args.model} onto {device}.")
-
+    
     norm_stats = (torch.tensor(checkpoint["X_mean"], device=device), torch.tensor(checkpoint["X_std"], device=device),
                   torch.tensor(checkpoint["y_mean"], device=device), torch.tensor(checkpoint["y_std"], device=device))
-    
     joint_dim = checkpoint["output_dim"]
     joint_limits = (torch.full((joint_dim,), -2*np.pi, device=device), torch.full((joint_dim,), 2*np.pi, device=device))
+    logging.info(f"Loaded model and normalization stats from: {args.model}")
+    logging.info(f"Input Dim: {checkpoint['input_dim']}, Output Dim: {checkpoint['output_dim']}")
+    logging.info(f"Joint Limits: Min {joint_limits[0][0].item()}, Max {joint_limits[1][0].item()}")
+    # logging.info(f"Normalization - X_mean: {norm_stats[0].cpu().numpy()}, X_std: {norm_stats[1].cpu().numpy()}")
+    # logging.info(f"Normalization - y_mean: {norm_stats[2].cpu().numpy()}, y_std: {norm_stats[3].cpu().numpy()}")
 
     with open(args.dataset_pkl, "rb") as f: all_trajectories = pickle.load(f)
     random.seed(args.seed); random.shuffle(all_trajectories)
@@ -105,7 +114,9 @@ def main():
     
     output_dir = Path("data/debug/")
     output_dir.mkdir(parents=True, exist_ok=True)
-
+    logging.info(f"Loaded {len(val_trajectories)} validation trajectories from dataset.")
+    logging.info(f"Evaluation outputs will be saved to: {output_dir}")
+    
     if args.rollout:
         # --- ROLLOUT MODE ---
         all_metrics, all_preds, all_gts = [], [], []
@@ -168,43 +179,48 @@ def main():
     else:
         # --- ONE-STEP MODE (Frame-Stack Aware & Corrected) ---
         logging.info("Starting one-step evaluation with frame stacking...")
+
+        is_sequence_model = model_type in ["lstm", "gru", "transformer"]
+        flatten_data = not is_sequence_model
         
-        X_val_sequences, y_val_list = [], []
+        X_val_list, y_val_list = [], []
         for traj in val_trajectories:
             X_unstacked = np.concatenate([traj['tactile_t'], traj['visual_t'], traj['joints_t']], axis=1)
             y_unstacked = traj['delta_q']
-            num_samples = len(X_unstacked)
-            if num_samples < frame_stack_k: continue
+            if len(X_unstacked) < frame_stack_k: continue
             
-            for i in range(frame_stack_k - 1, num_samples):
-                # FIX: Append the sequence, not the flattened vector
+            for i in range(frame_stack_k - 1, len(X_unstacked)):
                 state_sequence = X_unstacked[i - frame_stack_k + 1 : i + 1]
-                X_val_sequences.append(state_sequence)
+                X_val_list.append(state_sequence.flatten() if flatten_data else state_sequence)
                 y_val_list.append(y_unstacked[i])
 
-        X_val_seq_tensor = torch.tensor(np.array(X_val_sequences), dtype=torch.float32, device=device)
+        X_val_raw = torch.tensor(np.array(X_val_list), dtype=torch.float32, device=device)
         y_val_true = torch.tensor(np.array(y_val_list), dtype=torch.float32, device=device)
         
         X_mean, X_std, y_mean, y_std = norm_stats
 
         with torch.no_grad():
-            # Normalize each frame in the sequence using broadcasting
-            X_val_norm = (X_val_seq_tensor - X_mean) / X_std
+            if flatten_data: # MLP
+                X_val_norm = (X_val_raw - X_mean.repeat(frame_stack_k)) / X_std.repeat(frame_stack_k)
+            else: # Sequence models
+                X_val_norm = (X_val_raw - X_mean) / X_std
+
             pred_norm = model(X_val_norm)
-            
-            # Denormalize the prediction
             delta_q_pred = (pred_norm * y_std) + y_mean
         
         delta_q_pred_np = to_np(delta_q_pred)
         delta_q_true_np = to_np(y_val_true)
-
+        
         metrics = {'mse': mean_squared_error(delta_q_true_np, delta_q_pred_np), 
                    'mae': mean_absolute_error(delta_q_true_np, delta_q_pred_np), 
                    'r2': r2_score(delta_q_true_np, delta_q_pred_np)}
-        
+
         logging.info("\n" + "="*50 + "\n          📊 ONE-STEP (delta_q) METRICS 📊\n" + "="*50)
         logging.info(f"MSE: {metrics['mse']:.6f}\nMAE: {metrics['mae']:.6f}\nR² : {metrics['r2']:.4f}")
-        logging.info(f"Total one-step samples evaluated: {len(X_val_sequences)}")
+        logging.info(f"Ground truth stats - Mean: {delta_q_true_np.mean(axis=0)}, Std: {delta_q_true_np.std(axis=0)}")
+        logging.info(f"Predicted stats    - Mean: {delta_q_pred_np.mean(axis=0)}, Std: {delta_q_pred_np.std(axis=0)}")
+        logging.info(f"Difference stats   - Mean: {(delta_q_pred_np - delta_q_true_np).mean(axis=0)}, Std: {(delta_q_pred_np - delta_q_true_np).std(axis=0)}")
+        logging.info(f"Total one-step samples evaluated: {len(delta_q_true_np)}")
 
         # --- FIX: Update plotting to use the correct variables and labels ---
         
@@ -236,3 +252,6 @@ def main():
         plt.savefig(output_dir / "onestep_eval_error_hist.png"); plt.close()
         
         logging.info(f"Evaluation plots saved in: {output_dir}")
+
+if __name__ == "__main__":
+    main()

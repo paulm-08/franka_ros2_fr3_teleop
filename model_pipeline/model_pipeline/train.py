@@ -35,7 +35,7 @@ class MLPPolicy(nn.Module):
 
 class LSTMPolicy(nn.Module):
     """A more robust LSTM Policy for sequence data."""
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_layers=2):
+    def __init__(self, input_dim, output_dim, hidden_dim=128, num_layers=1):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2 if num_layers > 1 else 0)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
@@ -89,6 +89,7 @@ class TrajectoryFrameStackDataset(Dataset):
         self.k = frame_stack_k
         self.flatten = flatten
         self.indices = []
+        self.is_training = (norm_stats is None)
         
         for traj_idx, traj in enumerate(self.trajectories):
             num_samples = traj['joints_t'].shape[0]
@@ -125,8 +126,16 @@ class TrajectoryFrameStackDataset(Dataset):
         action_norm = (action - self.y_mean) / self.y_std
         
         state_output = state_norm.flatten() if self.flatten else state_norm
-            
-        return torch.from_numpy(state_output).float(), torch.from_numpy(action_norm).float()
+
+        state_tensor = torch.from_numpy(state_output).float()
+        action_tensor = torch.from_numpy(action_norm).float()
+
+        # --- ADD AUGMENTATION ---
+        if self.is_training:
+            # Add a small amount of Gaussian noise
+            state_tensor += torch.randn_like(state_tensor) * 0.02
+
+        return state_tensor, action_tensor
 
     def log_stats(self):
         """NEW: Helper to log normalization statistics."""
@@ -152,7 +161,7 @@ def build_model(model_type, input_dim, output_dim, **kwargs):
     if model_type == "mlp":
         return MLPPolicy(input_dim, output_dim, width=kwargs.get("width", 256))
     elif model_type == "lstm":
-        return LSTMPolicy(input_dim, output_dim) # Can add hidden_dim, etc. here later
+        return LSTMPolicy(input_dim, output_dim, hidden_dim=kwargs.get("width", 128)) # Can add hidden_dim, etc. here later
     elif model_type == "gru":
         return GRUPolicy(input_dim, output_dim)
     elif model_type == "transformer":
@@ -218,7 +227,8 @@ def main():
     # --- 4. Build Model and Log Sanity Checks ---
     model = build_model(args.model_type, input_dim, output_dim, width=args.width).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    loss_fn = nn.MSELoss()
+    # loss_fn = nn.MSELoss()
+    loss_fn = nn.SmoothL1Loss()  # More robust to outliers than MSE
 
     logging.info(f"Training with Frame Stacking (K={args.frame_stack}) for '{args.model_type.upper()}' model.")
     logging.info(f"  Input Dim: {input_dim}, Output Dim: {output_dim}")

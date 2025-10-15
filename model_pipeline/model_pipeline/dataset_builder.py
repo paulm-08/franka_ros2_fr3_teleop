@@ -19,6 +19,7 @@ import json
 import torch
 
 from model_pipeline.visual_embedder import VisualEmbedder
+from model_pipeline.keypoint_extractor import KeypointExtractor
 # Import the revised feature extractor and its dimension constant
 from model_pipeline.tactile_features import process_tactile_image, TACTILE_FEATURE_DIM
 from model_pipeline.utils import load_frame_paths, load_actions, get_cfg_path, init_sensor
@@ -171,19 +172,29 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, embedde
         depth_emb2 = embedder.embed_depth(depth2)
 
         # Create a combined feature vector for each camera
-        visual_vecs = []
-        if rgb_emb1 is not None and depth_emb1 is not None:
-            visual_vecs.append(np.concatenate([rgb_emb1, depth_emb1]))
-        if rgb_emb2 is not None and depth_emb2 is not None:
-            visual_vecs.append(np.concatenate([rgb_emb2, depth_emb2]))
-        
-        # Robustly average the feature vectors from all available cameras
-        if not visual_vecs:
-            # The total dimension is now RGB_dim + Depth_dim
-            total_visual_dim = embedder.out_dim['rgb'] + embedder.out_dim['depth']
-            visual_vec = np.zeros(total_visual_dim, dtype=np.float32)
+        # --- REFINED LOGIC ---
+        # This robustly handles all cases: ResNet, Keypoints, or a mix
+        all_camera_features = []
+
+        # Process Camera 1
+        cam1_feats = []
+        if rgb_emb1 is not None: cam1_feats.append(rgb_emb1)
+        if depth_emb1 is not None: cam1_feats.append(depth_emb1)
+        if cam1_feats: all_camera_features.append(np.concatenate(cam1_feats))
+
+        # Process Camera 2
+        cam2_feats = []
+        if rgb_emb2 is not None: cam2_feats.append(rgb_emb2)
+        if depth_emb2 is not None: cam2_feats.append(depth_emb2)
+        if cam2_feats: all_camera_features.append(np.concatenate(cam2_feats))
+
+        # Average the feature vectors from all available and valid cameras
+        if not all_camera_features:
+            # Calculate total expected dimension if no cameras provide features
+            total_dim = sum(dim for dim in embedder.out_dim.values() if dim > 0)
+            visual_vec = np.zeros(total_dim, dtype=np.float32)
         else:
-            visual_vec = np.mean(visual_vecs, axis=0).astype(np.float32)
+            visual_vec = np.mean(all_camera_features, axis=0).astype(np.float32)
 
         visual_list.append(visual_vec)
 
@@ -274,21 +285,59 @@ def build_dataset(data_dirs, out_file, use_height_map, config):
         config (dict): A configuration dictionary.
     """
     if config.get("global_depth_range"):
-        logging.info("Using pre-computed depth range from config.")
+        logging.info(f"Using pre-computed depth range from config: {config['global_depth_range']}")
         global_depth_range = config["global_depth_range"]
     else:
         # Only compute if not already provided
         global_depth_range = compute_global_depth_range(data_dirs)
         
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # The corrected call (just remove the out_dim line)
-    embedder = VisualEmbedder(
-        backbone=config.get("backbone", "resnet18"),
-        device=device,
-        pretrained=True,
-        global_depth_range=global_depth_range
-    )
-    logging.info(f"Visual embedder initialized on {device} with out_dim={embedder.out_dim}")
+
+    # --- Initialize the KeypointExtractor based on config ---
+    use_extractor = config.get("vision", {}).get("use_keypoint_extractor", False)
+    if use_extractor:
+        logging.info("Using KeypointExtractor for visual features.")
+        # This replaces the VisualEmbedder initialization
+        use_3d_kps = config.get("vision", {}).get("use_3d", False)
+        
+        extractor = KeypointExtractor(
+            model_path=config.get("vision", {}).get("yolo_model_path"),
+            use_3d=use_3d_kps,
+            # These will be ignored if use_3d is False, but are needed if True
+            intrinsics_path=config.get("vision", {}).get("intrinsics_path"),
+            extrinsics_path=config.get("vision", {}).get("extrinsics_path")
+        )
+        logging.info(f"Keypoint extractor initialized with output dimension={extractor.output_dim}")
+        
+        # Define a simple wrapper to match the embedder interface
+        class SimpleEmbedder:
+            def __init__(self, extractor):
+                self.extractor = extractor
+                self.out_dim = {'rgb': extractor.output_dim, 'depth': 0} # Depth not used here
+
+            def embed_rgb(self, img):
+                return self.extractor.extract_scene_features(img)
+
+            def embed_depth(self, img):
+                return None # Not used
+
+        embedder = SimpleEmbedder(extractor)
+    else:
+        logging.info("Using VisualEmbedder for visual features.")
+        # Define the output dimensions for RGB and Depth embeddings
+        visual_dim = config.get("visual_dim", 256)
+        depth_dim = config.get("depth_dim", 128)
+        out_dim = {'rgb': visual_dim, 'depth': depth_dim}
+
+        # The corrected call (just remove the out_dim line)
+        embedder = VisualEmbedder(
+            backbone=config.get("backbone", "resnet18"),
+            device=device,
+            pretrained=True,
+            out_dim=out_dim,
+            global_depth_range=global_depth_range
+        )
+        logging.info(f"Visual embedder initialized on {device} with out_dim={embedder.out_dim}")
 
     all_trajectories = []
     for data_dir in data_dirs:
@@ -354,8 +403,17 @@ def main():
         "visual_dim": 256,
         "global_depth_range": [154, 2826],
         # Add other params like frame stacking window K here
+        # --- New settings for controlling vision module ---
+        "vision": {
+            "use_keypoint_extractor": True,  # Set to false to use ResNet18
+            # --- KeypointExtractor settings (ignored if false) ---
+            "yolo_model_path": "./runs/detect/yolov8_custom6/weights/best.pt",
+            "use_3d": False,  # Set to true for 3D coordinates
+            "intrinsics_path": "path/to/intrinsics_cam1.json",  # Needed for 3D
+            "extrinsics_path": "path/to/T_base_cam1.npy"  # Needed for 3D
+        }
     }
-    
+
     data_dirs = [Path(d).expanduser().resolve() for d in args.data_dirs]
     for d in data_dirs:
         if not d.exists():
