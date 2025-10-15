@@ -7,6 +7,8 @@ import random
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from model_pipeline import paths # Import the new paths module
+
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -321,8 +323,9 @@ def visualize_and_split_dataset(input_path, output_path, split_ratio=0.8, seed=4
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze, visualize, and optionally split a trajectory dataset.")
-    parser.add_argument("--input_file", type=str, required=True, help="Path to the input .pkl dataset file.")
-    parser.add_argument("--output_file", type=str, help="Optional: Path to save the final split .npz file.")
+    # Use dynamic paths as defaults
+    parser.add_argument("--input_file", type=str, default=str(paths.PROCESSED_DATA_DIR / "dataset.pkl"), help="Path to the input .pkl dataset file.")
+    parser.add_argument("--output_file", type=str, default=str(paths.PROCESSED_DATA_DIR / "dataset_split.npz"), help="Optional: Path to save the final split .npz file.")
     parser.add_argument("--split_ratio", type=float, default=0.85, help="Fraction of trajectories for training.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling.")
     args = parser.parse_args()

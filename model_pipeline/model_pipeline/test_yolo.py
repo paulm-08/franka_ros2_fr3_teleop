@@ -5,10 +5,15 @@ import torch
 import glob
 import os
 import numpy as np
+import argparse
+from pathlib import Path
+
+from model_pipeline import paths  # Import the new paths module
 
 # --- Configuration ---
-MODEL_PATH = r'C:\Users\paulm\franka_ros2_ws\runs\detect\yolov8_custom6\weights\best.pt'
-DATA_DIR = r'data/recorded_data/tube5'
+# MODEL_PATH = r'C:\Users\paulm\franka_ros2_ws\runs\detect\yolov8_custom6\weights\best.pt'
+MODEL_PATH = r'/home/user/franka_ros2_ws/runs/detect/train4/weights/best.pt'
+DATA_DIR = r'/home/user/recorded_data/clipped_data/uploaded/tube2'
 
 def draw_detections(image, results, model_names):
     """
@@ -43,13 +48,31 @@ def draw_detections(image, results, model_names):
     return image
 
 def main():
+    parser = argparse.ArgumentParser(description="Test a trained YOLO model on demonstration data.")
+    # Use dynamic paths as defaults for both the model and the data source
+    parser.add_argument("--model", type=str, 
+                        default=str(paths.YOLO_MODELS_DIR / "train" / "weights" / "best.pt"), 
+                        help="Path to the trained YOLO model (.pt file).")
+    parser.add_argument("--data_dir", type=str, 
+                        default=str(paths.RAW_DATA_DIR / "tube5"),
+                        help="Path to a raw demonstration data directory to test on.")
+    args = parser.parse_args()
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    model = YOLO(MODEL_PATH)
+    # Resolve paths to handle user inputs
+    model_path = Path(args.model).resolve()
+    data_path = Path(args.data_dir).resolve()
+
+    if not model_path.exists():
+        print(f"Error: Model not found at {model_path}")
+        return
+
+    model = YOLO(model_path)
     model.to(device)
 
-    frame_paths = glob.glob(os.path.join(DATA_DIR, 'frame_*'))
+    frame_paths = glob.glob(os.path.join(data_path, 'frame_*'))
     frame_dirs = sorted(frame_paths, key=lambda p: int(os.path.basename(p).split('_')[1]))
     
     if not frame_dirs:

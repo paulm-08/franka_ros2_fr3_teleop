@@ -1,97 +1,164 @@
 import os
+import glob
+import cv2
 import json
-import shutil
-from pathlib import Path
-import argparse
 import logging
+import argparse
+from pathlib import Path
+import inquirer
 
+from model_pipeline import paths
+
+# --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-def sample_frames_by_clip(demo_dirs, output_dir, step=30):
+def find_demo_dirs(root_search_path):
     """
-    Samples frames from within each clip for both cameras and saves them into
-    separate directories with zero-padded frame numbers for correct sorting.
+    Recursively searches a root directory to find all subdirectories that
+    contain 'frame_*' folders, indicating they are valid demonstration datasets.
+    
+    Returns a list of paths relative to the workspace root.
     """
-    output_path = Path(output_dir)
-    cam1_path = output_path / "cam1_images"
-    cam2_path = output_path / "cam2_images"
-    cam1_path.mkdir(parents=True, exist_ok=True)
-    cam2_path.mkdir(parents=True, exist_ok=True)
-
-    img_count = 0
-
-    for demo_dir in demo_dirs:
-        demo_path = Path(demo_dir)
-        demo_name = demo_path.name
-        clip_marks_path = demo_path / "clip_marks.json"
-
-        if not clip_marks_path.exists():
-            logging.warning(f"No clip_marks.json in {demo_dir}, skipping.")
-            continue
-
-        logging.info(f"Processing clips for demonstration: {demo_name}")
-        with open(clip_marks_path, "r") as f:
-            clips = json.load(f)
-
-        # **FIX**: Sort frame paths numerically instead of alphabetically.
-        all_frame_paths = sorted(
-            demo_path.glob("frame_*"),
-            key=lambda p: int(p.name.split('_')[1])
-        )
-        all_frame_names = [p.name for p in all_frame_paths]
-
-        clip_iterable = None
-        if isinstance(clips, dict):
-            clip_iterable = clips.items()
-        elif isinstance(clips, list):
-            clip_iterable = ((clip.get("name", f"clip_{i}"), clip) for i, clip in enumerate(clips))
-        else:
-            logging.error(f"Unsupported format for clip_marks.json in {demo_dir}. Must be a dict or list.")
-            continue
-
-        for clip_name, clip_data in clip_iterable:
-            start_frame, end_frame = clip_data["start"], clip_data["end"]
+    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
+    found_demos = []
+    for dirpath, _, _ in os.walk(root_search_path):
+        # A directory is considered a "demo" if it directly contains frame_* folders
+        if glob.glob(os.path.join(dirpath, 'frame_*')):
+            # Store the path relative to the workspace root for a cleaner display
+            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
+            found_demos.append(str(relative_path))
             
+    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
+    return sorted(found_demos)
+
+def sample_frames_by_clip(demo_dirs, output_dir, step):
+    """
+    (Corrected Version)
+    Goes through specified demonstration directories, reads their clip_marks.json,
+    and samples one image from each camera every 'step' frames within each clip,
+    with robust error checking for file read/write operations.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cam1_dir = output_dir / "camera_1"
+    cam2_dir = output_dir / "camera_2"
+    cam1_dir.mkdir(exist_ok=True)
+    cam2_dir.mkdir(exist_ok=True)
+    
+    total_sampled_count = 0
+    
+    for demo_path_str in demo_dirs:
+        demo_path = Path(demo_path_str)
+        logging.info(f"\nProcessing directory: {demo_path.name}")
+        
+        clip_marks_path = demo_path / "clip_marks.json"
+        if not clip_marks_path.exists():
+            logging.warning(f"  - No clip_marks.json found in {demo_path.name}, skipping.")
+            continue
+
+        with open(clip_marks_path, "r") as f:
+            clip_marks = json.load(f)
+        
+        all_frame_dirs = sorted(
+            glob.glob(str(demo_path / 'frame_*')), 
+            key=lambda p: int(os.path.basename(p).split('_')[1])
+        )
+        frame_names = [os.path.basename(p) for p in all_frame_dirs]
+
+        clips = clip_marks if isinstance(clip_marks, list) else clip_marks.values()
+        for i, clip in enumerate(clips):
             try:
-                i_start = all_frame_names.index(start_frame)
-                i_end = all_frame_names.index(end_frame)
+                i_start = frame_names.index(clip["start"])
+                i_end = frame_names.index(clip["end"])
+                
+                logging.info(f"  Sampling from clip {i+1} ({clip['start']} to {clip['end']})...")
+                
+                for frame_idx in range(i_start, i_end + 1, step):
+                    frame_dir = all_frame_dirs[frame_idx]
+                    frame_num = os.path.basename(frame_dir).split('_')[1]
+                    frame_num_int = int(os.path.basename(frame_dir).split('_')[1])
+                    # --- FIX: Zero-pad the frame number to 5 digits (e.g., 3426 -> "03426") ---
+                    frame_num_padded = f"{frame_num_int:05d}"
+
+
+                    # --- Robust sampling for camera 1 ---
+                    img1_path = os.path.join(frame_dir, 'color_image1.jpg')
+                    if os.path.exists(img1_path):
+                        img = cv2.imread(img1_path)
+                        if img is None:
+                            logging.warning(f"    - Failed to READ image file (it may be corrupted): {img1_path}")
+                            continue # Skip this corrupted file
+                        
+                        # FIX: Added '_frame_' to the filename to match the label format
+                        save_name = f"{demo_path.name}_clip_{i}_frame_{frame_num_padded}_cam1.jpg"
+                        success = cv2.imwrite(str(cam1_dir / save_name), img)
+                        if success:
+                            total_sampled_count += 1
+                        else:
+                            logging.error(f"    - Failed to WRITE image file to: {str(cam1_dir / save_name)}")
+
+                    # --- Robust sampling for camera 2 ---
+                    img2_path = os.path.join(frame_dir, 'color_image2.jpg')
+                    if os.path.exists(img2_path):
+                        img = cv2.imread(img2_path)
+                        if img is None:
+                            logging.warning(f"    - Failed to READ image file (it may be corrupted): {img2_path}")
+                            continue # Skip this corrupted file
+
+                        # FIX: Added '_frame_' to the filename to match the label format
+                        save_name = f"{demo_path.name}_clip_{i}_frame_{frame_num_padded}_cam2.jpg"
+                        success = cv2.imwrite(str(cam2_dir / save_name), img)
+                        if success:
+                            total_sampled_count += 1
+                        else:
+                            logging.error(f"    - Failed to WRITE image file to: {str(cam2_dir / save_name)}")
+
             except ValueError:
-                logging.error(f"Frame range for clip '{clip_name}' not found. Skipping.")
-                continue
+                logging.warning(f"  - Could not find start/end frame for a clip in {demo_path.name}, skipping clip.")
 
-            clip_frame_paths = all_frame_paths[i_start : i_end + 1]
+    logging.info(f"\n✅ Done! Sampled a total of {total_sampled_count} images.")
+    logging.info(f"Output saved to: {output_dir}")
 
-            for i in range(0, len(clip_frame_paths), step):
-                frame_path = clip_frame_paths[i]
-
-                # --- START: Loop for Both Cameras ---
-                for cam_idx in [1, 2]:
-                    src_img_path = frame_path / f"color_image{cam_idx}.jpg"
-                    if src_img_path.exists():
-                        # **FIX**: Extract frame number and zero-pad it for correct sorting.
-                        frame_num = int(frame_path.name.split('_')[1])
-                        padded_frame_name = f"frame_{frame_num:05d}" # e.g., frame_00353
-
-                        # Create the new, informative filename.
-                        unique_name = f"{demo_name}_{clip_name}_{padded_frame_name}_cam{cam_idx}.jpg"
-                        
-                        # Select the correct destination folder based on the camera.
-                        if cam_idx == 1:
-                            dest_img_path = cam1_path / unique_name
-                        else: # cam_idx == 2
-                            dest_img_path = cam2_path / unique_name
-                        
-                        shutil.copy(src_img_path, dest_img_path)
-                        img_count += 1
-                # --- END: Loop for Both Cameras ---
-
-    logging.info(f"✅ Done! Sampled {img_count} images into separate camera folders in '{output_path}'.")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Sample images from robot demonstrations by clip for two cameras.")
-    parser.add_argument("--demos", nargs="+", required=True, help="List of demonstration directories.")
-    parser.add_argument("--output", type=str, required=True, help="Output directory for sampled images.")
+def main():
+    parser = argparse.ArgumentParser(description="Interactively sample images from robot demonstrations for YOLO annotation.")
+    parser.add_argument("--output", type=str, default=str(paths.YOLO_DATA_DIR / "sampled_images"), help="Output directory for sampled images.")
     parser.add_argument("--step", type=int, default=30, help="Frame sampling interval.")
     args = parser.parse_args()
+
+    # 1. Automatically find all potential demonstration directories
+    demo_choices = find_demo_dirs(paths.RAW_DATA_DIR)
     
-    sample_frames_by_clip(args.demos, args.output, args.step)
+    if not demo_choices:
+        logging.error(f"No demonstration directories containing 'frame_*' folders were found in {paths.RAW_DATA_DIR}.")
+        return
+
+    # 2. Create an interactive checklist for the user
+    questions = [
+        inquirer.Checkbox('selected_demos',
+                          message="Select the datasets to sample from (use SPACE to select, ENTER to confirm)",
+                          choices=demo_choices,
+                          ),
+    ]
+    
+    try:
+        answers = inquirer.prompt(questions)
+        if not answers or not answers['selected_demos']:
+            logging.info("No datasets selected. Exiting.")
+            return
+        
+        selected_relative_paths = answers['selected_demos']
+
+    except (KeyboardInterrupt, TypeError):
+        logging.info("\nSampling cancelled by user.")
+        return
+
+    # 3. Convert selected relative paths back to absolute paths
+    selected_absolute_paths = [str(paths.WORKSPACE_ROOT / path_str) for path_str in selected_relative_paths]
+    
+    logging.info(f"You selected {len(selected_absolute_paths)} dataset(s) for sampling.")
+    
+    # 4. Run the sampling process on the user's selection
+    sample_frames_by_clip(selected_absolute_paths, Path(args.output), args.step)
+
+if __name__ == "__main__":
+    main()
+

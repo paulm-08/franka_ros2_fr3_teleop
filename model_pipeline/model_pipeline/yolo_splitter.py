@@ -5,6 +5,8 @@ from pathlib import Path
 import argparse
 import logging
 
+from model_pipeline import paths # Import the new paths module
+
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 def split_data(images_dir, labels_dir, dest_dir, split_ratio=0.8):
@@ -82,12 +84,25 @@ def split_data(images_dir, labels_dir, dest_dir, split_ratio=0.8):
     logging.info(f"   Training set: {num_train} image-label pairs.")
     logging.info(f"   Validation set: {num_valid} image-label pairs.")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Split image and label data for YOLO training.")
-    parser.add_argument("--images", type=str, required=True, help="Source directory with image files.")
-    parser.add_argument("--labels", type=str, required=True, help="Source directory with annotation (.txt) files.")
-    parser.add_argument("--dest", type=str, required=True, help="Destination directory for the train/valid split.")
-    parser.add_argument("--ratio", type=float, default=0.8, help="Training set split ratio (e.g., 0.8 for 80%).")
+def main():
+    parser = argparse.ArgumentParser(description="Split aggregated image and label data for YOLO training.")
+    # The script now takes a single source directory and assumes it contains 'images' and 'labels' subfolders
+    parser.add_argument("--source", type=str, default=str(paths.YOLO_DATA_DIR / "aggregated_dataset"),
+                        help="Source directory with 'images' and 'labels' subfolders.")
+    parser.add_argument("--dest", type=str, default=str(paths.YOLO_DATA_DIR / "yolo_split_dataset"), 
+                        help="Destination directory for the train/valid split.")
+    parser.add_argument("--ratio", type=float, default=0.8, help="Training set split ratio.")
     args = parser.parse_args()
 
-    split_data(args.images, args.labels, args.dest, args.ratio)
+    source_path = Path(args.source)
+    images_path = source_path / "images"
+    labels_path = source_path / "labels"
+
+    if not images_path.exists() or not labels_path.exists():
+        logging.error(f"Error: Source directory '{source_path}' must contain 'images' and 'labels' subfolders.")
+        return
+
+    split_data(str(images_path), str(labels_path), args.dest, args.ratio)
+
+if __name__ == "__main__":
+    main()

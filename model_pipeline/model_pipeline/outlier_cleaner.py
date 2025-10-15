@@ -4,6 +4,7 @@ import pickle
 import argparse
 import logging
 from pathlib import Path
+from model_pipeline import paths
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -82,14 +83,18 @@ def find_and_clean_outliers(input_path, output_path, threshold_action, threshold
         
     logging.info(f"✅ Successfully saved cleaned dataset to {output_path}")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Clean outlier trajectories from a .pkl dataset.")
+    # Use dynamic paths from paths.py as defaults
     parser.add_argument(
-        "--input_file", type=str, required=True,
+        "--input_file", type=str, 
+        default=str(paths.PROCESSED_DATA_DIR / "dataset.pkl"),
         help="Path to the input .pkl dataset file to be cleaned."
     )
     parser.add_argument(
-        "--output_file", type=str, required=True,
+        "--output_file", type=str, 
+        default=str(paths.PROCESSED_DATA_DIR / "dataset_cleaned.pkl"),
         help="Path to save the new, cleaned .pkl dataset file."
     )
     parser.add_argument(

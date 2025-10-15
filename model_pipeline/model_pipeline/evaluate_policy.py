@@ -7,6 +7,7 @@ from pathlib import Path
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 from model_pipeline.train import build_model, MLPPolicy, LSTMPolicy, GRUPolicy, TransformerPolicy  # Assuming train.py is in the same package
+from model_pipeline import paths
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -76,20 +77,23 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a trained policy with frame stacking awareness.")
-    parser.add_argument("--model", type=str, required=True, help="Path to the trained model checkpoint (.pt file).")
-    parser.add_argument("--dataset_pkl", type=str, required=True, help="Path to the original trajectory dataset (.pkl file).")
+    # Use dynamic paths as defaults
+    parser.add_argument("--model", type=str, default=str(paths.POLICY_MODELS_DIR / "policy_mlp_best.pt"), help="Path to the trained model checkpoint (.pt file).")
+    parser.add_argument("--dataset_pkl", type=str, default=str(paths.PROCESSED_DATA_DIR / "dataset_cleaned.pkl"), help="Path to the original trajectory dataset (.pkl file).")
     parser.add_argument("--rollout", action="store_true", help="Enable closed-loop rollout mode.")
     parser.add_argument("--horizon", type=int, default=500, help="Max number of rollout steps per trajectory.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducing the train/val split.")
     parser.add_argument("--split_ratio", type=float, default=0.85, help="Train/val split ratio to reproduce.")
-    # NEW: Add the width argument to match train.py
     parser.add_argument("--width", type=int, default=256, help="Width of hidden layers for MLP if specified in model.")
     args = parser.parse_args()
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # --- Load Model, Stats, and Data ---
-    checkpoint = torch.load(args.model, map_location=device, weights_only=False)
+    model_path = Path(args.model).resolve()
+    dataset_path = Path(args.dataset_pkl).resolve()
+
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     frame_stack_k = checkpoint.get("frame_stack", 1)
     model_type = checkpoint["model_type"]
     logging.info(f"Model was trained with K={frame_stack_k}, type='{model_type}'. Evaluating accordingly.")
@@ -107,12 +111,12 @@ def main():
     # logging.info(f"Normalization - X_mean: {norm_stats[0].cpu().numpy()}, X_std: {norm_stats[1].cpu().numpy()}")
     # logging.info(f"Normalization - y_mean: {norm_stats[2].cpu().numpy()}, y_std: {norm_stats[3].cpu().numpy()}")
 
-    with open(args.dataset_pkl, "rb") as f: all_trajectories = pickle.load(f)
+    with open(dataset_path, "rb") as f: all_trajectories = pickle.load(f)
     random.seed(args.seed); random.shuffle(all_trajectories)
     split_index = int(len(all_trajectories) * args.split_ratio)
     val_trajectories = all_trajectories[split_index:]
     
-    output_dir = Path("data/debug/")
+    output_dir = paths.MODELS_DIR / "debug"
     output_dir.mkdir(parents=True, exist_ok=True)
     logging.info(f"Loaded {len(val_trajectories)} validation trajectories from dataset.")
     logging.info(f"Evaluation outputs will be saved to: {output_dir}")

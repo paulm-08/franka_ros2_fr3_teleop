@@ -30,6 +30,11 @@ setup(
             'train = model_pipeline.train:main',
             'rollout_policy = model_pipeline.rollout_policy:main',
             'evaluate_policy = model_pipeline.evaluate_policy:main',
+            'aggregate = model_pipeline.aggregate:main',
+            'sampler = model_pipeline.sampler:main',
+            'yolo_splitter = model_pipeline.yolo_splitter:main',
+            'test_yolo = model_pipeline.test_yolo:main',
+            'paths = model_pipeline.paths:log_all_paths',
         ],
     },
 )
