@@ -50,70 +50,116 @@ def plot_tactile_distributions(X_train, X_val, output_dir):
     logging.info(f"📊 Saved detailed tactile plot to {save_path}")
 
 def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, output_dir):
-    """Generates detailed plots for visual features, including YOLO and embeddings."""
-    # --- Define the structure of your visual vector ---
-    yolo_dim = 4
-    yolo_feature_names = ['tube_x', 'tube_y', 'peg_x', 'peg_y']
-    
-    # Check if there are embeddings in addition to YOLO features
-    has_embeddings = visual_dim > yolo_dim
-    
-    fig = plt.figure(figsize=(20, 15))
-    gs = fig.add_gridspec(3, 2)
-    fig.suptitle('Detailed Visual Feature Analysis', fontsize=18, y=1.02)
+    """
+    Generates detailed plots for a 16D visual feature vector (2 cameras, 2 objects, 4 features each).
+    Feature order: [tube_x, tube_y, tube_conf, tube_flag, peg_x, peg_y, peg_conf, peg_flag] per camera.
+    """
+    if visual_dim != 16:
+        logging.warning(f"This visualization expects a 16D visual vector, but found {visual_dim}D. Skipping visual plots.")
+        return
 
-    # Plot 1: YOLO Coordinate Distributions
-    ax1 = fig.add_subplot(gs[0, :])
-    for i in range(yolo_dim):
-        feature_idx = tactile_total_dim + i
-        # Use a simple histogram which is robust to zero-variance data
-        ax1.hist(X_train[:, feature_idx], bins=50, density=True, alpha=0.6, label=f'Train {yolo_feature_names[i]}')
-    ax1.set_title('YOLO Object Coordinate Distributions (Training Set)')
-    ax1.legend(); ax1.grid(True, linestyle='--')
-    
-    # --- The rest of the plots are the same as before ---
-    # Plot 2 & 3: 2D Position Heatmaps
-    ax2 = fig.add_subplot(gs[1, 0])
-    tube_x_idx, tube_y_idx = tactile_total_dim, tactile_total_dim + 1
-    ax2.scatter(X_train[:, tube_x_idx], X_train[:, tube_y_idx], alpha=0.05, label="Train")
-    ax2.scatter(X_val[:, tube_x_idx], X_val[:, tube_y_idx], alpha=0.05, label="Val")
-    ax2.set_title('Tube Position Coverage'); ax2.set_xlabel('X Coordinate'); ax2.set_ylabel('Y Coordinate')
-    ax2.legend(); ax2.grid(True, linestyle='--'); ax2.axis('equal')
+    fig = plt.figure(figsize=(20, 24))
+    gs = fig.add_gridspec(6, 2) # Added a row for the new detection rate plot
+    fig.suptitle('Dual-Camera Keypoint Feature Analysis (with Detection Flags)', fontsize=18, y=1.01)
 
-    ax3 = fig.add_subplot(gs[1, 1])
-    peg_x_idx, peg_y_idx = tactile_total_dim + 2, tactile_total_dim + 3
-    ax3.scatter(X_train[:, peg_x_idx], X_train[:, peg_y_idx], alpha=0.05)
-    ax3.set_title('Peg Position Coverage'); ax3.set_xlabel('X Coordinate'); ax3.set_ylabel('Y Coordinate')
-    ax3.grid(True, linestyle='--'); ax3.axis('equal')
+    # --- Feature Indices Setup (for 16D vector) ---
+    c1_tube_x, c1_tube_y, c1_tube_conf, c1_tube_flag = tactile_total_dim, tactile_total_dim + 1, tactile_total_dim + 2, tactile_total_dim + 3
+    c1_peg_x,  c1_peg_y,  c1_peg_conf,  c1_peg_flag  = tactile_total_dim + 4, tactile_total_dim + 5, tactile_total_dim + 6, tactile_total_dim + 7
+    c2_tube_x, c2_tube_y, c2_tube_conf, c2_tube_flag = tactile_total_dim + 8, tactile_total_dim + 9, tactile_total_dim + 10, tactile_total_dim + 11
+    c2_peg_x,  c2_peg_y,  c2_peg_conf,  c2_peg_flag  = tactile_total_dim + 12, tactile_total_dim + 13, tactile_total_dim + 14, tactile_total_dim + 15
 
-    # Plot 4: Relative Position Distribution
-    ax4 = fig.add_subplot(gs[2, 0])
-    rel_x_train = X_train[:, tube_x_idx] - X_train[:, peg_x_idx]
-    rel_y_train = X_train[:, tube_y_idx] - X_train[:, peg_y_idx]
-    ax4.hist2d(rel_x_train, rel_y_train, bins=50, cmap='viridis')
-    ax4.set_title('Relative Position (Tube - Peg) Distribution'); ax4.set_xlabel('Relative X'); ax4.set_ylabel('Relative Y')
-    ax4.grid(True, linestyle='--'); ax4.axis('equal')
+    # --- NEW: Plot Row 1: Detection Rate Analysis ---
+    ax_rate1 = fig.add_subplot(gs[0, 0])
+    tube1_rate = np.mean(X_train[:, c1_tube_flag]) * 100
+    peg1_rate = np.mean(X_train[:, c1_peg_flag]) * 100
+    ax_rate1.bar(['Tube Tip', 'Peg'], [tube1_rate, peg1_rate], color=['skyblue', 'salmon'])
+    ax_rate1.set_title('Camera 1: Object Detection Rate (%)', fontsize=14, weight='bold')
+    ax_rate1.set_ylabel('Frames Detected (%)'); ax_rate1.set_ylim(0, 105)
+    for i, rate in enumerate([tube1_rate, peg1_rate]):
+        ax_rate1.text(i, rate + 2, f'{rate:.1f}%', ha='center', fontsize=12)
+    ax_rate1.grid(axis='y', linestyle='--')
     
-    # --- FIX: Only plot embeddings if they exist ---
-    ax5 = fig.add_subplot(gs[2, 1])
-    if has_embeddings:
-        emb_start_idx = tactile_total_dim + yolo_dim
-        # Check to ensure indices are valid before plotting
-        if emb_start_idx + 50 < X_train.shape[1]:
-            sns.kdeplot(X_train[:, emb_start_idx + 10], ax=ax5, label='Train Emb[10]', fill=True)
-            sns.kdeplot(X_val[:, emb_start_idx + 10], ax=ax5, label='Val Emb[10]', fill=True, linestyle='--')
-            sns.kdeplot(X_train[:, emb_start_idx + 50], ax=ax5, label='Train Emb[50]', fill=True)
-            sns.kdeplot(X_val[:, emb_start_idx + 50], ax=ax5, label='Val Emb[50]', fill=True, linestyle='--')
-            ax5.set_title('Sample of Abstract Embedding Distributions')
-        else:
-            ax5.text(0.5, 0.5, 'Not enough embedding features to plot.', ha='center', va='center')
-    else:
-        ax5.text(0.5, 0.5, 'No abstract embeddings found in data.', ha='center', va='center')
-        ax5.set_title('Abstract Embedding Distributions')
-    
-    ax5.legend(); ax5.grid(True, linestyle='--')
+    ax_rate2 = fig.add_subplot(gs[0, 1])
+    tube2_rate = np.mean(X_train[:, c2_tube_flag]) * 100
+    peg2_rate = np.mean(X_train[:, c2_peg_flag]) * 100
+    ax_rate2.bar(['Tube Tip', 'Peg'], [tube2_rate, peg2_rate], color=['skyblue', 'salmon'])
+    ax_rate2.set_title('Camera 2: Object Detection Rate (%)', fontsize=14, weight='bold')
+    ax_rate2.set_ylim(0, 105)
+    for i, rate in enumerate([tube2_rate, peg2_rate]):
+        ax_rate2.text(i, rate + 2, f'{rate:.1f}%', ha='center', fontsize=12)
+    ax_rate2.grid(axis='y', linestyle='--')
 
-    plt.tight_layout(rect=[0, 0, 1, 1])
+    # --- Plot Row 2: Coordinate Distributions ---
+    ax1 = fig.add_subplot(gs[1, 0])
+    sns.kdeplot(X_train[:, c1_tube_x], ax=ax1, label='Tube X', fill=True, warn_singular=False)
+    sns.kdeplot(X_train[:, c1_peg_x], ax=ax1, label='Peg X', fill=True, warn_singular=False)
+    ax1.set_title('Camera 1: X-Coordinate Distributions'); ax1.legend(); ax1.grid(True, linestyle='--')
+
+    ax2 = fig.add_subplot(gs[1, 1])
+    sns.kdeplot(X_train[:, c2_tube_x], ax=ax2, label='Tube X', fill=True, warn_singular=False)
+    sns.kdeplot(X_train[:, c2_peg_x], ax=ax2, label='Peg X', fill=True, warn_singular=False)
+    ax2.set_title('Camera 2: X-Coordinate Distributions'); ax2.legend(); ax2.grid(True, linestyle='--')
+
+    # --- Plot Row 3: Confidence Score Distributions (only for detected frames) ---
+    ax_conf1 = fig.add_subplot(gs[2, 0])
+    ax_conf1.hist(X_train[X_train[:, c1_tube_flag] > 0, c1_tube_conf], bins=50, density=True, alpha=0.7, label='Tube Confidence')
+    ax_conf1.hist(X_train[X_train[:, c1_peg_flag] > 0, c1_peg_conf], bins=50, density=True, alpha=0.7, label='Peg Confidence')
+    ax_conf1.set_title('Camera 1: Detection Confidence (where detected)'); ax_conf1.legend(); ax_conf1.grid(True, linestyle='--')
+
+    ax_conf2 = fig.add_subplot(gs[2, 1])
+    ax_conf2.hist(X_train[X_train[:, c2_tube_flag] > 0, c2_tube_conf], bins=50, density=True, alpha=0.7, label='Tube Confidence')
+    ax_conf2.hist(X_train[X_train[:, c2_peg_flag] > 0, c2_peg_conf], bins=50, density=True, alpha=0.7, label='Peg Confidence')
+    ax_conf2.set_title('Camera 2: Detection Confidence (where detected)'); ax_conf2.legend(); ax_conf2.grid(True, linestyle='--')
+
+   # --- Plot Row 4: Position Coverage (FILTERED) ---
+    ax3 = fig.add_subplot(gs[3, 0])
+    # --- MODIFICATION: Create a boolean mask for detected tube in camera 1 ---
+    mask_train_c1_tube = X_train[:, c1_tube_flag] > 0
+    ax3.scatter(X_train[mask_train_c1_tube, c1_tube_x], X_train[mask_train_c1_tube, c1_tube_y], alpha=0.05)
+    ax3.set_title('Camera 1: Tube Position Coverage (Detected Only)')
+
+    ax4 = fig.add_subplot(gs[3, 1])
+    # --- MODIFICATION: Create a boolean mask for detected peg in camera 1 ---
+    mask_train_c1_peg = X_train[:, c1_peg_flag] > 0
+    ax4.scatter(X_train[mask_train_c1_peg, c1_peg_x], X_train[mask_train_c1_peg, c1_peg_y], alpha=0.05)
+    ax4.set_title('Camera 1: Peg Position Coverage (Detected Only)')
+    
+    # --- Plot Row 5: Position Coverage for Camera 2 (FILTERED) ---
+    ax5 = fig.add_subplot(gs[4, 0])
+    # --- MODIFICATION: Create a boolean mask for detected tube in camera 2 ---
+    mask_train_c2_tube = X_train[:, c2_tube_flag] > 0
+    ax5.scatter(X_train[mask_train_c2_tube, c2_tube_x], X_train[mask_train_c2_tube, c2_tube_y], alpha=0.05)
+    ax5.set_title('Camera 2: Tube Position Coverage (Detected Only)')
+
+    ax6 = fig.add_subplot(gs[4, 1])
+    # --- MODIFICATION: Create a boolean mask for detected peg in camera 2 ---
+    mask_train_c2_peg = X_train[:, c2_peg_flag] > 0
+    ax6.scatter(X_train[mask_train_c2_peg, c2_peg_x], X_train[mask_train_c2_peg, c2_peg_y], alpha=0.05)
+    ax6.set_title('Camera 2: Peg Position Coverage (Detected Only)')
+
+    # --- Plot Row 6: Relative Position Distributions (FILTERED) ---
+    ax7 = fig.add_subplot(gs[5, 0])
+    # --- MODIFICATION: Create a mask for frames where BOTH objects are seen in camera 1 ---
+    mask_c1_both = (X_train[:, c1_tube_flag] > 0) & (X_train[:, c1_peg_flag] > 0)
+    rel_x1 = X_train[mask_c1_both, c1_tube_x] - X_train[mask_c1_both, c1_peg_x]
+    rel_y1 = X_train[mask_c1_both, c1_tube_y] - X_train[mask_c1_both, c1_peg_y]
+    ax7.hist2d(rel_x1, rel_y1, bins=50, cmap='viridis')
+    ax7.set_title('Camera 1: Relative Position (Where Both Detected)')
+    
+    ax8 = fig.add_subplot(gs[5, 1])
+    # --- MODIFICATION: Create a mask for frames where BOTH objects are seen in camera 2 ---
+    mask_c2_both = (X_train[:, c2_tube_flag] > 0) & (X_train[:, c2_peg_flag] > 0)
+    rel_x2 = X_train[mask_c2_both, c2_tube_x] - X_train[mask_c2_both, c2_peg_x]
+    rel_y2 = X_train[mask_c2_both, c2_tube_y] - X_train[mask_c2_both, c2_peg_y]
+    ax8.hist2d(rel_x2, rel_y2, bins=50, cmap='viridis')
+    ax8.set_title('Camera 2: Relative Position (Where Both Detected)')
+
+    for ax in [ax3, ax4, ax5, ax6, ax7, ax8]:
+        ax.set_xlabel('X (normalized)'); ax.set_ylabel('Y (normalized)')
+        ax.grid(True, linestyle='--'); ax.axis('equal')
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1) # Set limits for normalized coordinates
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
     save_path = output_dir / "visual_feature_analysis.png"
     plt.savefig(save_path)
     plt.close(fig)
@@ -215,6 +261,7 @@ def plot_correlation_heatmap(X_train, tactile_total_dim, visual_dim, output_dir)
     plt.savefig(save_path)
     plt.close(fig)
     logging.info(f"📊 Saved feature correlation heatmap to {save_path}")
+    
 # ===================================================================
 # === MAIN SCRIPT LOGIC ===
 # ===================================================================
