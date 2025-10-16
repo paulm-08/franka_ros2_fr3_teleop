@@ -24,11 +24,14 @@ import pickle
 from pathlib import Path
 import json
 import torch
+import inquirer
+import yaml
 
 from model_pipeline.visual_embedder import VisualEmbedder
 from model_pipeline.keypoint_extractor import KeypointExtractor
 from model_pipeline.tactile_features import process_tactile_image, TACTILE_FEATURE_DIM
 from model_pipeline.utils import load_frame_paths, load_actions, get_cfg_path, init_sensor
+from model_pipeline import paths
 
 # It's good practice to define sensor names for consistent ordering
 SENSOR_ORDER = ["rindex", "rmiddle", "rthumb"]
@@ -68,7 +71,8 @@ class VisionProcessor:
                 confidence_threshold=conf_thresh,
                 device=device
             )
-            self.single_cam_dim = self.extractor1.output_dim
+            self.single_cam_dim = self.extractor1.output_dim + 2 
+
         else:
             logging.info("Initializing VisualEmbedder (ResNet) for visual features.")
             global_depth_range = config.get("global_depth_range")
@@ -89,8 +93,29 @@ class VisionProcessor:
 
     def process_cameras(self, color1, depth1, color2, depth2):
         if self.is_keypoint_extractor:
-            feats1 = self.extractor1.extract_scene_features(color1, depth1)
-            feats2 = self.extractor2.extract_scene_features(color2, depth2)
+            # --- MODIFICATION: Extract features AND engineer new ones ---
+            def get_engineered_features(extractor, color, depth):
+                # This returns the raw [tube_x, tube_y, tube_conf, tube_flag, peg_x, ...] vector
+                raw_kps = extractor.extract_scene_features(color, depth)
+                if raw_kps is None: return None
+
+                # Extract individual keypoints
+                tube_kp = raw_kps[0:4] # x, y, conf, flag
+                peg_kp = raw_kps[4:8]
+
+                # ENGINEER THE NEW FEATURE: The relative vector
+                # Only calculate if both objects were detected
+                if tube_kp[3] > 0 and peg_kp[3] > 0:
+                    relative_vec = tube_kp[0:2] - peg_kp[0:2] # [dx, dy]
+                else:
+                    relative_vec = np.zeros(2, dtype=np.float32)
+                
+                # The new feature vector is the raw keypoints + the engineered relative vector
+                return np.concatenate([raw_kps, relative_vec])
+
+            feats1 = get_engineered_features(self.extractor1, color1, depth1)
+            feats2 = get_engineered_features(self.extractor2, color2, depth2)
+            
         else: # ResNet Embedder
             def extract(c_img, d_img):
                 if c_img is None: return None
@@ -102,6 +127,28 @@ class VisionProcessor:
             feats2 = extract(color2, depth2)
         
         return {'cam1': feats1, 'cam2': feats2}
+
+def find_demo_dirs(root_search_path):
+    """
+    Recursively finds all valid demonstration directories.
+    """
+    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
+    found_demos = []
+    for dirpath, _, _ in os.walk(root_search_path):
+        if glob.glob(os.path.join(dirpath, 'frame_*')):
+            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
+            found_demos.append(str(relative_path))
+    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
+    return sorted(found_demos)
+
+def find_config_files(root_search_path):
+    """
+    Finds all .yaml configuration files in the specified directory.
+    """
+    logging.info(f"Searching for configuration files in: {root_search_path}...")
+    found_configs = [p.relative_to(paths.WORKSPACE_ROOT) for p in root_search_path.glob("*.yaml")]
+    logging.info(f"Found {len(found_configs)} config files.")
+    return [str(p) for p in found_configs]
 
 def compute_global_depth_range(data_dirs, percentile=99.5):
     """
@@ -269,6 +316,20 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, vision_
     tactile_t = tactile_feats[:-1]
     visual_t = visual_feats[:-1]
 
+    # --- NEW: Define the Goal State ---
+    # The goal is the final state of the trajectory.
+    # We take the last entry from the feature lists before they were sliced.
+    goal_tactile = tactile_feats[-1]
+    goal_visual = visual_feats[-1]
+    goal_joints = actions[-1]
+    
+    # Combine them into a single goal vector
+    goal_state = np.concatenate([goal_tactile, goal_visual, goal_joints])
+    
+    # Repeat the goal state for every timestep in the trajectory
+    num_samples = joints_t.shape[0]
+    goal_t = np.tile(goal_state, (num_samples, 1))
+
     # Action at time t (a_t)
     delta_q = actions[1:] - actions[:-1]
 
@@ -280,6 +341,7 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, vision_
         "tactile_t": tactile_t,
         "visual_t": visual_t,
         "joints_t": joints_t,
+        "goal_t": goal_t,
         "delta_q": delta_q,
     }
 
@@ -455,44 +517,80 @@ def build_dataset(data_dirs, out_file, use_height_map, config):
     logging.info(f"💾 Saved dataset -> {out_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Build a robot learning dataset from raw demonstrations.")
-    # For simplicity, main arguments are here. For a real project, use a YAML config file.
-    parser.add_argument("--data_dirs", nargs="+", required=True, help="List of dataset directories to process.")
-    parser.add_argument("--out_file", type=str, required=True, help="Path to the output .pkl dataset file.")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to a YAML config file.")
-    parser.add_argument("--height_map", action="store_true", help="Use 9DTact height map instead of raw image.")
+    parser = argparse.ArgumentParser(description="Interactively build a robot learning dataset from raw demonstrations.")
+    # The script is now primarily interactive, but we can keep args for advanced use or automation.
+    parser.add_argument("--config", type=str, help="Optional: Directly provide a path to a config file to skip interactive selection.")
     args = parser.parse_args()
-    
-    # In a real pipeline, you would load a config.yaml file here
-    # For now, we'll use a default dictionary
-    config = {
-        "backbone": "resnet18",
-        "visual_dim": 256,
-        "global_depth_range": [154, 2826],
-        # Add other params like frame stacking window K here
-        # --- New settings for controlling vision module ---
-        "vision": {
-            "use_keypoint_extractor": True,  # Set to false to use ResNet18
-            # --- KeypointExtractor settings (ignored if false) ---
-            "yolo_model_path": "./runs/detect/yolov8_custom6/weights/best.pt",
-            "confidence_threshold": 0.005,  # Minimum confidence to accept a detection
-            "use_3d": False,  # Set to true for 3D coordinates
-            
-            # For 3D keypoints, you would provide paths to EACH camera's calibration files
-            "intrinsics_path_cam1": "path/to/intrinsics_cam1.json",
-            "extrinsics_path_cam1": "path/to/T_base_cam1.npy",
-            "intrinsics_path_cam2": "path/to/intrinsics_cam2.json",
-            "extrinsics_path_cam2": "path/to/T_base_cam2.npy"
-        }
-    }
 
-    data_dirs = [Path(d).expanduser().resolve() for d in args.data_dirs]
-    for d in data_dirs:
-        if not d.exists():
-            logging.error(f"Data directory not found: {d}")
-            return
+    try:
+        # --- 1. Interactively Select Demonstration Datasets ---
+        demo_choices = find_demo_dirs(paths.RAW_DATA_DIR)
+        if not demo_choices:
+            logging.error(f"No demonstration directories found in {paths.RAW_DATA_DIR}. Exiting."); return
+
+        questions = [
+            inquirer.Checkbox('selected_demos',
+                              message="Select the demonstration datasets to build from (SPACE to select, ENTER to confirm)",
+                              choices=demo_choices),
+        ]
+        answers = inquirer.prompt(questions)
+        if not answers or not answers['selected_demos']:
+            logging.info("No datasets selected. Exiting."); return
+        selected_relative_paths = answers['selected_demos']
+        data_dirs = [str(paths.WORKSPACE_ROOT / path_str) for path_str in selected_relative_paths]
+
+        # --- 2. Interactively Select Configuration File ---
+        if args.config:
+            config_path_rel = args.config
+            logging.info(f"Using provided config file: {config_path_rel}")
+        else:
+            config_choices = find_config_files(paths.CONFIG_DIR)
+            if not config_choices:
+                logging.error(f"No .yaml config files found in {paths.CONFIG_DIR}. Exiting."); return
             
-    build_dataset(data_dirs, args.out_file, args.height_map, config)
+            config_question = [
+                inquirer.List('config_file',
+                              message="Select the configuration file to use",
+                              choices=config_choices),
+            ]
+            config_answer = inquirer.prompt(config_question)
+            if not config_answer: logging.info("No config selected. Exiting."); return
+            config_path_rel = config_answer['config_file']
+
+        config_path_abs = paths.WORKSPACE_ROOT / config_path_rel
+        with open(config_path_abs, 'r') as f:
+            config = yaml.safe_load(f)
+        logging.info(f"Loaded configuration from {config_path_abs}")
+        
+        # --- 3. Ask for Other Parameters ---
+        other_questions = [
+            inquirer.Text('out_file',
+                          message="Enter the name for the output dataset file",
+                          default="processed_dataset.pkl"),
+            inquirer.Confirm('height_map',
+                             message="Use height map for tactile processing?",
+                             default=True),
+        ]
+        other_answers = inquirer.prompt(other_questions)
+        if not other_answers: logging.info("Cancelled. Exiting."); return
+        
+        # Construct the full output path
+        out_file_path = paths.PROCESSED_DATA_DIR / other_answers['out_file']
+        use_height_map = other_answers['height_map']
+
+    except (KeyboardInterrupt, TypeError):
+        logging.info("\nDataset building cancelled by user.")
+        return
+
+    # Resolve paths within the config to be absolute
+    if config.get("vision", {}).get("use_keypoint_extractor", False):
+        yolo_path_str = config["vision"]["yolo_model_path"]
+        abs_yolo_path = paths.WORKSPACE_ROOT / yolo_path_str
+        if not abs_yolo_path.exists():
+            logging.error(f"YOLO model not found at resolved path: {abs_yolo_path}"); return
+        config["vision"]["yolo_model_path"] = str(abs_yolo_path)
+
+    build_dataset(data_dirs, str(out_file_path), use_height_map, config)
 
 if __name__ == "__main__":
     main()

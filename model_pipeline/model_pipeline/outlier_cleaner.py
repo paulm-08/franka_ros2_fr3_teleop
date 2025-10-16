@@ -4,7 +4,10 @@ import pickle
 import argparse
 import logging
 from pathlib import Path
+import inquirer
+
 from model_pipeline import paths
+
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -84,19 +87,18 @@ def find_and_clean_outliers(input_path, output_path, threshold_action, threshold
     logging.info(f"✅ Successfully saved cleaned dataset to {output_path}")
 
 
+def find_pkl_files(search_path):
+    """Finds all .pkl files in the specified directory."""
+    logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
+    found_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
+    logging.info(f"Found {len(found_files)} files.")
+    return [str(p) for p in found_files]
+
 def main():
-    parser = argparse.ArgumentParser(description="Clean outlier trajectories from a .pkl dataset.")
-    # Use dynamic paths from paths.py as defaults
-    parser.add_argument(
-        "--input_file", type=str, 
-        default=str(paths.PROCESSED_DATA_DIR / "dataset.pkl"),
-        help="Path to the input .pkl dataset file to be cleaned."
-    )
-    parser.add_argument(
-        "--output_file", type=str, 
-        default=str(paths.PROCESSED_DATA_DIR / "dataset_cleaned.pkl"),
-        help="Path to save the new, cleaned .pkl dataset file."
-    )
+    parser = argparse.ArgumentParser(description="Interactively clean outlier trajectories from a .pkl dataset.")
+    # Arguments are now optional, for advanced/scripted use
+    parser.add_argument("--input_file", type=str, help="Optional: Directly provide a path to the input .pkl file.")
+    parser.add_argument("--output_file", type=str, help="Optional: Directly provide a path for the output .pkl file.")
     parser.add_argument(
         "--threshold_action", type=float, default=1.0,
         help="Maximum absolute value allowed for any joint action (delta_q)."
@@ -106,13 +108,53 @@ def main():
         help="Maximum value allowed for any tactile feature."
     )
     args = parser.parse_args()
+    args = parser.parse_args()
 
-    find_and_clean_outliers(
-        input_path=Path(args.input_file),
-        output_path=Path(args.output_file),
-        threshold_action=args.threshold_action,
-        threshold_tactile=args.threshold_tactile
-    )
+    try:
+        if args.input_file:
+            input_path_rel = args.input_file
+        else:
+            # --- Interactive Input File Selection ---
+            pkl_choices = find_pkl_files(paths.PROCESSED_DATA_DIR)
+            if not pkl_choices:
+                logging.error(f"No processed dataset (.pkl) files found in {paths.PROCESSED_DATA_DIR}. Exiting."); return
+
+            questions = [
+                inquirer.List('input_file',
+                              message="Select the dataset (.pkl) to clean",
+                              choices=pkl_choices),
+            ]
+            answers = inquirer.prompt(questions)
+            if not answers: logging.info("No selection made. Exiting."); return
+            input_path_rel = answers['input_file']
+        
+        input_path = paths.WORKSPACE_ROOT / input_path_rel
+
+        # --- Interactive Output File Selection ---
+        if args.output_file:
+            output_path = Path(args.output_file)
+        else:
+            default_output_name = Path(input_path_rel).stem + "_cleaned.pkl"
+            output_question = [
+                inquirer.Text('output_filename',
+                              message="Enter the name for the cleaned output file",
+                              default=default_output_name),
+            ]
+            output_answer = inquirer.prompt(output_question)
+            if not output_answer: logging.info("Cancelled. Exiting."); return
+            output_path = paths.PROCESSED_DATA_DIR / output_answer['output_filename']
+        
+        # --- Run the cleaning process ---
+        find_and_clean_outliers(
+            input_path=input_path,
+            output_path=output_path,
+            threshold_action=args.threshold_action,
+            threshold_tactile=args.threshold_tactile
+        )
+
+    except (KeyboardInterrupt, TypeError):
+        logging.info("\nOperation cancelled by user.")
+        return
 
 if __name__ == "__main__":
     main()

@@ -34,6 +34,7 @@ setup(
             'sampler = model_pipeline.sampler:main',
             'yolo_splitter = model_pipeline.yolo_splitter:main',
             'test_yolo = model_pipeline.test_yolo:main',
+            'outlier_cleaner = model_pipeline.outlier_cleaner:main',
             'paths = model_pipeline.paths:log_all_paths',
         ],
     },

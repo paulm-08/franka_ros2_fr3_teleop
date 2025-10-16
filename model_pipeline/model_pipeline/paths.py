@@ -58,7 +58,7 @@ YOLO_IMAGES_DIR = YOLO_DATA_DIR / "sampled_images"
 # Model Paths
 MODELS_DIR = WORKSPACE_ROOT / "models"
 POLICY_MODELS_DIR = MODELS_DIR / "policy_models"
-YOLO_MODELS_DIR = MODELS_DIR / "yolo_runs"
+YOLO_MODELS_DIR = WORKSPACE_ROOT / "runs"
 
 # --- Helper function to print all paths for debugging ---
 def log_all_paths():

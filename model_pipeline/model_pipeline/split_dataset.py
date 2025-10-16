@@ -5,12 +5,21 @@ import logging
 from pathlib import Path
 import random
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import seaborn as sns
+import inquirer
 
 from model_pipeline import paths # Import the new paths module
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+def find_pkl_files(search_path):
+    """Finds all .pkl files in the specified directory."""
+    logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
+    found_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
+    logging.info(f"Found {len(found_files)} files.")
+    return [str(p) for p in found_files]
 
 # ===================================================================
 # === VISUALIZATION HELPER FUNCTIONS ===
@@ -53,24 +62,28 @@ def plot_tactile_distributions(X_train, X_val, output_dir):
 
 def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, output_dir):
     """
-    Generates detailed plots for a 16D visual feature vector (2 cameras, 2 objects, 4 features each).
-    Feature order: [tube_x, tube_y, tube_conf, tube_flag, peg_x, peg_y, peg_conf, peg_flag] per camera.
+    Generates detailed plots for a 20D visual feature vector (2 cameras, 2 objects, 5 features each).
+    Feature order: [tube_x, tube_y, tube_conf, tube_flag, peg_x, peg_y, peg_conf, peg_flag, rel_x, rel_y] per camera.
     """
-    if visual_dim != 16:
-        logging.warning(f"This visualization expects a 16D visual vector, but found {visual_dim}D. Skipping visual plots.")
+    if visual_dim != 20:
+        logging.warning(f"This visualization expects a 20D visual vector, but found {visual_dim}D. Skipping visual plots.")
         return
 
-    fig = plt.figure(figsize=(20, 24))
-    gs = fig.add_gridspec(6, 2) # Added a row for the new detection rate plot
-    fig.suptitle('Dual-Camera Keypoint Feature Analysis (with Detection Flags)', fontsize=18, y=1.01)
+    fig = plt.figure(figsize=(20, 28))
+    gs = fig.add_gridspec(6, 2)
+    fig.suptitle('Dual-Camera Keypoint Feature Analysis (with Engineered Features)', fontsize=18, y=1.01)
 
-    # --- Feature Indices Setup (for 16D vector) ---
+    # --- Feature Indices Setup (for 20D vector) ---
+    # Camera 1
     c1_tube_x, c1_tube_y, c1_tube_conf, c1_tube_flag = tactile_total_dim, tactile_total_dim + 1, tactile_total_dim + 2, tactile_total_dim + 3
     c1_peg_x,  c1_peg_y,  c1_peg_conf,  c1_peg_flag  = tactile_total_dim + 4, tactile_total_dim + 5, tactile_total_dim + 6, tactile_total_dim + 7
-    c2_tube_x, c2_tube_y, c2_tube_conf, c2_tube_flag = tactile_total_dim + 8, tactile_total_dim + 9, tactile_total_dim + 10, tactile_total_dim + 11
-    c2_peg_x,  c2_peg_y,  c2_peg_conf,  c2_peg_flag  = tactile_total_dim + 12, tactile_total_dim + 13, tactile_total_dim + 14, tactile_total_dim + 15
+    c1_rel_x,  c1_rel_y                             = tactile_total_dim + 8, tactile_total_dim + 9
+    # Camera 2
+    c2_tube_x, c2_tube_y, c2_tube_conf, c2_tube_flag = tactile_total_dim + 10, tactile_total_dim + 11, tactile_total_dim + 12, tactile_total_dim + 13
+    c2_peg_x,  c2_peg_y,  c2_peg_conf,  c2_peg_flag  = tactile_total_dim + 14, tactile_total_dim + 15, tactile_total_dim + 16, tactile_total_dim + 17
+    c2_rel_x,  c2_rel_y                             = tactile_total_dim + 18, tactile_total_dim + 19
 
-    # --- NEW: Plot Row 1: Detection Rate Analysis ---
+    # --- Plot Row 1: Detection Rate Analysis ---
     ax_rate1 = fig.add_subplot(gs[0, 0])
     tube1_rate = np.mean(X_train[:, c1_tube_flag]) * 100
     peg1_rate = np.mean(X_train[:, c1_peg_flag]) * 100
@@ -91,82 +104,95 @@ def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, out
         ax_rate2.text(i, rate + 2, f'{rate:.1f}%', ha='center', fontsize=12)
     ax_rate2.grid(axis='y', linestyle='--')
 
-    # --- Plot Row 2: Coordinate Distributions ---
-    ax1 = fig.add_subplot(gs[1, 0])
-    sns.kdeplot(X_train[:, c1_tube_x], ax=ax1, label='Tube X', fill=True, warn_singular=False)
-    sns.kdeplot(X_train[:, c1_peg_x], ax=ax1, label='Peg X', fill=True, warn_singular=False)
-    ax1.set_title('Camera 1: X-Coordinate Distributions'); ax1.legend(); ax1.grid(True, linestyle='--')
-
-    ax2 = fig.add_subplot(gs[1, 1])
-    sns.kdeplot(X_train[:, c2_tube_x], ax=ax2, label='Tube X', fill=True, warn_singular=False)
-    sns.kdeplot(X_train[:, c2_peg_x], ax=ax2, label='Peg X', fill=True, warn_singular=False)
-    ax2.set_title('Camera 2: X-Coordinate Distributions'); ax2.legend(); ax2.grid(True, linestyle='--')
-
-    # --- Plot Row 3: Confidence Score Distributions (only for detected frames) ---
-    ax_conf1 = fig.add_subplot(gs[2, 0])
+    # --- Plot Row 2: Confidence Score Distributions ---
+    ax_conf1 = fig.add_subplot(gs[1, 0])
     ax_conf1.hist(X_train[X_train[:, c1_tube_flag] > 0, c1_tube_conf], bins=50, density=True, alpha=0.7, label='Tube Confidence')
     ax_conf1.hist(X_train[X_train[:, c1_peg_flag] > 0, c1_peg_conf], bins=50, density=True, alpha=0.7, label='Peg Confidence')
     ax_conf1.set_title('Camera 1: Detection Confidence (where detected)'); ax_conf1.legend(); ax_conf1.grid(True, linestyle='--')
 
-    ax_conf2 = fig.add_subplot(gs[2, 1])
+    ax_conf2 = fig.add_subplot(gs[1, 1])
     ax_conf2.hist(X_train[X_train[:, c2_tube_flag] > 0, c2_tube_conf], bins=50, density=True, alpha=0.7, label='Tube Confidence')
     ax_conf2.hist(X_train[X_train[:, c2_peg_flag] > 0, c2_peg_conf], bins=50, density=True, alpha=0.7, label='Peg Confidence')
     ax_conf2.set_title('Camera 2: Detection Confidence (where detected)'); ax_conf2.legend(); ax_conf2.grid(True, linestyle='--')
-
-   # --- Plot Row 4: Position Coverage (FILTERED) ---
-    ax3 = fig.add_subplot(gs[3, 0])
-    # --- MODIFICATION: Create a boolean mask for detected tube in camera 1 ---
-    mask_train_c1_tube = X_train[:, c1_tube_flag] > 0
-    ax3.scatter(X_train[mask_train_c1_tube, c1_tube_x], X_train[mask_train_c1_tube, c1_tube_y], alpha=0.05)
-    ax3.set_title('Camera 1: Tube Position Coverage (Detected Only)')
-
-    ax4 = fig.add_subplot(gs[3, 1])
-    # --- MODIFICATION: Create a boolean mask for detected peg in camera 1 ---
-    mask_train_c1_peg = X_train[:, c1_peg_flag] > 0
-    ax4.scatter(X_train[mask_train_c1_peg, c1_peg_x], X_train[mask_train_c1_peg, c1_peg_y], alpha=0.05)
-    ax4.set_title('Camera 1: Peg Position Coverage (Detected Only)')
     
-    # --- Plot Row 5: Position Coverage for Camera 2 (FILTERED) ---
-    ax5 = fig.add_subplot(gs[4, 0])
-    # --- MODIFICATION: Create a boolean mask for detected tube in camera 2 ---
-    mask_train_c2_tube = X_train[:, c2_tube_flag] > 0
-    ax5.scatter(X_train[mask_train_c2_tube, c2_tube_x], X_train[mask_train_c2_tube, c2_tube_y], alpha=0.05)
-    ax5.set_title('Camera 2: Tube Position Coverage (Detected Only)')
+    # --- Plot Row 3: COMBINED Position Coverage ---
+    ax_pos1 = fig.add_subplot(gs[2, 0])
+    mask_c1_tube = X_train[:, c1_tube_flag] > 0
+    mask_c1_peg = X_train[:, c1_peg_flag] > 0
+    ax_pos1.scatter(X_train[mask_c1_tube, c1_tube_x], X_train[mask_c1_tube, c1_tube_y], alpha=0.05, color='blue')
+    ax_pos1.scatter(X_train[mask_c1_peg, c1_peg_x], X_train[mask_c1_peg, c1_peg_y], alpha=0.05, color='red')
+    ax_pos1.set_title('Camera 1: Position Coverage (Detected Only)')
+    legend_elements_pos = [Line2D([0], [0], marker='o', color='w', label='Tube Tip', markerfacecolor='blue', markersize=10),
+                           Line2D([0], [0], marker='o', color='w', label='Peg', markerfacecolor='red', markersize=10)]
+    ax_pos1.legend(handles=legend_elements_pos)
 
-    ax6 = fig.add_subplot(gs[4, 1])
-    # --- MODIFICATION: Create a boolean mask for detected peg in camera 2 ---
-    mask_train_c2_peg = X_train[:, c2_peg_flag] > 0
-    ax6.scatter(X_train[mask_train_c2_peg, c2_peg_x], X_train[mask_train_c2_peg, c2_peg_y], alpha=0.05)
-    ax6.set_title('Camera 2: Peg Position Coverage (Detected Only)')
+    ax_pos2 = fig.add_subplot(gs[2, 1])
+    mask_c2_tube = X_train[:, c2_tube_flag] > 0
+    mask_c2_peg = X_train[:, c2_peg_flag] > 0
+    ax_pos2.scatter(X_train[mask_c2_tube, c2_tube_x], X_train[mask_c2_tube, c2_tube_y], alpha=0.05, color='blue')
+    ax_pos2.scatter(X_train[mask_c2_peg, c2_peg_x], X_train[mask_c2_peg, c2_peg_y], alpha=0.05, color='red')
+    ax_pos2.set_title('Camera 2: Position Coverage (Detected Only)')
+    ax_pos2.legend(handles=legend_elements_pos)
 
-    # --- Plot Row 6: Relative Position Distributions (FILTERED) ---
-    ax7 = fig.add_subplot(gs[5, 0])
-    # --- MODIFICATION: Create a mask for frames where BOTH objects are seen in camera 1 ---
+    # --- Plot Row 4: Engineered Relative Position Distributions ---
+    ax_rel_dist1 = fig.add_subplot(gs[3, 0])
     mask_c1_both = (X_train[:, c1_tube_flag] > 0) & (X_train[:, c1_peg_flag] > 0)
-    rel_x1 = X_train[mask_c1_both, c1_tube_x] - X_train[mask_c1_both, c1_peg_x]
-    rel_y1 = X_train[mask_c1_both, c1_tube_y] - X_train[mask_c1_both, c1_peg_y]
-    ax7.hist2d(rel_x1, rel_y1, bins=50, cmap='viridis')
-    ax7.set_title('Camera 1: Relative Position (Where Both Detected)')
-    
-    ax8 = fig.add_subplot(gs[5, 1])
-    # --- MODIFICATION: Create a mask for frames where BOTH objects are seen in camera 2 ---
-    mask_c2_both = (X_train[:, c2_tube_flag] > 0) & (X_train[:, c2_peg_flag] > 0)
-    rel_x2 = X_train[mask_c2_both, c2_tube_x] - X_train[mask_c2_both, c2_peg_x]
-    rel_y2 = X_train[mask_c2_both, c2_tube_y] - X_train[mask_c2_both, c2_peg_y]
-    ax8.hist2d(rel_x2, rel_y2, bins=50, cmap='viridis')
-    ax8.set_title('Camera 2: Relative Position (Where Both Detected)')
+    sns.kdeplot(X_train[mask_c1_both, c1_rel_x], ax=ax_rel_dist1, label='Relative X', fill=True, warn_singular=False)
+    sns.kdeplot(X_train[mask_c1_both, c1_rel_y], ax=ax_rel_dist1, label='Relative Y', fill=True, warn_singular=False)
+    ax_rel_dist1.set_title(f'Camera 1: Engineered Relative Coords ({np.sum(mask_c1_both)} frames)')
+    ax_rel_dist1.legend(); ax_rel_dist1.grid(True, linestyle='--')
 
-    for ax in [ax3, ax4, ax5, ax6, ax7, ax8]:
+    ax_rel_dist2 = fig.add_subplot(gs[3, 1])
+    mask_c2_both = (X_train[:, c2_tube_flag] > 0) & (X_train[:, c2_peg_flag] > 0)
+    sns.kdeplot(X_train[mask_c2_both, c2_rel_x], ax=ax_rel_dist2, label='Relative X', fill=True, warn_singular=False)
+    sns.kdeplot(X_train[mask_c2_both, c2_rel_y], ax=ax_rel_dist2, label='Relative Y', fill=True, warn_singular=False)
+    ax_rel_dist2.set_title(f'Camera 2: Engineered Relative Coords ({np.sum(mask_c2_both)} frames)')
+    ax_rel_dist2.legend(); ax_rel_dist2.grid(True, linestyle='--')
+    
+    # --- Plot Row 5: Calculated Relative Position (for Verification) ---
+    ax_rel_scatter1 = fig.add_subplot(gs[4, 0])
+    rel_x1_calc = X_train[mask_c1_both, c1_tube_x] - X_train[mask_c1_both, c1_peg_x]
+    rel_y1_calc = X_train[mask_c1_both, c1_tube_y] - X_train[mask_c1_both, c1_peg_y]
+    ax_rel_scatter1.scatter(rel_x1_calc, rel_y1_calc, alpha=0.1)
+    ax_rel_scatter1.set_title('Camera 1: Calculated Relative Position')
+
+    ax_rel_scatter2 = fig.add_subplot(gs[4, 1])
+    rel_x2_calc = X_train[mask_c2_both, c2_tube_x] - X_train[mask_c2_both, c2_peg_x]
+    rel_y2_calc = X_train[mask_c2_both, c2_tube_y] - X_train[mask_c2_both, c2_peg_y]
+    ax_rel_scatter2.scatter(rel_x2_calc, rel_y2_calc, alpha=0.1)
+    ax_rel_scatter2.set_title('Camera 2: Calculated Relative Position')
+
+    # --- Plot Row 6: Absolute Coordinate Distributions ---
+    ax_abs_dist1 = fig.add_subplot(gs[5, 0])
+    sns.kdeplot(X_train[mask_c1_tube, c1_tube_x], ax=ax_abs_dist1, label='Tube X', fill=True, warn_singular=False)
+    sns.kdeplot(X_train[mask_c1_tube, c1_tube_y], ax=ax_abs_dist1, label='Tube Y', fill=True, warn_singular=False)
+    ax_abs_dist1.set_title('Camera 1: Absolute Coordinate Distributions'); ax_abs_dist1.legend()
+    
+    ax_abs_dist2 = fig.add_subplot(gs[5, 1])
+    sns.kdeplot(X_train[mask_c2_tube, c2_tube_x], ax=ax_abs_dist2, label='Tube X', fill=True, warn_singular=False)
+    sns.kdeplot(X_train[mask_c2_tube, c2_tube_y], ax=ax_abs_dist2, label='Tube Y', fill=True, warn_singular=False)
+    ax_abs_dist2.set_title('Camera 2: Absolute Coordinate Distributions'); ax_abs_dist2.legend()
+    
+    # --- Styling ---
+    for ax in [ax_pos1, ax_pos2]:
         ax.set_xlabel('X (normalized)'); ax.set_ylabel('Y (normalized)')
         ax.grid(True, linestyle='--'); ax.axis('equal')
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1) # Set limits for normalized coordinates
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+
+    for ax in [ax_rel_scatter1, ax_rel_scatter2]:
+        ax.set_xlabel('Relative X'); ax.set_ylabel('Relative Y')
+        ax.grid(True, linestyle='--'); ax.axis('equal')
+        
+    for ax in [ax_abs_dist1, ax_abs_dist2, ax_rel_dist1, ax_rel_dist2]:
+        ax.grid(True, linestyle='--')
+        ax.set_xlabel('Coordinate Value'); ax.set_ylabel('Density')
 
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     save_path = output_dir / "visual_feature_analysis.png"
     plt.savefig(save_path)
     plt.close(fig)
     logging.info(f"📊 Saved detailed visual plot to {save_path}")
-
+    
 def plot_proprio_action_distributions(X_train, y_train, X_val, y_val, joint_start_idx, output_dir):
     """Generates plots for proprioceptive state and action distributions."""
     joint_indices_to_plot = {
@@ -305,6 +331,8 @@ def visualize_and_split_dataset(input_path, output_path, split_ratio=0.8, seed=4
 
     # --- 4. Generate All Visualizations ---
     plot_dir = Path(output_path).parent if output_path else Path("./data/visualizations")
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Generating visualizations in {plot_dir}...")
     
     if X_val.shape[0] > 0:
         plot_tactile_distributions(X_train, X_val, plot_dir)
@@ -322,21 +350,58 @@ def visualize_and_split_dataset(input_path, output_path, split_ratio=0.8, seed=4
         logging.info(f"✅ Split dataset saved to {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze, visualize, and optionally split a trajectory dataset.")
-    # Use dynamic paths as defaults
-    parser.add_argument("--input_file", type=str, default=str(paths.PROCESSED_DATA_DIR / "dataset.pkl"), help="Path to the input .pkl dataset file.")
-    parser.add_argument("--output_file", type=str, default=str(paths.PROCESSED_DATA_DIR / "dataset_split.npz"), help="Optional: Path to save the final split .npz file.")
-    parser.add_argument("--split_ratio", type=float, default=0.85, help="Fraction of trajectories for training.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling.")
+    parser = argparse.ArgumentParser(description="Interactively analyze, visualize, and split a trajectory dataset.")
+    # The script is now fully interactive, so no arguments are required.
     args = parser.parse_args()
 
+    try:
+        # --- 1. Interactively Select the Input Dataset ---
+        pkl_choices = find_pkl_files(paths.PROCESSED_DATA_DIR)
+        if not pkl_choices:
+            logging.error(f"No processed dataset (.pkl) files found in {paths.PROCESSED_DATA_DIR}. Please run dataset_builder.py first.")
+            return
+
+        questions = [
+            inquirer.List('input_file',
+                          message="Select the processed dataset (.pkl) to analyze and split",
+                          choices=pkl_choices),
+            inquirer.Text('output_filename',
+                          message="Enter the name for the output split file (or leave blank to only visualize)",
+                          default="dataset_split.npz"),
+            inquirer.Text('split_ratio',
+                          message="Enter the training split ratio (e.g., 0.85 for 85%)",
+                          default="0.85"),
+        ]
+        
+        answers = inquirer.prompt(questions)
+        if not answers:
+            logging.info("No selection made. Exiting.")
+            return
+
+        # --- 2. Process User Selections ---
+        input_path = paths.WORKSPACE_ROOT / answers['input_file']
+        split_ratio = float(answers['split_ratio'])
+        
+        output_filename = answers['output_filename']
+        if output_filename and output_filename.strip():
+            output_path = paths.PROCESSED_DATA_DIR / output_filename.strip()
+        else:
+            output_path = None # Visualization-only mode
+
+    except (KeyboardInterrupt, TypeError):
+        logging.info("\nOperation cancelled by user.")
+        return
+    except ValueError:
+        logging.error("Invalid split ratio. Please enter a number between 0 and 1.")
+        return
+
+    # --- 3. Run the Main Logic ---
     visualize_and_split_dataset(
-        input_path=Path(args.input_file),
-        output_path=Path(args.output_file) if args.output_file else None,
-        split_ratio=args.split_ratio,
-        seed=args.seed
+        input_path=input_path,
+        output_path=output_path,
+        split_ratio=split_ratio,
+        seed=42 # Using a fixed seed for consistency
     )
 
 if __name__ == "__main__":
     main()
-
