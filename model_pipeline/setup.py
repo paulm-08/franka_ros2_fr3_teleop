@@ -36,6 +36,9 @@ setup(
             'test_yolo = model_pipeline.test_yolo:main',
             'outlier_cleaner = model_pipeline.outlier_cleaner:main',
             'paths = model_pipeline.paths:log_all_paths',
+            'create_goal_state = model_pipeline.create_goal_state:main',
+            'policy_rollout = model_pipeline.policy_rollout_node:main',
+            'start_task = model_pipeline.start_task:main',
         ],
     },
 )

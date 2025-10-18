@@ -45,7 +45,7 @@ SRC_ROOT = WORKSPACE_ROOT / "src"
 
 # Configuration Path
 CONFIG_DIR = WORKSPACE_ROOT / "config"
-DEFAULT_CONFIG_PATH = CONFIG_DIR / "main_config.yaml"
+DEFAULT_CONFIG_PATH = CONFIG_DIR / "config.yaml"
 
 # Data Paths
 DATA_DIR = WORKSPACE_ROOT / "data"
