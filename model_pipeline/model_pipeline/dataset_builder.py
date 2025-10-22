@@ -47,87 +47,63 @@ class VisionProcessor:
     """A wrapper class to handle different vision modules (ResNet/YOLO) seamlessly."""
     def __init__(self, config, device, data_dirs):
         vision_config = config.get("vision", {})
-        self.is_keypoint_extractor = vision_config.get("use_keypoint_extractor", False)
+        self.is_keypoint_extractor = vision_config.get("use_keypoint_extractor", True)
         
-        if self.is_keypoint_extractor:
-            logging.info("Initializing KeypointExtractor (YOLO) for visual features.")
-            # For keypoints, we need an extractor for each camera if we want to support
-            # per-camera calibration files for 3D in the future.
-            conf_thresh = vision_config.get("confidence_threshold", 0.1)
-            
-            self.extractor1 = KeypointExtractor(
-                model_path=vision_config["yolo_model_path"],
-                use_3d=vision_config.get("use_3d", False),
-                intrinsics_path=vision_config.get("intrinsics_path_cam1"),
-                extrinsics_path=vision_config.get("extrinsics_path_cam1"),
-                confidence_threshold=conf_thresh,
-                device=device
-            )
-            self.extractor2 = KeypointExtractor(
-                model_path=vision_config["yolo_model_path"],
-                use_3d=vision_config.get("use_3d", False),
-                intrinsics_path=vision_config.get("intrinsics_path_cam2"),
-                extrinsics_path=vision_config.get("extrinsics_path_cam2"),
-                confidence_threshold=conf_thresh,
-                device=device
-            )
-            self.single_cam_dim = self.extractor1.output_dim + 2 
-
-        else:
-            logging.info("Initializing VisualEmbedder (ResNet) for visual features.")
-            global_depth_range = config.get("global_depth_range")
-            if not global_depth_range:
-                logging.warning("Global depth range not found in config, computing it now. This can be slow.")
-                global_depth_range = compute_global_depth_range(data_dirs)
-
-            self.embedder = VisualEmbedder(
-                backbone=config.get("backbone", "resnet18"), device=device,
-                out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
-                global_depth_range=global_depth_range
-            )
-            self.single_cam_dim = self.embedder.out_dim['rgb'] + self.embedder.out_dim['depth']
+        # 1. Initialize the KeypointExtractor (for 2D features)
+        self.extractor = KeypointExtractor(
+            model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
+            use_3d=False, # We are explicitly choosing robust 2D
+            confidence_threshold=vision_config.get("confidence_threshold", 0.1),
+            device=device
+        )
+        self.keypoint_dim_per_cam = self.extractor.output_dim + 2 # (8 + 2 = 10)
         
-        # The final visual vector will be the concatenation of both cameras
+        # 2. Initialize the ResNet Embedder (for RGB and Depth context)
+        global_depth_range = config.get("global_depth_range")
+        # ... (load depth range)
+        self.embedder = VisualEmbedder(
+            backbone=config.get("backbone", "resnet18"), device=device,
+            out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
+            global_depth_range=global_depth_range
+        )
+        self.embedder_rgb_dim = self.embedder.out_dim['rgb']
+        self.embedder_depth_dim = self.embedder.out_dim['depth']
+
+        # 3. Define the final, combined feature dimension
+        self.single_cam_dim = self.keypoint_dim_per_cam + self.embedder_rgb_dim + self.embedder_depth_dim
         self.output_dim = self.single_cam_dim * 2
+        
         logging.info(f"Vision module initialized. Single-camera dim: {self.single_cam_dim}, Total visual dim: {self.output_dim}")
-
+    
     def process_cameras(self, color1, depth1, color2, depth2):
-        if self.is_keypoint_extractor:
-            # --- MODIFICATION: Extract features AND engineer new ones ---
-            def get_engineered_features(extractor, color, depth):
-                # This returns the raw [tube_x, tube_y, tube_conf, tube_flag, peg_x, ...] vector
-                raw_kps = extractor.extract_scene_features(color, depth)
-                if raw_kps is None: return None
+        
+        def get_all_features(color_img, depth_img):
+            if color_img is None or depth_img is None:
+                return np.zeros(self.single_cam_dim, dtype=np.float32)
 
-                # Extract individual keypoints
-                tube_kp = raw_kps[0:4] # x, y, conf, flag
-                peg_kp = raw_kps[4:8]
-
-                # ENGINEER THE NEW FEATURE: The relative vector
-                # Only calculate if both objects were detected
-                if tube_kp[3] > 0 and peg_kp[3] > 0:
-                    relative_vec = tube_kp[0:2] - peg_kp[0:2] # [dx, dy]
-                else:
-                    relative_vec = np.zeros(2, dtype=np.float32)
-                
-                # The new feature vector is the raw keypoints + the engineered relative vector
-                return np.concatenate([raw_kps, relative_vec])
-
-            feats1 = get_engineered_features(self.extractor1, color1, depth1)
-            feats2 = get_engineered_features(self.extractor2, color2, depth2)
+            # 1. Get Keypoints (Raw)
+            raw_kps = self.extractor.extract_scene_features(color_img, depth_img) # (8D)
             
-        else: # ResNet Embedder
-            def extract(c_img, d_img):
-                if c_img is None: return None
-                rgb = self.embedder.embed_rgb(c_img)
-                depth = self.embedder.embed_depth(d_img)
-                if rgb is None or depth is None: return None
-                return np.concatenate([rgb, depth])
-            feats1 = extract(color1, depth1)
-            feats2 = extract(color2, depth2)
+            # 2. Engineer Relative Feature
+            tube_kp, peg_kp = raw_kps[:4], raw_kps[4:8]
+            if tube_kp[3] > 0 and peg_kp[3] > 0:
+                rel_vec = tube_kp[0:2] - peg_kp[0:2]
+            else:
+                rel_vec = np.zeros(2, dtype=np.float32)
+            keypoint_features = np.concatenate([raw_kps, rel_vec]) # (10D)
+            
+            # 3. Get Dense Embeddings
+            rgb_embedding = self.embedder.embed_rgb(color_img)      # (256D)
+            depth_embedding = self.embedder.embed_depth(depth_img)  # (128D)
+            
+            # 4. Concatenate Everything
+            return np.concatenate([keypoint_features, rgb_embedding, depth_embedding])
+
+        feats1 = get_all_features(color1, depth1)
+        feats2 = get_all_features(color2, depth2)
         
         return {'cam1': feats1, 'cam2': feats2}
-
+    
 def find_demo_dirs(root_search_path):
     """
     Recursively finds all valid demonstration directories.

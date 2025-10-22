@@ -13,6 +13,7 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.executors import MultiThreadedExecutor
 import asyncio
 import threading
+from std_msgs.msg import Float64MultiArray
 
 # ROS 2 message types
 from sensor_msgs.msg import JointState
@@ -23,6 +24,7 @@ from builtin_interfaces.msg import Duration
 import pyrealsense2 as rs
 from tact9d.shape_reconstruction import Sensor
 from leap_hand.srv import LeapPosition, LeapPosVelEff
+import dex_retargeting.leap_hand_utils.leap_hand_utils as lhu
 
 # Your ML Pipeline Imports
 from model_pipeline.train import build_model, MLPPolicy
@@ -71,11 +73,26 @@ class PolicyRolloutNode(Node):
         self.is_arm_only = checkpoint.get("arm_only", False)
         self.num_arm_joints = checkpoint.get("num_arm_joints", 7)
         model_type = checkpoint["model_type"]
-        
+
+        # --- THE CRITICAL FIX: Read hyperparameters from the checkpoint ---
+        model_hyperparams = checkpoint.get("model_hyperparams", {})
+        logging.info(f"Loaded model hyperparameters: {model_hyperparams}")
+        logging.info(f"Model was trained with K={self.frame_stack_k}, type='{model_type}'. Evaluating accordingly.")
+        if self.is_arm_only:
+            logging.info(f"Evaluating an ARM-ONLY model with {self.num_arm_joints} joints.")
+
         inferred_width = checkpoint['state_dict']['net.0.bias'].shape[0] if model_type == 'mlp' else None
-        self.model = build_model(model_type, checkpoint["input_dim"], checkpoint["output_dim"], width=inferred_width).to(self.device).eval()
+        self.model = build_model(
+            model_type, 
+            checkpoint["input_dim"], 
+            checkpoint["output_dim"],
+            # Pass all saved hyperparameters. The build_model function
+            # will only use the ones it needs (e.g., 'width' for MLP).
+            **model_hyperparams 
+        ).to(self.device)
         self.model.load_state_dict(checkpoint["state_dict"])
-        
+        self.model.eval()
+
         self.X_mean = torch.tensor(checkpoint["X_mean"], device=self.device)
         self.X_std = torch.tensor(checkpoint["X_std"], device=self.device)
         self.y_mean = torch.tensor(checkpoint["y_mean"], device=self.device)
@@ -94,10 +111,12 @@ class PolicyRolloutNode(Node):
         
         # --- ROS 2 Interfaces ---
         self.joint_state_sub = self.create_subscription(JointState, '/franka/joint_states', self.joint_state_callback, 10)
-        self.command_pub = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
+        self.arm_command_pub = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
         
         # --- LEAP Hand Service Client ---
         self.leap_position_client = self.create_client(LeapPosition, '/leap_position')
+        self.hand_command_pub = self.create_publisher(Float64MultiArray, '/leap_hand/target_allegro_pose', 10)
+
         # # Wait for the service to be available
         # while not self.leap_position_client.wait_for_service(timeout_sec=5.0):
         #     self.get_logger().info('Waiting for /leap_position service...')
@@ -106,13 +125,45 @@ class PolicyRolloutNode(Node):
         self.current_joint_states = None
         self.current_arm_states = None
         self.full_joint_names = None
-        self.joint_names = [] 
         self.history_buffer = []
-        self.last_known_positions = {'camera1': np.full(self.vision_processor.feature_dim_per_object, -1.0, dtype=np.float32),
-                                     'camera2': np.full(self.vision_processor.feature_dim_per_object, -1.0, dtype=np.float32)}
+        self.last_known_positions = {'cam1': np.full(self.vision_processor.feature_dim_per_object, -1.0, dtype=np.float32),
+                                     'cam2': np.full(self.vision_processor.feature_dim_per_object, -1.0, dtype=np.float32)}
 
         self.control_rate = self.get_parameter('control_rate_hz').get_parameter_value().double_value
         self.sample_period = 1.0 / self.control_rate
+
+        logging.info("Commanding a slow, interpolated grasp...")
+        with open(paths.DEFAULT_CONFIG_PATH, 'r') as f:
+            config = yaml.safe_load(f).get('robot_setup', {})
+        start_pose_arm = config.get('start_pose_arm')
+        hand_grasp_pose = config.get('hand_grasp_pose')
+
+        open_hand_pose = lhu.allegro_to_LEAPhand([0.0]*16, zeros=False)
+        # Define grasp parameters
+        grasp_duration = 2.0  # Total time for the grasp in seconds
+        num_steps = 100        # Number of intermediate steps
+        hand_grasp_pose = np.array(hand_grasp_pose)
+
+        # Loop to send intermediate poses
+        for i in range(num_steps + 1):
+            # Calculate the interpolation factor (alpha) from 0.0 to 1.0
+            alpha = i / num_steps
+            
+            # Linearly interpolate between the open and closed poses
+            intermediate_pose = (1 - alpha) * open_hand_pose + alpha * hand_grasp_pose
+            
+            # Send the command (convert back to list for the function)
+            msg = Float64MultiArray()
+            msg.data = [float(p) for p in intermediate_pose.tolist()]
+            self.hand_command_pub.publish(msg)
+            self.get_logger().info("Hand command sent.")
+
+            # Wait for a short duration before the next step
+            time.sleep(grasp_duration / num_steps)
+        
+        logging.info("Grasp complete.")
+        time.sleep(1) # A final short pause after grasping
+        
         self.get_logger().info(f"✅ Policy rollout node initialized. Running at {self.control_rate} Hz.")
 
     def initialize_vision_processor(self):
@@ -298,11 +349,31 @@ class PolicyRolloutNode(Node):
                 )[0] for name in SENSOR_ORDER
             ])            
 
-            # Process each camera's data stream
-            cam1_feats = self.vision_processor.extract_scene_features(obs['color1'], obs['depth1'])
-            cam2_feats = self.vision_processor.extract_scene_features(obs['color2'], obs['depth2'])
+            # --- Process each camera's data stream ---
+            raw_cam1_feats = self.vision_processor.extract_scene_features(obs['color1'], obs['depth1'])
+            raw_cam2_feats = self.vision_processor.extract_scene_features(obs['color2'], obs['depth2'])
             
-            raw_features_per_cam = {'cam1': cam1_feats, 'cam2': cam2_feats}
+            # --- THE CRITICAL FIX: Replicate the Feature Engineering ---
+            def get_engineered_features(raw_kps):
+                # This function MUST be identical to the one in dataset_builder
+                if raw_kps is None or np.all(raw_kps == 0):
+                    # If detection fails, return a zero vector of the correct final size (10)
+                    return np.zeros(self.vision_processor.output_dim + 2, dtype=np.float32)
+
+                tube_kp = raw_kps[0:4] # u, v, conf, flag
+                peg_kp = raw_kps[4:8]
+
+                if tube_kp[3] > 0 and peg_kp[3] > 0: # If both detected
+                    relative_vec = tube_kp[0:2] - peg_kp[0:2] # [du, dv]
+                else:
+                    relative_vec = np.zeros(2, dtype=np.float32)
+                
+                return np.concatenate([raw_kps, relative_vec])
+
+            cam1_feats_engineered = get_engineered_features(raw_cam1_feats)
+            cam2_feats_engineered = get_engineered_features(raw_cam2_feats)
+            
+            raw_features_per_cam = {'cam1': cam1_feats_engineered, 'cam2': cam2_feats_engineered}
 
             # Handle "Carry Forward" logic if using KeypointExtractor
             if self.vision_processor.is_keypoint_extractor:
@@ -318,23 +389,34 @@ class PolicyRolloutNode(Node):
             f2 = raw_features_per_cam.get('cam2', np.zeros(self.vision_processor.output_dim, dtype=np.float32))
             visual_features = np.concatenate([f1, f2])
 
-            proprio_data = self.current_joint_states[:self.num_arm_joints] if self.is_arm_only else self.current_joint_states            
+            # proprio_data = self.current_joint_states[:self.num_arm_joints] if self.is_arm_only else self.current_joint_states 
+            proprio_data = self.current_joint_states           
             current_state_np = np.concatenate([tactile_feats, visual_features, proprio_data])
 
             # --- DIAGNOSTIC PRINTS ---
             self.get_logger().info(f"--- Shape Analysis ---")
             self.get_logger().info(f"Tactile Features Shape: {tactile_feats.shape}")
-            self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
-            self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
-            
-            # This is the vector being created live
-            current_state_np = np.concatenate([tactile_feats, visual_features, proprio_data])
-            self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
+            tactile_log_msg = "Tactile Contact: "
+            for i, name in enumerate(SENSOR_ORDER):
+                flag = tactile_feats[i * 8 + 7]  # Correctly checks the flag at the end of each sensor's 8 features
+                tactile_log_msg += f"✅ {name.upper()} | " if flag > 0 else f"❌ {name.upper()} | "
+            self.get_logger().info(tactile_log_msg)
 
-            # The goal state's shape reflects the TRAINING data format
+            self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
+            visual_log_msg = "Visual Detections: "
+            # 'raw_features_per_cam' now contains the engineered 10-element vectors
+            for cam_id, feats in raw_features_per_cam.items():
+                if feats is None: continue
+                # --- THE CRITICAL FIX: Use the correct indices for the flags ---
+                tube_flag = feats[3]
+                peg_flag = feats[7]
+                visual_log_msg += f"{cam_id} [Tube: {'✅' if tube_flag > 0 else '❌'}, Peg: {'✅' if peg_flag > 0 else '❌'}] | "
+            self.get_logger().info(visual_log_msg)
+
+            self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
+            self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
             self.get_logger().info(f"Goal State Vector Shape:    {self.goal_state.shape}")
             self.get_logger().info(f"------------------------")
-            
             full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
             
             # 3. HANDLE HISTORY (Frame Stacking)
@@ -361,23 +443,37 @@ class PolicyRolloutNode(Node):
                 delta_q_pred = (action_norm * self.y_std) + self.y_mean
 
             # 5. PUBLISH COMMAND
+            current_q_torch = torch.from_numpy(self.current_joint_states).to(self.device)
+            
             if self.is_arm_only:
-                num_hand_joints = 23 - self.num_arm_joints
-                hand_zeros = torch.zeros(num_hand_joints, device=self.device)
+                hand_zeros = torch.zeros(16, device=self.device)
                 full_delta_q = torch.cat([delta_q_pred, hand_zeros])
             else:
                 full_delta_q = delta_q_pred
                 
-            current_q_torch = torch.from_numpy(self.current_joint_states).to(self.device)
             target_q = current_q_torch + full_delta_q
 
+            # --- Split the command for each controller ---
+            target_q_arm = target_q[:self.num_arm_joints]
+            target_q_hand_allegro = target_q[self.num_arm_joints:]
+
+            # --- Publish Arm Command ---
             traj_msg = JointTrajectory()
-            traj_msg.joint_names = self.joint_names
+            traj_msg.joint_names = self.full_joint_names[:self.num_arm_joints]
             point = JointTrajectoryPoint()
-            point.positions = target_q.cpu().tolist()
-            point.time_from_start = Duration(sec=0, nanosec=int(1e9 / self.get_parameter('control_rate_hz').get_parameter_value().double_value))
+            point.positions = target_q_arm.cpu().tolist()
+            point.time_from_start = Duration(sec=0, nanosec=int(1e9 / self.control_rate))
             traj_msg.points.append(point)
-            self.command_pub.publish(traj_msg)
+            self.arm_command_pub.publish(traj_msg)
+
+            # --- Publish Hand Command (only if not in arm_only mode) ---
+            if not self.is_arm_only:
+                hand_msg = Float64MultiArray()
+                hand_msg.data = target_q_hand_allegro.cpu().tolist()
+                self.hand_command_pub.publish(hand_msg)
+                self.get_logger().info("Published arm and hand commands.")
+            else:
+                self.get_logger().info("Published arm command (arm_only mode).")
 
             time_end = time.perf_counter()
             time_sleep = max(0, self.sample_period - (time_end - time_start))

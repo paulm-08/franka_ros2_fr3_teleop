@@ -19,30 +19,44 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 # === MODEL DEFINITIONS ===
 # ===================================================================
 class MLPPolicy(nn.Module):
-    def __init__(self, input_dim, output_dim, width=512):
+    """A dynamically generated MLP with a configurable number of layers and width."""
+    def __init__(self, input_dim, output_dim, width=512, num_layers=2, dropout_p=0.4):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, width),
-            nn.ReLU(),
-            nn.Dropout(p=0.4), # Increased dropout
-            nn.Linear(width, width // 2),
-            nn.ReLU(),
-            nn.Dropout(p=0.4), # Increased dropout
-            nn.Linear(width // 2, output_dim)
-        )
+        
+        layers = []
+        # --- Input Layer ---
+        layers.append(nn.Linear(input_dim, width))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(p=dropout_p))
+        
+        # --- Hidden Layers ---
+        # This loop creates the tapering structure
+        current_width = width
+        for _ in range(num_layers - 1):
+            next_width = current_width // 2
+            layers.append(nn.Linear(current_width, next_width))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(p=dropout_p))
+            current_width = next_width
+            
+        # --- Output Layer ---
+        layers.append(nn.Linear(current_width, output_dim))
+        
+        self.net = nn.Sequential(*layers)
+
     def forward(self, x):
         return self.net(x)
 
 class LSTMPolicy(nn.Module):
+    """A more robust LSTM Policy for sequence data."""
     def __init__(self, input_dim, output_dim, hidden_dim=256, num_layers=2):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2 if num_layers > 1 else 0)
-        self.dropout1 = nn.Dropout(p=0.5) # Aggressive dropout after LSTM
+        self.dropout1 = nn.Dropout(p=0.5)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.relu = nn.ReLU()
-        self.dropout2 = nn.Dropout(p=0.5) # Aggressive dropout after activation
+        self.dropout2 = nn.Dropout(p=0.5)
         self.fc2 = nn.Linear(hidden_dim // 2, output_dim)
-
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
         last_timestep_out = lstm_out[:, -1, :]
@@ -65,19 +79,25 @@ class GRUPolicy(nn.Module):
         return self.fc2(x)
     
 class TransformerPolicy(nn.Module):
-    def __init__(self, input_dim, output_dim, num_heads=4, hidden_dim=128, num_layers=2):
+    def __init__(self, input_dim, output_dim, num_heads=4, hidden_dim=256, num_layers=2):
         super().__init__()
+        # PyTorch's Transformer modules require d_model to be divisible by nhead
+        if input_dim % num_heads != 0:
+            raise ValueError(f"input_dim ({input_dim}) must be divisible by num_heads ({num_heads}).")
+            
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim, batch_first=True
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim, batch_first=True, dropout=0.1
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
-        if x.ndim == 2:
-            x = x.unsqueeze(1)
-        out = self.encoder(x)
-        return self.fc(out[:, -1, :])
+        # x is expected to be (Batch, SequenceLength, FeatureDim)
+        # For Transformer, we often use a special [CLS] token, but for simple BC,
+        # taking the output of the last token is a strong baseline.
+        transformer_out = self.transformer_encoder(x)
+        last_timestep_out = transformer_out[:, -1, :]
+        return self.fc(last_timestep_out)
 
 # ===================================================================
 # === DATASET CLASS ===
@@ -110,6 +130,10 @@ class TrajectoryFrameStackDataset(Dataset):
             self.X_mean = X_unstacked.mean(axis=0); self.X_std = X_unstacked.std(axis=0)
             self.y_mean = y_unstacked.mean(axis=0); self.y_std = y_unstacked.std(axis=0)
             self.X_std[self.X_std < 1e-9] = 1.0; self.y_std[self.y_std < 1e-9] = 1.0
+        
+        self.current_state_dim = trajectories[0]['tactile_t'].shape[1] + \
+                                 trajectories[0]['visual_t'].shape[1] + \
+                                 trajectories[0]['joints_t'].shape[1]
 
     def __len__(self):
         return len(self.indices)
@@ -120,26 +144,36 @@ class TrajectoryFrameStackDataset(Dataset):
         
         start_idx, end_idx = frame_idx - self.k + 1, frame_idx + 1
         
-        state_sequence = np.concatenate([
+        # --- 1. Build the full state sequence (current + goal) ---
+        full_state_sequence = np.concatenate([
             traj['tactile_t'][start_idx:end_idx],
             traj['visual_t'][start_idx:end_idx],
             traj['joints_t'][start_idx:end_idx],
             traj['goal_t'][start_idx:end_idx]
         ], axis=1)
         
-        state_norm = (state_sequence - self.X_mean) / self.X_std
+        # --- 2. Normalize the entire sequence ---
+        full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
         
-        # --- NEW: Add noise ONLY during training ---
+        # --- 3. Split state and goal BEFORE adding noise ---
+        current_state_norm = full_state_norm[:, :self.current_state_dim]
+        goal_state_norm = full_state_norm[:, self.current_state_dim:]
+        
+        # --- 4. Add noise ONLY to the current state during training ---
         if self.is_train and self.noise_std > 0:
-            noise = np.random.normal(0, self.noise_std, state_norm.shape)
-            state_norm += noise
-            
+            noise = np.random.normal(0, self.noise_std, current_state_norm.shape).astype(np.float32)
+            current_state_norm += noise
+        
+        # --- 5. Recombine the (potentially noisy) state with the CLEAN goal ---
+        final_state_norm = np.concatenate([current_state_norm, goal_state_norm], axis=1)
+        
         action = traj['delta_q'][frame_idx]
         action_norm = (action - self.y_mean) / self.y_std
         
-        state_output = state_norm.flatten() if self.flatten else state_norm
+        state_output = final_state_norm.flatten() if self.flatten else final_state_norm
             
         return torch.from_numpy(state_output).float(), torch.from_numpy(action_norm).float()
+    
 # ===================================================================
 # === UTILITY FUNCTIONS ===
 # ===================================================================
@@ -151,9 +185,16 @@ def build_model(model_type, input_dim, output_dim, **kwargs):
     if model_type == "mlp":
         return MLPPolicy(input_dim, output_dim, width=kwargs.get("width", 256))
     elif model_type == "lstm":
-        return LSTMPolicy(input_dim, output_dim)
+        return LSTMPolicy(input_dim, output_dim, hidden_dim=kwargs.get("hidden_dim", 256), num_layers=kwargs.get("num_layers", 2))
     elif model_type == "gru":
-        return GRUPolicy(input_dim, output_dim)
+        return GRUPolicy(input_dim, output_dim, hidden_dim=kwargs.get("hidden_dim", 256), num_layers=kwargs.get("num_layers", 2))
+    elif model_type == "transformer":
+        return TransformerPolicy(
+            input_dim, output_dim,
+            num_heads=kwargs.get("num_heads", 4),
+            hidden_dim=kwargs.get("hidden_dim", 256),
+            num_layers=kwargs.get("num_layers", 2)
+        )
     else:
         raise ValueError(f"Unknown model_type '{model_type}'")
 
@@ -169,48 +210,92 @@ def find_pkl_files(search_path):
 # ===================================================================
 def main():
     parser = argparse.ArgumentParser(description="Interactively train a policy model.")
+    # All arguments are now optional and have defaults. They can override interactive selections.
     parser.add_argument("--dataset_pkl", type=str, help="Path to the .pkl dataset file.")
-    # FIX: Add the missing output_dir argument with a dynamic default
-    parser.add_argument("--output_dir", type=str, default=str(paths.POLICY_MODELS_DIR), help="Directory to save models and logs.")
-    parser.add_argument("--model_type", type=str, choices=["mlp", "lstm", "gru"], help="Model architecture.")
+    parser.add_argument("--output_dir", type=str, default=str(paths.POLICY_MODELS_DIR), help="Directory to save models.")
+    parser.add_argument("--model_type", type=str, choices=["mlp", "lstm", "gru", "transformer"], help="Model architecture.")
     parser.add_argument("--frame_stack", type=int, help="Number of frames to stack (K).")
-    parser.add_argument("--width", type=int, help="Width of hidden layers for MLP.")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--split_ratio", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--arm_only", action="store_true", help="If set, trains a policy for the arm joints only.")
-    parser.add_argument("--num_arm_joints", type=int, default=7, help="The number of joints belonging to the arm.")
+    parser.add_argument("--arm_only", action=argparse.BooleanOptionalAction, help="Train a policy for arm joints only.")
+    parser.add_argument("--num_arm_joints", type=int, default=7)
+    
+    # Model-specific hyperparameters
+    parser.add_argument("--width", type=int, help="Width of hidden layers for MLP.")
+    parser.add_argument("--hidden_dim", type=int, help="Hidden dimension for LSTM/GRU/Transformer.")
+    parser.add_argument("--num_layers", type=int, help="Number of layers for LSTM/GRU/Transformer.")
+    parser.add_argument("--num_heads", type=int, help="Number of attention heads for Transformer.")
+
     args = parser.parse_args()
 
     try:
-        # --- 1. Interactively build up the configuration ---
         answers = {}
-        if not args.dataset_pkl:
+        # --- Step 1: General Configuration ---
+        base_questions = []
+        if args.dataset_pkl is None:
             pkl_choices = find_pkl_files(paths.PROCESSED_DATA_DIR)
             if not pkl_choices: logging.error(f"No .pkl files found in {paths.PROCESSED_DATA_DIR}."); return
-            answers.update(inquirer.prompt([inquirer.List('dataset_pkl', message="Select the dataset to train on", choices=pkl_choices)]) or {})
+            base_questions.append(inquirer.List('dataset_pkl', message="Select the dataset to train on", choices=pkl_choices))
+        if args.arm_only is None:
+            base_questions.append(inquirer.Confirm('arm_only', message="Train in ARM-ONLY mode?", default=False))
+        if base_questions:
+            answers.update(inquirer.prompt(base_questions) or {})
         
-        if not args.model_type:
-            model_questions = [
-                inquirer.List('model_type', message="Select model architecture", choices=['mlp', 'lstm', 'gru'], default='mlp'),
-                inquirer.Text('frame_stack', message="Enter frame stack size (K)", default='1'),
-                inquirer.Text('width', message="Enter MLP width", default='512', ignore=lambda x: x['model_type'] != 'mlp'),
-            ]
-            answers.update(inquirer.prompt(model_questions) or {})
+        # --- Step 2: Model Selection ---
+        if args.model_type is None:
+            model_question = [inquirer.List('model_type', message="Select model architecture", choices=['mlp', 'lstm', 'gru', 'transformer'], default='mlp')]
+            answers.update(inquirer.prompt(model_question) or {})
 
-        # --- 2. Combine args and answers, with args taking precedence ---
+        # Use the answer from the prompt if the arg wasn't provided
+        model_type = args.model_type or answers.get('model_type')
+
+        # --- Step 3: Model-Specific Hyperparameters ---
+        model_specific_questions = []
+        if model_type == 'mlp' and args.width is None:
+            model_specific_questions.append(inquirer.Text('width', message="Enter MLP width", default='512'))
+            model_specific_questions.append(inquirer.Text('num_layers', message="Enter MLP number of layers", default='2'))
+
+        if model_type in ['lstm', 'gru'] and args.hidden_dim is None:
+            model_specific_questions.append(inquirer.Text('hidden_dim', message=f"Enter {model_type.upper()} hidden dimension", default='256'))
+            model_specific_questions.append(inquirer.Text('num_layers', message=f"Enter {model_type.upper()} number of layers", default='2'))
+
+        if model_type == 'transformer' and args.hidden_dim is None:
+            model_specific_questions.append(inquirer.Text('hidden_dim', message="Enter Transformer hidden (feedforward) dimension", default='256'))
+            model_specific_questions.append(inquirer.Text('num_layers', message="Enter Transformer number of encoder layers", default='2'))
+            model_specific_questions.append(inquirer.Text('num_heads', message="Enter Transformer number of attention heads", default='4'))
+        
+        if model_specific_questions:
+            answers.update(inquirer.prompt(model_specific_questions) or {})
+        
+        # --- Step 4: Final Training Parameters ---
+        final_questions = []
+        if args.frame_stack is None:
+            default_k = '10' if model_type != 'mlp' else '3'
+            final_questions.append(inquirer.Text('frame_stack', message="Enter frame stack size (K)", default=default_k))
+        if args.lr == 1e-4: # If it's the default, ask
+             final_questions.append(inquirer.Text('lr', message="Enter learning rate", default='1e-4'))
+        if args.batch_size == 64:
+             final_questions.append(inquirer.Text('batch_size', message="Enter batch size", default='64'))
+        
+        if final_questions:
+             answers.update(inquirer.prompt(final_questions) or {})
+
+        # --- Combine args and answers ---
         final_args = argparse.Namespace(**vars(args))
         for key, value in answers.items():
             if getattr(final_args, key) is None:
-                try: value = int(value)
+                try: # Try to convert to float/int first
+                    if '.' in str(value): value = float(value)
+                    else: value = int(value)
                 except (ValueError, TypeError): pass
                 setattr(final_args, key, value)
         
-        if not final_args.dataset_pkl:
-            logging.info("No dataset selected. Exiting."); return
+        if not final_args.dataset_pkl: logging.info("No dataset selected. Exiting."); return
+        logging.info(f"Final training configuration: {final_args}")
 
         # --- 3. Run the Training Logic ---
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -231,20 +316,21 @@ def main():
         logging.info(f"Loaded {len(all_trajectories)} trajectories: {len(train_trajectories)} train, {len(val_trajectories)} val.")
 
         if final_args.arm_only:
-            logging.info(f"ARM-ONLY mode enabled. Using the first {final_args.num_arm_joints} joints.")
+            logging.info(f"ARM-ONLY mode enabled. Slicing ACTIONS to the first {final_args.num_arm_joints} joints.")
             n = final_args.num_arm_joints
             
-            # Slice the joint and action data in each trajectory dictionary
-            for traj in all_trajectories: # Apply to all before splitting for consistency
-                traj['joints_t'] = traj['joints_t'][:, :n]
+            for traj in all_trajectories:
+                # We ONLY slice the action vector (the output of the policy).
                 traj['delta_q'] = traj['delta_q'][:, :n]
-                # Also slice the goal state's joint component if using GCBC
-                if 'goal_t' in traj:
-                    goal_joints = traj['goal_t'][:, -23:-23+n] # Assuming goal joints are the last 23 features
-                    other_goal_features = traj['goal_t'][:, :-23]
-                    traj['goal_t'] = np.concatenate([other_goal_features, goal_joints], axis=1)
 
-        is_sequence_model = final_args.model_type in ["lstm", "gru"]
+                # We DO NOT slice 'joints_t' or 'goal_t'.
+                # The policy's input (the state) should contain the full 23 joints.
+
+        logging.info("Preparing datasets and dataloaders...")
+        logging.info(f"Train dataset delta_q shape example: {train_trajectories[0]['delta_q'].shape}")
+        logging.info(f"Val dataset delta_q shape example: {val_trajectories[0]['delta_q'].shape}")
+
+        is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
         train_dataset = TrajectoryFrameStackDataset(
             train_trajectories, 
             final_args.frame_stack, 
@@ -271,8 +357,15 @@ def main():
         output_dim = train_dataset.y_mean.shape[0]
         input_dim = single_frame_dim * final_args.frame_stack if not is_sequence_model else single_frame_dim
 
-        model = build_model(final_args.model_type, input_dim, output_dim, width=final_args.width).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=final_args.lr, weight_decay=1e-4)
+        # --- Build Model ---
+        model = build_model(
+            final_args.model_type, input_dim, output_dim, 
+            width=final_args.width,
+            num_heads=final_args.num_heads,
+            hidden_dim=final_args.hidden_dim,
+            num_layers=final_args.num_layers
+        ).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=final_args.lr, weight_decay=1e-3)
         loss_fn = nn.MSELoss()
 
         logging.info(f"Training with Frame Stacking (K={final_args.frame_stack}) for '{final_args.model_type.upper()}' model.")
@@ -310,10 +403,19 @@ def main():
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
+
+                model_hyperparams = {
+                    "width": final_args.width,
+                    "hidden_dim": final_args.hidden_dim,
+                    "num_layers": final_args.num_layers,
+                    "num_heads": final_args.num_heads
+                }
+
                 torch.save({
                     "state_dict": model.state_dict(),
                     "model_type": final_args.model_type,
                     "input_dim": input_dim, "output_dim": output_dim,
+                    "model_hyperparams": model_hyperparams,
                     "X_mean": train_dataset.X_mean, "X_std": train_dataset.X_std,
                     "y_mean": train_dataset.y_mean, "y_std": train_dataset.y_std,
                     "frame_stack": final_args.frame_stack,

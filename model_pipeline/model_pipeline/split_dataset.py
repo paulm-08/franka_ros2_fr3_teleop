@@ -62,26 +62,41 @@ def plot_tactile_distributions(X_train, X_val, output_dir):
 
 def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, output_dir):
     """
-    Generates detailed plots for a 20D visual feature vector (2 cameras, 2 objects, 5 features each).
-    Feature order: [tube_x, tube_y, tube_conf, tube_flag, peg_x, peg_y, peg_conf, peg_flag, rel_x, rel_y] per camera.
+    Generates detailed plots for the 788D "kitchen sink" visual feature vector.
+    Structure per camera: [Keypoints(10D), RGB_Emb(256D), Depth_Emb(128D)]
     """
-    if visual_dim != 20:
-        logging.warning(f"This visualization expects a 20D visual vector, but found {visual_dim}D. Skipping visual plots.")
+    # --- Define the dimensions of each sub-feature ---
+    kp_dim = 10  # (x, y, conf, flag) * 2 + (rel_x, rel_y)
+    rgb_dim = 256
+    depth_dim = 128
+    
+    single_cam_dim = kp_dim + rgb_dim + depth_dim
+    expected_visual_dim = single_cam_dim * 2 # 394 * 2 = 788
+
+    if visual_dim != expected_visual_dim:
+        logging.warning(f"This visualization expects a {expected_visual_dim}D visual vector, but found {visual_dim}D. Skipping visual plots.")
         return
 
-    fig = plt.figure(figsize=(20, 28))
-    gs = fig.add_gridspec(6, 2)
-    fig.suptitle('Dual-Camera Keypoint Feature Analysis (with Engineered Features)', fontsize=18, y=1.01)
+    fig = plt.figure(figsize=(20, 30))
+    gs = fig.add_gridspec(7, 2) # Now 7 rows
+    fig.suptitle('Hybrid Visual Feature Analysis (Keypoints + Embeddings)', fontsize=18, y=1.01)
 
-    # --- Feature Indices Setup (for 20D vector) ---
-    # Camera 1
-    c1_tube_x, c1_tube_y, c1_tube_conf, c1_tube_flag = tactile_total_dim, tactile_total_dim + 1, tactile_total_dim + 2, tactile_total_dim + 3
-    c1_peg_x,  c1_peg_y,  c1_peg_conf,  c1_peg_flag  = tactile_total_dim + 4, tactile_total_dim + 5, tactile_total_dim + 6, tactile_total_dim + 7
-    c1_rel_x,  c1_rel_y                             = tactile_total_dim + 8, tactile_total_dim + 9
-    # Camera 2
-    c2_tube_x, c2_tube_y, c2_tube_conf, c2_tube_flag = tactile_total_dim + 10, tactile_total_dim + 11, tactile_total_dim + 12, tactile_total_dim + 13
-    c2_peg_x,  c2_peg_y,  c2_peg_conf,  c2_peg_flag  = tactile_total_dim + 14, tactile_total_dim + 15, tactile_total_dim + 16, tactile_total_dim + 17
-    c2_rel_x,  c2_rel_y                             = tactile_total_dim + 18, tactile_total_dim + 19
+    # --- Feature Indices Setup (for 788D vector) ---
+    # Camera 1 (starts at tactile_total_dim)
+    c1_start = tactile_total_dim
+    c1_tube_x, c1_tube_y, c1_tube_conf, c1_tube_flag = c1_start, c1_start + 1, c1_start + 2, c1_start + 3
+    c1_peg_x,  c1_peg_y,  c1_peg_conf,  c1_peg_flag  = c1_start + 4, c1_start + 5, c1_start + 6, c1_start + 7
+    c1_rel_x,  c1_rel_y                             = c1_start + 8, c1_start + 9
+    c1_rgb_emb_start = c1_start + kp_dim
+    c1_depth_emb_start = c1_rgb_emb_start + rgb_dim
+    
+    # Camera 2 (starts after camera 1)
+    c2_start = tactile_total_dim + single_cam_dim
+    c2_tube_x, c2_tube_y, c2_tube_conf, c2_tube_flag = c2_start, c2_start + 1, c2_start + 2, c2_start + 3
+    c2_peg_x,  c2_peg_y,  c2_peg_conf,  c2_peg_flag  = c2_start + 4, c2_start + 5, c2_start + 6, c2_start + 7
+    c2_rel_x,  c2_rel_y                             = c2_start + 8, c2_start + 9
+    c2_rgb_emb_start = c2_start + kp_dim
+    c2_depth_emb_start = c2_rgb_emb_start + rgb_dim
 
     # --- Plot Row 1: Detection Rate Analysis ---
     ax_rate1 = fig.add_subplot(gs[0, 0])
@@ -162,17 +177,32 @@ def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, out
     ax_rel_scatter2.scatter(rel_x2_calc, rel_y2_calc, alpha=0.1)
     ax_rel_scatter2.set_title('Camera 2: Calculated Relative Position')
 
-    # --- Plot Row 6: Absolute Coordinate Distributions ---
-    ax_abs_dist1 = fig.add_subplot(gs[5, 0])
-    sns.kdeplot(X_train[mask_c1_tube, c1_tube_x], ax=ax_abs_dist1, label='Tube X', fill=True, warn_singular=False)
-    sns.kdeplot(X_train[mask_c1_tube, c1_tube_y], ax=ax_abs_dist1, label='Tube Y', fill=True, warn_singular=False)
-    ax_abs_dist1.set_title('Camera 1: Absolute Coordinate Distributions'); ax_abs_dist1.legend()
+    # --- NEW: Plot Row 6: RGB Embedding Distributions ---
+    ax_emb_rgb1 = fig.add_subplot(gs[5, 0])
+    sns.kdeplot(X_train[:, c1_rgb_emb_start + 10], ax=ax_emb_rgb1, label='Train Emb[10]', fill=True)
+    sns.kdeplot(X_val[:, c1_rgb_emb_start + 10], ax=ax_emb_rgb1, label='Val Emb[10]', fill=True, linestyle='--')
+    sns.kdeplot(X_train[:, c1_rgb_emb_start + 50], ax=ax_emb_rgb1, label='Train Emb[50]', fill=True)
+    ax_emb_rgb1.set_title('Camera 1: Sample RGB Embedding Dists'); ax_emb_rgb1.legend()
     
-    ax_abs_dist2 = fig.add_subplot(gs[5, 1])
-    sns.kdeplot(X_train[mask_c2_tube, c2_tube_x], ax=ax_abs_dist2, label='Tube X', fill=True, warn_singular=False)
-    sns.kdeplot(X_train[mask_c2_tube, c2_tube_y], ax=ax_abs_dist2, label='Tube Y', fill=True, warn_singular=False)
-    ax_abs_dist2.set_title('Camera 2: Absolute Coordinate Distributions'); ax_abs_dist2.legend()
+    ax_emb_rgb2 = fig.add_subplot(gs[5, 1])
+    sns.kdeplot(X_train[:, c2_rgb_emb_start + 10], ax=ax_emb_rgb2, label='Train Emb[10]', fill=True)
+    sns.kdeplot(X_val[:, c2_rgb_emb_start + 10], ax=ax_emb_rgb2, label='Val Emb[10]', fill=True, linestyle='--')
+    sns.kdeplot(X_train[:, c2_rgb_emb_start + 50], ax=ax_emb_rgb2, label='Train Emb[50]', fill=True)
+    ax_emb_rgb2.set_title('Camera 2: Sample RGB Embedding Dists'); ax_emb_rgb2.legend()
     
+    # --- NEW: Plot Row 7: Depth Embedding Distributions ---
+    ax_emb_d1 = fig.add_subplot(gs[6, 0])
+    sns.kdeplot(X_train[:, c1_depth_emb_start + 10], ax=ax_emb_d1, label='Train Emb[10]', fill=True)
+    sns.kdeplot(X_val[:, c1_depth_emb_start + 10], ax=ax_emb_d1, label='Val Emb[10]', fill=True, linestyle='--')
+    sns.kdeplot(X_train[:, c1_depth_emb_start + 50], ax=ax_emb_d1, label='Train Emb[50]', fill=True)
+    ax_emb_d1.set_title('Camera 1: Sample Depth Embedding Dists'); ax_emb_d1.legend()
+    
+    ax_emb_d2 = fig.add_subplot(gs[6, 1])
+    sns.kdeplot(X_train[:, c2_depth_emb_start + 10], ax=ax_emb_d2, label='Train Emb[10]', fill=True)
+    sns.kdeplot(X_val[:, c2_depth_emb_start + 10], ax=ax_emb_d2, label='Val Emb[10]', fill=True, linestyle='--')
+    sns.kdeplot(X_train[:, c2_depth_emb_start + 50], ax=ax_emb_d2, label='Train Emb[50]', fill=True)
+    ax_emb_d2.set_title('Camera 2: Sample Depth Embedding Dists'); ax_emb_d2.legend()
+
     # --- Styling ---
     for ax in [ax_pos1, ax_pos2]:
         ax.set_xlabel('X (normalized)'); ax.set_ylabel('Y (normalized)')
@@ -183,16 +213,16 @@ def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, out
         ax.set_xlabel('Relative X'); ax.set_ylabel('Relative Y')
         ax.grid(True, linestyle='--'); ax.axis('equal')
         
-    for ax in [ax_abs_dist1, ax_abs_dist2, ax_rel_dist1, ax_rel_dist2]:
+    for ax in [ax_rel_dist1, ax_rel_dist2, ax_emb_rgb1, ax_emb_rgb2, ax_emb_d1, ax_emb_d2]:
         ax.grid(True, linestyle='--')
-        ax.set_xlabel('Coordinate Value'); ax.set_ylabel('Density')
+        ax.set_xlabel('Feature Value'); ax.set_ylabel('Density')
 
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     save_path = output_dir / "visual_feature_analysis.png"
     plt.savefig(save_path)
     plt.close(fig)
     logging.info(f"📊 Saved detailed visual plot to {save_path}")
-    
+        
 def plot_proprio_action_distributions(X_train, y_train, X_val, y_val, joint_start_idx, output_dir):
     """Generates plots for proprioceptive state and action distributions."""
     joint_indices_to_plot = {

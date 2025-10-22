@@ -113,12 +113,35 @@ def main():
         staging_node.command_arm(start_pose_arm, duration_sec=5)
         time.sleep(6) # Wait for arm move
 
-        staging_node.command_hand(hand_grasp_pose)
-        time.sleep(3) # Wait for grasp
+        # # staging_node.command_hand(hand_grasp_pose)
+        # # time.sleep(3) # Wait for grasp
+        # logging.info("Commanding a slow, interpolated grasp...")
+
+        # # Define grasp parameters
+        # grasp_duration = 2.0  # Total time for the grasp in seconds
+        # num_steps = 100        # Number of intermediate steps
+        # hand_grasp_pose = np.array(hand_grasp_pose)
+
+        # # Loop to send intermediate poses
+        # for i in range(num_steps - 5):
+        #     # Calculate the interpolation factor (alpha) from 0.0 to 1.0
+        #     alpha = i / num_steps
+            
+        #     # Linearly interpolate between the open and closed poses
+        #     intermediate_pose = (1 - alpha) * open_hand_pose + alpha * hand_grasp_pose
+            
+        #     # Send the command (convert back to list for the function)
+        #     staging_node.command_hand(intermediate_pose.tolist())
+
+        #     # Wait for a short duration before the next step
+        #     time.sleep(grasp_duration / num_steps)
+        
+        # logging.info("Grasp complete.")
+        # time.sleep(1) # A final short pause after grasping
            
         # --- Launch the Autonomous Policy Node ---
         logging.info("\n✅ Robot is at start pose. Launching policy node...")
-        
+                   
         command = [
             "ros2", "launch", "franka_fr3_moveit_config", "rollout.launch.py",
             f"model_path:={selected_model}",
@@ -128,7 +151,7 @@ def main():
         subprocess.run(" ".join(command), shell=True, check=True)
         
 
-    except (KeyboardInterrupt, TypeError):
+    except (KeyboardInterrupt):
         logging.info("\nOperation cancelled by user.")
     except Exception as e:
         logging.error(f"An error occurred: {e}", exc_info=True)

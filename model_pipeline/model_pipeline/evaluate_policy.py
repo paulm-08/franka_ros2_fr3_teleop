@@ -31,68 +31,81 @@ def find_pkl_files(search_path):
     other_files = sorted([p for p in all_files if 'cleaned' not in str(p)])
     return [str(p) for p in cleaned_files + other_files]
 
-def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_stack_k, device):
-    """Performs a plausible closed-loop rollout on a single trajectory, compatible with all model types."""
+def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_stack_k, is_arm_only, num_arm_joints, device):
+    """Performs a plausible closed-loop rollout, compatible with all model types and arm_only mode."""
     X_mean, X_std, y_mean, y_std = norm_stats
     joint_min, joint_max = joint_limits
 
-    X_traj_unstacked = torch.tensor(
-        np.concatenate([trajectory['tactile_t'], trajectory['visual_t'], trajectory['joints_t']], axis=1),
-        dtype=torch.float32, device=device
-    )
-    # The goal is constant for the entire trajectory
-    goal_state = torch.tensor(trajectory['goal_t'][0], dtype=torch.float32, device=device)
+    # The full, un-sliced trajectory data
+    current_state_unstacked = torch.tensor(np.concatenate([trajectory['tactile_t'], trajectory['visual_t'], trajectory['joints_t']], axis=1), dtype=torch.float32, device=device)
+    goal_state_unstacked = torch.tensor(trajectory['goal_t'][0], dtype=torch.float32, device=device)
     
-    joint_dim = trajectory['joints_t'].shape[1]
-    single_frame_dim = X_traj_unstacked.shape[1]
-    JOINT_START_IDX = single_frame_dim - joint_dim
+    joint_dim_full = trajectory['joints_t'].shape[1]
+    single_frame_dim_full = current_state_unstacked.shape[1]
+    JOINT_START_IDX_FULL = single_frame_dim_full - joint_dim_full
 
-    rollout_steps = min(horizon, len(X_traj_unstacked) - frame_stack_k)
+    rollout_steps = min(horizon, len(current_state_unstacked) - frame_stack_k)
     if rollout_steps <= 0: return None, None, None
     
-    q_pred_history = X_traj_unstacked[:frame_stack_k, JOINT_START_IDX:].clone()
+    q_pred_history = current_state_unstacked[:frame_stack_k, JOINT_START_IDX_FULL:].clone()
     predicted_q_trajectory = []
 
-    # Check if the loaded model is an MLP to decide how to format data
     is_sequence_model = not isinstance(model, MLPPolicy)
 
     for i in range(rollout_steps):
         t = i + frame_stack_k - 1
-        sensory_gt_stack = X_traj_unstacked[t - frame_stack_k + 1 : t + 1, :JOINT_START_IDX]
+        sensory_gt_stack = current_state_unstacked[t - frame_stack_k + 1 : t + 1, :JOINT_START_IDX_FULL]
+        
+        # --- PREPARE STATE (This logic must perfectly match train.py) ---
         state_window = torch.cat([sensory_gt_stack, q_pred_history], dim=1)
-
-        goal_window = goal_state.unsqueeze(0).repeat(frame_stack_k, 1)
+        goal_window = goal_state_unstacked.unsqueeze(0).repeat(frame_stack_k, 1)
         full_state_sequence = torch.cat([state_window, goal_window], dim=1)
         
-        # --- FIX: Prepare input batch correctly based on model type ---
+        # Apply normalization
         if is_sequence_model:
-            # For LSTM/GRU, normalize each frame and keep the sequence shape
             state_norm = (full_state_sequence - X_mean) / X_std
-            state_norm = state_norm.unsqueeze(0) # Add batch dimension -> (1, K, D)
-        else: # For MLP
-            # For MLP, flatten the sequence and then normalize
-            state_flattened = full_state_sequence.flatten()
-            X_mean_stacked = X_mean.repeat(frame_stack_k)
-            X_std_stacked = X_std.repeat(frame_stack_k)
-            state_norm = (state_flattened - X_mean_stacked) / X_std_stacked
-            state_norm = state_norm.unsqueeze(0) # Add batch dimension -> (1, K*D)
+            state_norm = state_norm.unsqueeze(0)
+        else: # MLP
+            state_norm = (full_state_sequence.flatten() - X_mean.repeat(frame_stack_k)) / X_std.repeat(frame_stack_k)
+            state_norm = state_norm.unsqueeze(0)
         
         with torch.no_grad():
-            pred_norm = model(state_norm)
-            delta_q_pred = (pred_norm.view(-1) * y_std) + y_mean
+            action_norm = model(state_norm).squeeze(0)
+            delta_q_pred_arm = (action_norm * y_std) + y_mean # This will be 7-DOF if arm_only
             
-        q_pred_next = q_pred_history[-1] + delta_q_pred
+        # Reconstruct full action if in arm_only mode
+        if is_arm_only:
+            hand_zeros = torch.zeros(joint_dim_full - num_arm_joints, device=device)
+            full_delta_q = torch.cat([delta_q_pred_arm, hand_zeros])
+        else:
+            full_delta_q = delta_q_pred_arm
+            
+        q_pred_next = q_pred_history[-1] + full_delta_q
         q_pred_next = torch.clamp(q_pred_next, min=joint_min, max=joint_max)
         
         predicted_q_trajectory.append(to_np(q_pred_next))
-        
-        q_pred_history = torch.roll(q_pred_history, shifts=-1, dims=0)
-        q_pred_history[-1] = q_pred_next
+        q_pred_history = torch.roll(q_pred_history, shifts=-1, dims=0); q_pred_history[-1] = q_pred_next
 
     pred_np = np.array(predicted_q_trajectory)
-    gt_np = to_np(X_traj_unstacked[frame_stack_k : rollout_steps + frame_stack_k, JOINT_START_IDX:])
+    gt_np = to_np(current_state_unstacked[frame_stack_k : rollout_steps + frame_stack_k, JOINT_START_IDX_FULL:])
 
-    metrics = {'mse': mean_squared_error(gt_np, pred_np), 'mae': mean_absolute_error(gt_np, pred_np), 'r2': r2_score(gt_np, pred_np)}
+    if is_arm_only:
+        # If in arm-only mode, slice both trajectories down to just the arm joints for scoring
+        gt_for_metrics = gt_np[:, :num_arm_joints]
+        pred_for_metrics = pred_np[:, :num_arm_joints]
+        logging.info(f"  (Calculating metrics on the first {num_arm_joints} arm joints only)")
+    else:
+        # If controlling the whole body, use all joints for scoring
+        gt_for_metrics = gt_np
+        pred_for_metrics = pred_np
+
+    metrics = {
+        'mse': mean_squared_error(gt_for_metrics, pred_for_metrics),
+        'mae': mean_absolute_error(gt_for_metrics, pred_for_metrics),
+        'r2': r2_score(gt_for_metrics, pred_for_metrics)
+    }
+    
+    # We still return the full 23-DOF trajectories for comprehensive plotting
     return pred_np, gt_np, metrics
 
 def main():
@@ -152,7 +165,15 @@ def main():
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         frame_stack_k = checkpoint.get("frame_stack", 1)
         model_type = checkpoint["model_type"]
+        is_arm_only = checkpoint.get("arm_only", False)
+        num_arm_joints = checkpoint.get("num_arm_joints", checkpoint["output_dim"])
+        
+        # --- THE CRITICAL FIX: Read hyperparameters from the checkpoint ---
+        model_hyperparams = checkpoint.get("model_hyperparams", {})
+        logging.info(f"Loaded model hyperparameters: {model_hyperparams}")
         logging.info(f"Model was trained with K={frame_stack_k}, type='{model_type}'. Evaluating accordingly.")
+        if is_arm_only:
+            logging.info(f"Evaluating an ARM-ONLY model with {num_arm_joints} joints.")
 
         # --- Automatically infer the MLP width from the checkpoint file ---
         inferred_width = None
@@ -164,14 +185,14 @@ def main():
                 logging.error("Could not infer MLP width from checkpoint.")
                 return
         
-        # --- NEW: Check for the arm-only flag ---
-        is_arm_only = checkpoint.get("arm_only", False)
-        num_arm_joints = checkpoint.get("num_arm_joints", checkpoint["output_dim"])
-        if is_arm_only:
-            logging.info(f"Evaluating an ARM-ONLY model with {num_arm_joints} joints.")
-
-        
-        model = build_model(model_type, checkpoint["input_dim"], checkpoint["output_dim"], width=inferred_width).to(device)
+        model = build_model(
+            model_type, 
+            checkpoint["input_dim"], 
+            checkpoint["output_dim"],
+            # Pass all saved hyperparameters. The build_model function
+            # will only use the ones it needs (e.g., 'width' for MLP).
+            **model_hyperparams 
+        ).to(device)
         model.load_state_dict(checkpoint["state_dict"])
         model.eval()
         
@@ -189,12 +210,12 @@ def main():
         # --- NEW: Slice the validation data if it's an arm-only model ---
         if is_arm_only:
             for traj in val_trajectories:
-                traj['joints_t'] = traj['joints_t'][:, :num_arm_joints]
+                # traj['joints_t'] = traj['joints_t'][:, :num_arm_joints]
                 traj['delta_q'] = traj['delta_q'][:, :num_arm_joints]
-                if 'goal_t' in traj:
-                    # Reconstruct the correct sliced goal dimension
-                    goal_state_dim = traj['tactile_t'].shape[1] + traj['visual_t'].shape[1] + num_arm_joints
-                    traj['goal_t'] = traj['goal_t'][:, :goal_state_dim]
+                # if 'goal_t' in traj:
+                #     # Reconstruct the correct sliced goal dimension
+                #     goal_state_dim = traj['tactile_t'].shape[1] + traj['visual_t'].shape[1] + num_arm_joints
+                #     traj['goal_t'] = traj['goal_t'][:, :goal_state_dim]
 
         output_dir = paths.MODELS_DIR / "debug"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -208,10 +229,17 @@ def main():
             rollout_plot_dir.mkdir(exist_ok=True)
             logging.info(f"Starting per-trajectory closed-loop rollout evaluation...")
 
-            joint_limits = (torch.full((joint_dim,), -2*np.pi, device=device), torch.full((joint_dim,), 2*np.pi, device=device))
+            # joint_limits = (torch.full((joint_dim,), -2*np.pi, device=device), torch.full((joint_dim,), 2*np.pi, device=device))
+            # Joint limits must always match the FULL robot's dimensionality (23),
+            # not the model's output dimensionality (7).
+            FULL_ROBOT_JOINT_DIM = 23 # Use a constant for clarity
+            joint_limits = (
+                torch.full((FULL_ROBOT_JOINT_DIM,), -2*np.pi, device=device),
+                torch.full((FULL_ROBOT_JOINT_DIM,), 2*np.pi, device=device)
+            )
 
             for i, trajectory in enumerate(val_trajectories):
-                pred_np, gt_np, metrics = perform_rollout(model, trajectory, final_args.horizon, norm_stats, joint_limits, frame_stack_k, device)
+                pred_np, gt_np, metrics = perform_rollout(model, trajectory, final_args.horizon, norm_stats, joint_limits, frame_stack_k, is_arm_only, num_arm_joints, device)
                 all_metrics.append(metrics); all_preds.append(pred_np); all_gts.append(gt_np)
                 logging.info(f"  Trajectory {i+1}/{len(val_trajectories)} | R²={metrics['r2']:.4f}")
 
@@ -254,7 +282,7 @@ def main():
                 all_gts_np = np.concatenate(all_gts, axis=0)
                 per_joint_error = np.sqrt(np.mean((all_preds_np - all_gts_np) ** 2, axis=0))
                 plt.figure(figsize=(12, 6))
-                plt.bar(np.arange(joint_dim), per_joint_error)
+                plt.bar(np.arange(len(per_joint_error)), per_joint_error)
                 plt.xlabel("Joint Index"); plt.ylabel("Overall RMSE")
                 plt.title("Per-Joint Rollout Error (Averaged Across All Validation Rollouts)"); plt.grid(True)
                 plt.savefig(output_dir / "rollout_per_joint_error.png"); plt.close()
