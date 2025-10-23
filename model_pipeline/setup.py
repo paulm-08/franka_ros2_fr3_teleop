@@ -39,6 +39,9 @@ setup(
             'create_goal_state = model_pipeline.create_goal_state:main',
             'policy_rollout = model_pipeline.policy_rollout_node:main',
             'start_task = model_pipeline.start_task:main',
+            'test_kinematics = model_pipeline.kinematics_test:main',
+            'save_calibration = model_pipeline.save_calibration:main',
+            'test_3d_keypoint = model_pipeline.test_3d_keypoint:main',
         ],
     },
 )

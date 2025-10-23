@@ -13,6 +13,11 @@ dataset_builder.py (Revised)
   handle temporary occlusions and failed detections.
 - Correctly processes and formats visual features from two separate cameras.
 
+- Reads main_config.yaml to build a dataset based on the specified
+  control_mode ('task_space' or 'joint_space') and state representation.
+- Uses KinematicsSolver to generate 3D poses for the end-effector and sensors.
+- Generates 6D task-space actions (delta_pose) for the arm.
+
 """
 import os
 import glob
@@ -24,14 +29,18 @@ import pickle
 from pathlib import Path
 import json
 import torch
-import inquirer
 import yaml
+import pinocchio as pin
+import inquirer
+import tempfile
 
 from model_pipeline.visual_embedder import VisualEmbedder
 from model_pipeline.keypoint_extractor import KeypointExtractor
 from model_pipeline.tactile_features import process_tactile_image, TACTILE_FEATURE_DIM
 from model_pipeline.utils import load_frame_paths, load_actions, get_cfg_path, init_sensor
 from model_pipeline import paths
+from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
+
 
 # It's good practice to define sensor names for consistent ordering
 SENSOR_ORDER = ["rindex", "rmiddle", "rthumb"]
@@ -46,28 +55,64 @@ logging.basicConfig(
 class VisionProcessor:
     """A wrapper class to handle different vision modules (ResNet/YOLO) seamlessly."""
     def __init__(self, config, device, data_dirs):
+        state_config = config.get("state", {})
+        self.is_keypoint_extractor = state_config.get("use_keypoint_extractor", False)
+        self.use_3d_keypoints = state_config.get("use_3d_keypoints", False)
+        self.use_resnet_embeddingss = state_config.get("use_resnet_embeddingss", False)
+
         vision_config = config.get("vision", {})
-        self.is_keypoint_extractor = vision_config.get("use_keypoint_extractor", True)
+
+        if not (self.is_keypoint_extractor or self.use_resnet_embeddings):
+            raise ValueError("At least one vision module (Keypoint Extractor or ResNet Embedder) must be enabled.")
         
-        # 1. Initialize the KeypointExtractor (for 2D features)
-        self.extractor = KeypointExtractor(
-            model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
-            use_3d=False, # We are explicitly choosing robust 2D
-            confidence_threshold=vision_config.get("confidence_threshold", 0.1),
-            device=device
-        )
-        self.keypoint_dim_per_cam = self.extractor.output_dim + 2 # (8 + 2 = 10)
+        self.keypoint_dim_per_cam = 0
+        self.embedder_rgb_dim = 0
+        self.embedder_depth_dim = 0
+
+        if self.is_keypoint_extractor:
+            logging.info("Initializing VisionProcessor with YOLO Keypoint Extractor...")
         
-        # 2. Initialize the ResNet Embedder (for RGB and Depth context)
-        global_depth_range = config.get("global_depth_range")
-        # ... (load depth range)
-        self.embedder = VisualEmbedder(
-            backbone=config.get("backbone", "resnet18"), device=device,
-            out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
-            global_depth_range=global_depth_range
-        )
-        self.embedder_rgb_dim = self.embedder.out_dim['rgb']
-        self.embedder_depth_dim = self.embedder.out_dim['depth']
+            # 1. Initialize the KeypointExtractor (for 2D or 3D features)
+            self.extractor1 = KeypointExtractor(
+                model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
+                use_3d=self.use_3d_keypoints,
+                confidence_threshold=vision_config.get("confidence_threshold", 0.1),
+                intrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("intrinsics_path_cam1")),
+                extrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("extrinsics_path_cam1")),
+                device=device
+            )
+
+            self.extractor2 = KeypointExtractor(
+                model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
+                use_3d=self.use_3d_keypoints,
+                confidence_threshold=vision_config.get("confidence_threshold", 0.1),
+                intrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("intrinsics_path_cam2")),
+                extrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("extrinsics_path_cam2")),
+                device=device
+            )
+
+            keypoint_dim = 3 if self.use_3d_keypoints else 2 # x,y,z or u,v for the relative vector
+            self.keypoint_dim_per_cam = self.extractor1.output_dim + keypoint_dim  # (8 + 2 = 10) or (10 + 3 = 13) if 3D
+            logging.info(f"KeypointExtractor initialized. Single-camera dim: {self.keypoint_dim_per_cam} (including relative vector).")
+
+        if self.use_resnet_embeddings:
+            logging.info("Initializing VisionProcessor with ResNet Embedder...")
+
+            # 2. Initialize the ResNet Embedder (for RGB and Depth context)
+            global_depth_range = config.get("global_depth_range")
+            if not global_depth_range:
+                logging.warning("Global depth range not found in config, computing it now. This can be slow.")
+                global_depth_range = compute_global_depth_range(data_dirs)
+
+            # ... (load depth range)
+            self.embedder = VisualEmbedder(
+                backbone=config.get("backbone", "resnet18"), device=device,
+                out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
+                global_depth_range=global_depth_range
+            )
+            self.embedder_rgb_dim = self.embedder.out_dim['rgb']
+            self.embedder_depth_dim = self.embedder.out_dim['depth']
+            logging.info(f"VisualEmbedder initialized. RGB dim: {self.embedder_rgb_dim}, Depth dim: {self.embedder_depth_dim}.")
 
         # 3. Define the final, combined feature dimension
         self.single_cam_dim = self.keypoint_dim_per_cam + self.embedder_rgb_dim + self.embedder_depth_dim
@@ -76,33 +121,72 @@ class VisionProcessor:
         logging.info(f"Vision module initialized. Single-camera dim: {self.single_cam_dim}, Total visual dim: {self.output_dim}")
     
     def process_cameras(self, color1, depth1, color2, depth2):
-        
-        def get_all_features(color_img, depth_img):
-            if color_img is None or depth_img is None:
-                return np.zeros(self.single_cam_dim, dtype=np.float32)
+        """Processes images from both cameras based on the selected vision mode."""
+        keypoint_feats1 = []
+        keypoint_feats2 = []
+        embedding_feats1 = []
+        embedding_feats2 = []
 
-            # 1. Get Keypoints (Raw)
-            raw_kps = self.extractor.extract_scene_features(color_img, depth_img) # (8D)
-            
-            # 2. Engineer Relative Feature
-            tube_kp, peg_kp = raw_kps[:4], raw_kps[4:8]
-            if tube_kp[3] > 0 and peg_kp[3] > 0:
-                rel_vec = tube_kp[0:2] - peg_kp[0:2]
-            else:
-                rel_vec = np.zeros(2, dtype=np.float32)
-            keypoint_features = np.concatenate([raw_kps, rel_vec]) # (10D)
-            
-            # 3. Get Dense Embeddings
-            rgb_embedding = self.embedder.embed_rgb(color_img)      # (256D)
-            depth_embedding = self.embedder.embed_depth(depth_img)  # (128D)
-            
-            # 4. Concatenate Everything
-            return np.concatenate([keypoint_features, rgb_embedding, depth_embedding])
+        if self.is_keypoint_extractor:
+            def get_engineered_features(extractor, color, depth):
+                raw_kps = extractor.extract_scene_features(color, depth)
+                if raw_kps is None: return np.zeros(self.single_cam_dim, dtype=np.float32)
 
-        feats1 = get_all_features(color1, depth1)
-        feats2 = get_all_features(color2, depth2)
-        
+                # Feature order: [tube(N), peg(N)]
+                tube_kp = raw_kps[0 : extractor.feature_dim_per_object]
+                peg_kp = raw_kps[extractor.feature_dim_per_object : ]
+                
+                # Use 3D or 2D coordinates for relative vector
+                coord_dim = 3 if extractor.use_3d else 2
+                
+                if tube_kp[coord_dim+1] > 0 and peg_kp[coord_dim+1] > 0: # Check detection flags
+                    relative_vec = tube_kp[0:coord_dim] - peg_kp[0:coord_dim]
+                else:
+                    relative_vec = np.zeros(coord_dim, dtype=np.float32)
+                
+                # Final vector per camera: [raw_kps(8D or 10D), relative_vec(2D or 3D)]
+                return np.concatenate([raw_kps, relative_vec])
+            
+            keypoint_feats1 = get_engineered_features(self.extractor1, color1, depth1)
+            keypoint_feats2 = get_engineered_features(self.extractor2, color2, depth2)
+
+        if self.use_resnet_embeddings: # ResNet Embedder
+            def extract(c_img, d_img):
+                if c_img is None: return np.zeros(self.single_cam_dim, dtype=np.float32)
+                rgb = self.embedder.embed_rgb(c_img)
+                depth = self.embedder.embed_depth(d_img)
+                if rgb is None or depth is None: return np.zeros(self.single_cam_dim, dtype=np.float32)
+                return np.concatenate([rgb, depth])
+            embedding_feats1 = extract(color1, depth1)
+            embedding_feats2 = extract(color2, depth2)
+
+        # --- Combine features based on enabled modules ---
+        feats1 = np.concatenate([
+            keypoint_feats1,
+            embedding_feats1
+        ])
+        feats2 = np.concatenate([
+            keypoint_feats2,
+            embedding_feats2
+        ])
         return {'cam1': feats1, 'cam2': feats2}
+    
+def calculate_6d_pose_delta(pose_start: np.ndarray, pose_end: np.ndarray) -> np.ndarray:
+    """
+    Calculates the 6D (twist) delta from a start pose to an end pose.
+    Poses are [x, y, z, qx, qy, qz, qw].
+    Returns a 6D vector [vx, vy, vz, wx, wy, wz].
+    """
+    # Convert [x,y,z,qx,qy,qz,qw] to Pinocchio's SE3 object
+    T_start = pin.XYZQUATToSE3(pose_start)
+    T_end = pin.XYZQUATToSE3(pose_end)
+    
+    # Calculate the transformation from start to end
+    T_delta = T_start.inverse() * T_end
+    
+    # Convert the SE3 transformation to a 6D twist/motion vector
+    # This is the "action" that moves from T_start to T_end
+    return pin.log(T_delta).vector
     
 def find_demo_dirs(root_search_path):
     """
@@ -182,7 +266,7 @@ def compute_global_depth_range(data_dirs, percentile=99.5):
     logging.info(f"✅ Robust global depth range found: min={min_val:.0f}, max={max_val:.0f} (at {percentile}th percentile)")
     return min_val, max_val
 
-def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, vision_processor):
+def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solver, config):
     """
     Processes a single continuous trajectory (a clip or a full demonstration).
     This function is now stateful to handle carrying forward keypoint detections across frames.
@@ -203,6 +287,8 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, vision_
         os.path.basename(p): cv2.imread(p, cv2.IMREAD_UNCHANGED)
         for p in glob.glob(os.path.join(ref_frame_dir, "*raw_image.jpg"))
     }
+
+    use_height_map = config.get("state", {}).get("use_height_map", True)
 
     sensors = {}
     if use_height_map:
@@ -225,7 +311,9 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, vision_
 
     # --- Per-frame feature extraction ---
     tactile_list, visual_list = [], []
-    for frame_dir in frame_dirs:
+    kinematic_pose_list, hand_joint_list = [], []
+
+    for i, frame_dir in enumerate(frame_dirs):
         # --- Tactile Features (with guaranteed order) ---
         frame_feats = []
         # Sort glob results to ensure consistent feature order
@@ -282,43 +370,82 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, use_height_map, vision_
         f2 = features_per_cam.get('cam2', np.zeros(vision_processor.single_cam_dim, dtype=np.float32))
         visual_list.append(np.concatenate([f1, f2]))
 
+        # --- Kinematics (End-Effector Pose and Hand Joints) ---
+        arm_joints = actions[i, :7]
+        hand_joints = actions[i, 7:23]
+        
+        _, kinematic_poses = solver.get_all_poses(arm_joints, hand_joints)
+        kinematic_pose_list.append(kinematic_poses)
+        hand_joint_list.append(hand_joints)
+
     # --- Convert lists to numpy arrays ---
     tactile_feats = np.array(tactile_list, dtype=np.float32)
     visual_feats = np.stack(visual_list, axis=0)
+    kinematic_poses_array = np.array(kinematic_pose_list) # Array of dicts
+    hand_joints_array = np.array(hand_joint_list, dtype=np.float32)
 
-    # --- Create State-Action pairs ---
-    # State at time t (s_t)
-    joints_t = actions[:-1]
-    tactile_t = tactile_feats[:-1]
-    visual_t = visual_feats[:-1]
+    # --- Build State, Goal, and Action vectors based on config ---
+    state_list, goal_list = [], []
 
-    # --- NEW: Define the Goal State ---
-    # The goal is the final state of the trajectory.
-    # We take the last entry from the feature lists before they were sliced.
-    goal_tactile = tactile_feats[-1]
-    goal_visual = visual_feats[-1]
-    goal_joints = actions[-1]
+    # 1. Tactile Features (always included)
+    state_list.append(tactile_feats)
+    goal_list.append(tactile_feats[-1])
+
+    # 2. Proprioceptive Features
+    if config['control_mode'] == 'task_space':
+        # Extract 7D EE pose [x,y,z,qx,qy,qz,qw] from the array of dicts
+        ee_poses = np.array([p['ee'] for p in kinematic_poses_array])
+        state_list.append(ee_poses)
+        goal_list.append(ee_poses[-1])
+    else: # joint_space
+        state_list.append(actions[:, :7]) # 7D Arm Joints
+        goal_list.append(actions[-1, :7])
     
-    # Combine them into a single goal vector
-    goal_state = np.concatenate([goal_tactile, goal_visual, goal_joints])
+    state_list.append(hand_joints_array) # Always include 16D Hand Joints
+    goal_list.append(hand_joints_array[-1])
+
+    # 3. 3D Tactile Poses
+    if config['state']['use_3d_tactile']:
+        for frame_name in config['kinematics']['tactile_frames']:
+            poses = np.array([p[frame_name] for p in kinematic_poses_array])
+            state_list.append(poses)
+            goal_list.append(poses[-1])
+
+    # 4. Visual Features
+    # The visual_feats is already the full [keypoints, embeddings] vector
+    if config['state']['use_3d_keypoints'] or config['state']['use_resnet_embeddingss']:
+        state_list.append(visual_feats)
+        goal_list.append(visual_feats[-1])
+        
+    # --- Finalize State and Goal ---
+    s_t_full = np.concatenate(state_list, axis=1)
+    goal_state = np.concatenate(goal_list)
     
-    # Repeat the goal state for every timestep in the trajectory
-    num_samples = joints_t.shape[0]
-    goal_t = np.tile(goal_state, (num_samples, 1))
+    # Create slices for s_t and g_t
+    s_t = s_t_full[:-1]
+    g_t = np.tile(goal_state, (s_t.shape[0], 1))
 
-    # Action at time t (a_t)
-    delta_q = actions[1:] - actions[:-1]
+    # --- Build Action Vector (a_t) ---
+    if config['control_mode'] == 'task_space':
+        ee_poses = np.array([p['ee'] for p in kinematic_poses_array])
+        delta_arm_action = []
+        for i in range(len(ee_poses) - 1):
+            delta = calculate_6d_pose_delta(ee_poses[i], ee_poses[i+1])
+            delta_arm_action.append(delta)
+        delta_arm = np.array(delta_arm_action)
+    else: # joint_space
+        delta_arm = actions[1:, :7] - actions[:-1, :7]
+        
+    delta_hand = actions[1:, 7:23] - actions[:-1, 7:23]
+    a_t = np.concatenate([delta_arm, delta_hand], axis=1)
 
-    # After concatenating tactile, visual, and joint features
-    expected_dim = (len(SENSOR_ORDER) * TACTILE_FEATURE_DIM) + vision_processor.output_dim + joints_t.shape[1]
-    assert tactile_t.shape[1] + visual_t.shape[1] + joints_t.shape[1] == expected_dim, "State vector dimension mismatch!"
-
+    # --- Sanity Checks ---
+    assert s_t.shape[0] == a_t.shape[0] == g_t.shape[0], "State, Action, and Goal have different lengths!"
+    
     return {
-        "tactile_t": tactile_t,
-        "visual_t": visual_t,
-        "joints_t": joints_t,
-        "goal_t": goal_t,
-        "delta_q": delta_q,
+        "state_t": s_t.astype(np.float32),
+        "goal_t": g_t.astype(np.float32),
+        "action_t": a_t.astype(np.float32)
     }
 
 def generate_dataset_summary(all_trajectories):
@@ -422,7 +549,7 @@ def log_detailed_tactile_analysis(all_trajectories):
     
     logging.info("="*60)
 
-def build_dataset(data_dirs, out_file, use_height_map, config):
+def build_dataset(data_dirs, out_file, config):
     """
     Builds a dataset from multiple raw data directories.
 
@@ -434,9 +561,41 @@ def build_dataset(data_dirs, out_file, use_height_map, config):
     """
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    vision_processor = VisionProcessor(config, device, data_dirs)
     logging.info(f"Using device: {device}")
-    logging.info(f"Using height map for tactile features: {use_height_map}")
+
+    # --- Initialize Kinematics Solver ---
+    urdf_content = get_urdf_string_from_xacro()
+    if not urdf_content: 
+        logging.error("Failed to generate URDF, cannot proceed."); return
+
+    urdf_temp_file = None
+    try:
+        # 2b. Save to a temporary file for Pinocchio to load
+        # This creates a file with a unique name in the system's temp directory
+        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.urdf', encoding='utf-8') as f:
+            f.write(urdf_content)
+            urdf_temp_file = Path(f.name)
+    
+        kinematics_config = config.get("kinematics", {})
+        solver = KinematicsSolver(
+            urdf_content=urdf_temp_file,
+            end_effector_frame_name=kinematics_config.get("ee_frame", "fr3_hand_tcp"),
+            tactile_frame_names=kinematics_config.get("tactile_frames", []),
+            visualize=False,
+        )
+    except Exception as e:
+        logging.error(f"Error initializing KinematicsSolver: {e}")
+        return
+    finally:
+        # Clean up the temporary URDF file
+        if urdf_temp_file and urdf_temp_file.exists():
+            urdf_temp_file.unlink()
+
+    logging.info("Kinematics solver initialized.")
+
+    # --- Initialize Vision Processor ---
+    vision_processor = VisionProcessor(config, device, data_dirs)
+    logging.info("Vision processor initialized.")
 
     all_trajectories = []
     for data_dir in data_dirs:
@@ -460,10 +619,11 @@ def build_dataset(data_dirs, out_file, use_height_map, config):
                     clip_frame_dirs = all_frame_dirs[i_start : i_end + 1]
                     ref_frame_dir = all_frame_dirs[i_start] # Use first frame of clip as reference
                     
-                    trajectory_data = process_single_trajectory(clip_frame_dirs, ref_frame_dir, use_height_map, vision_processor)
+                    trajectory_data = process_single_trajectory(
+                        clip_frame_dirs, ref_frame_dir, vision_processor, solver, config
+                    )
                     if trajectory_data is not None and isinstance(trajectory_data, dict):
                         all_trajectories.append(trajectory_data)
-
 
                 except KeyboardInterrupt:
                     logging.info("KeyboardInterrupt detected. Finalizing dataset...")
@@ -474,7 +634,7 @@ def build_dataset(data_dirs, out_file, use_height_map, config):
         else:
             logging.info("No clip_marks.json found, processing entire directory as one trajectory.")
             ref_frame_dir = all_frame_dirs[0]
-            trajectory_data = process_single_trajectory(all_frame_dirs, ref_frame_dir, use_height_map, vision_processor)
+            trajectory_data = process_single_trajectory(all_frame_dirs, ref_frame_dir, vision_processor, solver, config)
             if trajectory_data is not None and isinstance(trajectory_data, dict):
                 all_trajectories.append(trajectory_data)
 
@@ -543,16 +703,15 @@ def main():
             inquirer.Text('out_file',
                           message="Enter the name for the output dataset file",
                           default="processed_dataset.pkl"),
-            inquirer.Confirm('height_map',
-                             message="Use height map for tactile processing?",
-                             default=True),
+            # inquirer.Confirm('height_map',
+            #                  message="Use height map for tactile processing?",
+            #                  default=True),
         ]
         other_answers = inquirer.prompt(other_questions)
         if not other_answers: logging.info("Cancelled. Exiting."); return
         
         # Construct the full output path
         out_file_path = paths.PROCESSED_DATA_DIR / other_answers['out_file']
-        use_height_map = other_answers['height_map']
 
     except (KeyboardInterrupt, TypeError):
         logging.info("\nDataset building cancelled by user.")
@@ -566,7 +725,7 @@ def main():
             logging.error(f"YOLO model not found at resolved path: {abs_yolo_path}"); return
         config["vision"]["yolo_model_path"] = str(abs_yolo_path)
 
-    build_dataset(data_dirs, str(out_file_path), use_height_map, config)
+    build_dataset(data_dirs, str(out_file_path), config)
 
 if __name__ == "__main__":
     main()

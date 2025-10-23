@@ -67,15 +67,14 @@ def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, out
     """
     # --- Define the dimensions of each sub-feature ---
     kp_dim = 10  # (x, y, conf, flag) * 2 + (rel_x, rel_y)
-    rgb_dim = 256
-    depth_dim = 128
+    rgb_dim = 32
+    depth_dim = 16
     
     single_cam_dim = kp_dim + rgb_dim + depth_dim
     expected_visual_dim = single_cam_dim * 2 # 394 * 2 = 788
 
     if visual_dim != expected_visual_dim:
         logging.warning(f"This visualization expects a {expected_visual_dim}D visual vector, but found {visual_dim}D. Skipping visual plots.")
-        return
 
     fig = plt.figure(figsize=(20, 30))
     gs = fig.add_gridspec(7, 2) # Now 7 rows
@@ -194,13 +193,13 @@ def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, out
     ax_emb_d1 = fig.add_subplot(gs[6, 0])
     sns.kdeplot(X_train[:, c1_depth_emb_start + 10], ax=ax_emb_d1, label='Train Emb[10]', fill=True)
     sns.kdeplot(X_val[:, c1_depth_emb_start + 10], ax=ax_emb_d1, label='Val Emb[10]', fill=True, linestyle='--')
-    sns.kdeplot(X_train[:, c1_depth_emb_start + 50], ax=ax_emb_d1, label='Train Emb[50]', fill=True)
+    # sns.kdeplot(X_train[:, c1_depth_emb_start + 50], ax=ax_emb_d1, label='Train Emb[50]', fill=True)
     ax_emb_d1.set_title('Camera 1: Sample Depth Embedding Dists'); ax_emb_d1.legend()
     
     ax_emb_d2 = fig.add_subplot(gs[6, 1])
     sns.kdeplot(X_train[:, c2_depth_emb_start + 10], ax=ax_emb_d2, label='Train Emb[10]', fill=True)
     sns.kdeplot(X_val[:, c2_depth_emb_start + 10], ax=ax_emb_d2, label='Val Emb[10]', fill=True, linestyle='--')
-    sns.kdeplot(X_train[:, c2_depth_emb_start + 50], ax=ax_emb_d2, label='Train Emb[50]', fill=True)
+    # sns.kdeplot(X_train[:, c2_depth_emb_start + 50], ax=ax_emb_d2, label='Train Emb[50]', fill=True)
     ax_emb_d2.set_title('Camera 2: Sample Depth Embedding Dists'); ax_emb_d2.legend()
 
     # --- Styling ---
@@ -222,7 +221,7 @@ def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, out
     plt.savefig(save_path)
     plt.close(fig)
     logging.info(f"📊 Saved detailed visual plot to {save_path}")
-        
+
 def plot_proprio_action_distributions(X_train, y_train, X_val, y_val, joint_start_idx, output_dir):
     """Generates plots for proprioceptive state and action distributions."""
     joint_indices_to_plot = {
