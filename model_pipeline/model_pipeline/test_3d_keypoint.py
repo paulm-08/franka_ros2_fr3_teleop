@@ -7,14 +7,29 @@ import pyrealsense2 as rs
 import yaml
 import inquirer
 import os
+import time
+import glob
 import pickle
 
 # Import your pipeline components
 from model_pipeline import paths
 from model_pipeline.keypoint_extractor import KeypointExtractor
-from model_pipeline.utils import load_frame_paths # Assuming this is in your utils
+from model_pipeline.utils import load_frame_paths, load_actions
+from model_pipeline.kinematics import get_urdf_string_from_xacro, KinematicsSolver
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+np.set_printoptions(precision=4, suppress=True)
+
+def find_demo_dirs(root_search_path):
+    """Recursively finds all valid demonstration directories."""
+    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
+    found_demos = []
+    for dirpath, _, _ in os.walk(root_search_path):
+        if glob.glob(os.path.join(dirpath, 'frame_*')):
+            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
+            found_demos.append(str(relative_path))
+    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
+    return sorted(found_demos)
 
 def find_pkl_files(search_path):
     """Finds all .pkl dataset files."""
@@ -49,68 +64,59 @@ def main():
     with open(config_path, 'r') as f: config = yaml.safe_load(f)
     
     vision_config = config.get("vision", {})
-    if not vision_config.get("use_keypoint_extractor", False) or not vision_config.get("use_3d", False):
-        logging.error("This script requires 'use_keypoint_extractor: true' and 'use_3d: true' in config.yaml.")
+    state_config = config.get("state", {})
+    if not state_config.get("use_keypoint_extractor", False):
+        logging.error("This script requires 'use_keypoint_extractor: true' in config.yaml.")
         return
 
     # --- 2. Interactive Mode Selection ---
     try:
         source_question = [
-            inquirer.List('source', message="Select data source", choices=['Live Feed', 'Dataset File']),
+            inquirer.List('source', message="Select data source", choices=['Live Feed', 'Recorded Dataset']),
         ]
         source_answer = inquirer.prompt(source_question)
         if not source_answer: return
         data_source = source_answer['source']
-
-        dataset_frames = None
-        frame_idx = 0
         
-        if data_source == 'Dataset File':
-            pkl_choices = find_pkl_files(paths.PROCESSED_DATA_DIR)
-            if not pkl_choices: logging.error(f"No .pkl datasets found in {paths.PROCESSED_DATA_DIR}."); return
+        frame_dirs = []
+        if data_source == 'Recorded Dataset':
+            demo_choices = find_demo_dirs(paths.RAW_DATA_DIR)
+            if not demo_choices: logging.error(f"No demonstration directories found in {paths.RAW_DATA_DIR}."); return
             
             dataset_question = [
-                inquirer.List('dataset_pkl', message="Select the dataset (.pkl) to test on", choices=pkl_choices)
+                inquirer.List('demo_dir', message="Select the demonstration directory to test on", choices=demo_choices)
             ]
             dataset_answer = inquirer.prompt(dataset_question)
-            dataset_path = paths.WORKSPACE_ROOT / dataset_answer['dataset_pkl']
-            with open(dataset_path, "rb") as f: all_trajectories = pickle.load(f)
-            
-            # For this test, just use the first trajectory
-            traj_data = all_trajectories[0]
-            # We need to reconstruct the original frame paths
-            # This is a bit of a hack; assumes dataset 'name' is in the config or similar
-            # A simpler way is to just browse the raw demo folders.
-            logging.warning("Dataset mode is complex; using raw demo folder browser instead.")
-            logging.error("Dataset mode not fully implemented in this test script. Please select Live Feed or update script.")
-            return # Let's stick to a live feed test for simplicity of this script
-            
+            demo_path = paths.WORKSPACE_ROOT / dataset_answer['demo_dir']
+            frame_dirs = load_frame_paths(str(demo_path))
+            logging.info(f"Loaded {len(frame_dirs)} frames from {demo_path.name}.")
+
     except (KeyboardInterrupt, TypeError):
-        logging.info("\nSelection cancelled.")
-        return
+        logging.info("\nSelection cancelled."); return
         
-    # --- 3. Initialize Hardware (RealSense) ---
+    # --- 3. Initialize Hardware (if Live) or set to None ---
     pipelines = {}
-    aligners = {}
-    camera_serials = {
-        'cam1': '151422254571', # Use your 'camera1' serial
-        'cam2': '036522072607', # Use your 'camera2' serial
-    }
-    
-    try:
-        for cam_id, serial in camera_serials.items():
-            pipeline = rs.pipeline()
-            rs_config = rs.config()
-            rs_config.enable_device(serial)
-            rs_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-            rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-            pipeline.start(rs_config)
-            aligners[cam_id] = rs.align(rs.stream.color)
-            pipelines[cam_id] = pipeline
-            logging.info(f"RealSense camera {cam_id} ({serial}) started.")
-    except Exception as e:
-        logging.error(f"Failed to start RealSense cameras: {e}")
-        return
+    if data_source == 'Live Feed':
+        aligners = {}
+        camera_serials = {
+            'cam1': '151422254571', # Use your 'camera1' serial
+            'cam2': '036522072607', # Use your 'camera2' serial
+        }
+        
+        try:
+            for cam_id, serial in camera_serials.items():
+                pipeline = rs.pipeline()
+                rs_config = rs.config()
+                rs_config.enable_device(serial)
+                rs_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+                rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                pipeline.start(rs_config)
+                aligners[cam_id] = rs.align(rs.stream.color)
+                pipelines[cam_id] = pipeline
+                logging.info(f"RealSense camera {cam_id} ({serial}) started.")
+        except Exception as e:
+            logging.error(f"Failed to start RealSense cameras: {e}")
+            return
 
     # --- 4. Initialize KeypointExtractors in 3D Mode ---
     try:
@@ -138,81 +144,79 @@ def main():
     logging.info("Extractors initialized in 3D mode. Press 'q' to quit.")
     np.set_printoptions(precision=4, suppress=True)
 
-    # --- 5. Run Test Loop ---
+    # --- 5. Initialize "Carry Forward" State ---
+    coord_dim = 3 if vision_config.get("use_3d", False) else 2
+    last_known_coords = {
+        'cam1_tube': np.zeros(coord_dim, dtype=np.float32), 'cam1_peg':  np.zeros(coord_dim, dtype=np.float32),
+        'cam2_tube': np.zeros(coord_dim, dtype=np.float32), 'cam2_peg':  np.zeros(coord_dim, dtype=np.float32)
+    }
+
+    # --- 6. Run Test Loop ---
+    idx = 0
     while True:
-        # Get frames from both cameras
-        try:
-            frames1 = pipelines['cam1'].wait_for_frames()
-            frames2 = pipelines['cam2'].wait_for_frames()
-            
-            aligned_frames1 = aligners['cam1'].process(frames1)
-            aligned_frames2 = aligners['cam2'].process(frames2)
-            
-            color_frame1 = aligned_frames1.get_color_frame()
-            depth_frame1 = aligned_frames1.get_depth_frame()
-            color_frame2 = aligned_frames2.get_color_frame()
-            depth_frame2 = aligned_frames2.get_depth_frame()
+        if data_source == 'Live Feed':
+            # ... (Get live frames from pipelines) ...
+            pass
+        else: # Recorded Dataset
+            if idx >= len(frame_dirs):
+                logging.info("End of trajectory reached."); break
+            frame_dir = frame_dirs[idx]
+            color_image1 = cv2.imread(str(Path(frame_dir) / "color_image1.jpg"))
+            depth_image1 = cv2.imread(str(Path(frame_dir) / "depth_image1.png"), cv2.IMREAD_UNCHANGED)
+            color_image2 = cv2.imread(str(Path(frame_dir) / "color_image2.jpg"))
+            depth_image2 = cv2.imread(str(Path(frame_dir) / "depth_image2.png"), cv2.IMREAD_UNCHANGED)
 
-            if not all([color_frame1, depth_frame1, color_frame2, depth_frame2]):
-                continue
-        except Exception as e:
-            logging.warning(f"Failed to get frames: {e}")
-            continue
-
-        color_image1 = np.asanyarray(color_frame1.get_data())
-        depth_image1 = np.asanyarray(depth_frame1.get_data())
-        color_image2 = np.asanyarray(color_frame2.get_data())
-        depth_image2 = np.asanyarray(depth_frame2.get_data())
-
-        # --- Extract 3D Features ---
-        features1 = extractor1.extract_scene_features(color_image1, depth_image1)
-        features2 = extractor2.extract_scene_features(color_image2, depth_image2)
+        # --- Extract Raw 3D Features (same as builder) ---
+        raw_feats1 = extractor1.extract_scene_features(color_image1, depth_image1)
+        raw_feats2 = extractor2.extract_scene_features(color_image2, depth_image2)
         
-        tube_feats1 = features1[0:5]
-        peg_feats1 = features1[5:10]
-        tube_feats2 = features2[0:5]
-        peg_feats2 = features2[5:10]
+        # --- Apply "Carry Forward" Logic (same as builder) ---
+        def update_features(feats, cam_id, key_prefix):
+            if feats is None: feats = np.zeros(extractor1.output_dim) # Safety
+            tube_key, peg_key = f"{key_prefix}_tube", f"{key_prefix}_peg"
+            tube_feats, peg_feats = feats[0:5], feats[5:10] # 5D: [x,y,z,conf,flag]
+
+            if tube_feats[4] == 0: tube_feats[0:3] = last_known_coords[tube_key]; tube_feats[3] = 0
+            else: last_known_coords[tube_key] = tube_feats[0:3]
+            
+            if peg_feats[4] == 0: peg_feats[0:3] = last_known_coords[peg_key]; peg_feats[3] = 0
+            else: last_known_coords[peg_key] = peg_feats[0:3]
+            return tube_feats, peg_feats
+
+        clean_tube1, clean_peg1 = update_features(raw_feats1, 'cam1', 'cam1')
+        clean_tube2, clean_peg2 = update_features(raw_feats2, 'cam2', 'cam2')
 
         # --- Print 3D Coordinates & Cross-Validation ---
-        print("\n" + "="*50)
+        print("\n" + "="*50); logging.info(f"Frame {idx}")
+        logging.info(f"  Cam1 Tube: {'✅' if clean_tube1[4]>0 else '❌'} {clean_tube1[0:3]} (Conf: {clean_tube1[3]:.2f})")
+        logging.info(f"  Cam2 Tube: {'✅' if clean_tube2[4]>0 else '❌'} {clean_tube2[0:3]} (Conf: {clean_tube2[3]:.2f})")
+        logging.info(f"  Cam1 Peg:  {'✅' if clean_peg1[4]>0 else '❌'} {clean_peg1[0:3]} (Conf: {clean_peg1[3]:.2f})")
+        logging.info(f"  Cam2 Peg:  {'✅' if clean_peg2[4]>0 else '❌'} {clean_peg2[0:3]} (Conf: {clean_peg2[3]:.2f})")
         
-        if tube_feats1[4] > 0: # Check cam1 tube flag
-            logging.info(f"✅ Cam1 Tube [3D]:   {tube_feats1[0:3]} (Conf: {tube_feats1[3]:.2f})")
-        else: logging.info("❌ Cam1 Tube [3D]:   Not detected")
-            
-        if tube_feats2[4] > 0: # Check cam2 tube flag
-            logging.info(f"✅ Cam2 Tube [3D]:   {tube_feats2[0:3]} (Conf: {tube_feats2[3]:.2f})")
-        else: logging.info("❌ Cam2 Tube [3D]:   Not detected")
-
-        if peg_feats1[4] > 0: # Check cam1 peg flag
-            logging.info(f"✅ Cam1 Peg [3D]:    {peg_feats1[0:3]} (Conf: {peg_feats1[3]:.2f})")
-        else: logging.info("❌ Cam1 Peg [3D]:    Not detected")
-            
-        if peg_feats2[4] > 0: # Check cam2 peg flag
-            logging.info(f"✅ Cam2 Peg [3D]:    {peg_feats2[0:3]} (Conf: {peg_feats2[3]:.2f})")
-        else: logging.info("❌ Cam2 Peg [3D]:    Not detected")
-
         # --- 3D Validation Logic ---
-        if tube_feats1[4] > 0 and tube_feats2[4] > 0:
-            tube_dist = np.linalg.norm(tube_feats1[0:3] - tube_feats2[0:3]) * 100 # in cm
-            logging.info(f"   -> 📏 Tube 3D Position Error (Cam1 vs Cam2): {tube_dist:.2f} cm")
-        if peg_feats1[4] > 0 and peg_feats2[4] > 0:
-            peg_dist = np.linalg.norm(peg_feats1[0:3] - peg_feats2[0:3]) * 100 # in cm
-            logging.info(f"   -> 📏 Peg 3D Position Error (Cam1 vs Cam2): {peg_dist:.2f} cm")
+        if clean_tube1[4] > 0 and clean_tube2[4] > 0:
+            tube_dist = np.linalg.norm(clean_tube1[0:3] - clean_tube2[0:3]) * 100
+            logging.info(f"   -> 📏 Tube 3D Error: {tube_dist:.2f} cm")
+        if clean_peg1[4] > 0 and clean_peg2[4] > 0:
+            peg_dist = np.linalg.norm(clean_peg1[0:3] - clean_peg2[0:3]) * 100
+            logging.info(f"   -> 📏 Peg 3D Error:  {peg_dist:.2f} cm")
 
         # --- Visualization ---
-        results1 = extractor1.model(color_image1, verbose=False, conf=extractor1.confidence_threshold)[0]
-        results2 = extractor2.model(color_image2, verbose=False, conf=extractor2.confidence_threshold)[0]
-        annotated_img1 = results1.plot()
-        annotated_img2 = results2.plot()
+        raw_results1 = extractor1.model(color_image1, verbose=False, conf=extractor1.confidence_threshold)[0]
+        raw_results2 = extractor2.model(color_image2, verbose=False, conf=extractor2.confidence_threshold)[0]
+        annotated_img1 = raw_results1.plot()
+        annotated_img2 = raw_results2.plot()
         
         combined_img = np.hstack((annotated_img1, annotated_img2))
-        cv2.imshow("3D Keypoint Test - Camera 1 (Left) vs Camera 2 (Right)", combined_img)
+        cv2.imshow("3D Keypoint Test - Cam 1 (Raw) vs Cam 2 (Raw)", combined_img)
         
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        key = cv2.waitKey(0 if data_source == 'Recorded Dataset' else 1) & 0xFF
+        if key == ord('q'): break
+        elif key == ord('n'): idx = (idx + 1)
+        elif key == ord('p') and data_source == 'Recorded Dataset': idx = max(0, idx - 1)
 
-    for p in pipelines.values(): p.stop()
+    if data_source == 'Live Feed':
+        for p in pipelines.values(): p.stop()
     cv2.destroyAllWindows()
     logging.info("Test finished.")
 

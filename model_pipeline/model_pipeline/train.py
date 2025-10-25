@@ -11,7 +11,10 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import random
 import matplotlib.pyplot as plt
+import yaml
 
+from model_pipeline.dataset_builder import find_config_files
+from model_pipeline import paths
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -113,7 +116,7 @@ class TrajectoryFrameStackDataset(Dataset):
         
         self.indices = []
         for traj_idx, traj in enumerate(self.trajectories):
-            num_samples = traj['joints_t'].shape[0]
+            num_samples = traj['state_t'].shape[0]
             if num_samples >= self.k:
                 for frame_idx in range(self.k - 1, num_samples):
                     self.indices.append((traj_idx, frame_idx))
@@ -123,17 +126,15 @@ class TrajectoryFrameStackDataset(Dataset):
         else:
             # The X_unstacked now includes the goal state
             X_unstacked = np.concatenate([
-                np.concatenate([t['tactile_t'], t['visual_t'], t['joints_t'], t['goal_t']], axis=1) 
+                np.concatenate([t['state_t'], t['goal_t']], axis=1) 
                 for t in trajectories
             ], axis=0)
-            y_unstacked = np.concatenate([t['delta_q'] for t in trajectories], axis=0)
+            y_unstacked = np.concatenate([t['action_t'] for t in trajectories], axis=0)
             self.X_mean = X_unstacked.mean(axis=0); self.X_std = X_unstacked.std(axis=0)
             self.y_mean = y_unstacked.mean(axis=0); self.y_std = y_unstacked.std(axis=0)
             self.X_std[self.X_std < 1e-9] = 1.0; self.y_std[self.y_std < 1e-9] = 1.0
         
-        self.current_state_dim = trajectories[0]['tactile_t'].shape[1] + \
-                                 trajectories[0]['visual_t'].shape[1] + \
-                                 trajectories[0]['joints_t'].shape[1]
+        self.current_state_dim = trajectories[0]['state_t'].shape[1]
 
     def __len__(self):
         return len(self.indices)
@@ -146,10 +147,8 @@ class TrajectoryFrameStackDataset(Dataset):
         
         # --- 1. Build the full state sequence (current + goal) ---
         full_state_sequence = np.concatenate([
-            traj['tactile_t'][start_idx:end_idx],
-            traj['visual_t'][start_idx:end_idx],
-            traj['joints_t'][start_idx:end_idx],
-            traj['goal_t'][start_idx:end_idx]
+            traj['state_t'][start_idx:end_idx],
+            traj['goal_t'][start_idx:end_idx],
         ], axis=1)
         
         # --- 2. Normalize the entire sequence ---
@@ -167,7 +166,7 @@ class TrajectoryFrameStackDataset(Dataset):
         # --- 5. Recombine the (potentially noisy) state with the CLEAN goal ---
         final_state_norm = np.concatenate([current_state_norm, goal_state_norm], axis=1)
         
-        action = traj['delta_q'][frame_idx]
+        action = traj['action_t'][frame_idx]
         action_norm = (action - self.y_mean) / self.y_std
         
         state_output = final_state_norm.flatten() if self.flatten else final_state_norm
@@ -222,8 +221,9 @@ def main():
     parser.add_argument("--split_ratio", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--arm_only", action=argparse.BooleanOptionalAction, help="Train a policy for arm joints only.")
-    parser.add_argument("--num_arm_joints", type=int, default=7)
-    
+    parser.add_argument("--validation", action=argparse.BooleanOptionalAction, help="Use validation loss during training.")
+    parser.add_argument("--config_file", type=str, help="Path to the configuration YAML used to build the dataset.")
+    parser.add_argument("--num_arm_joints", type=int, default=7, help="Number of arm joints.")
     # Model-specific hyperparameters
     parser.add_argument("--width", type=int, help="Width of hidden layers for MLP.")
     parser.add_argument("--hidden_dim", type=int, help="Hidden dimension for LSTM/GRU/Transformer.")
@@ -231,6 +231,10 @@ def main():
     parser.add_argument("--num_heads", type=int, help="Number of attention heads for Transformer.")
 
     args = parser.parse_args()
+
+    config_choices = find_config_files(paths.CONFIG_DIR)
+    if not config_choices:
+        logging.error(f"No .yaml config files found in {paths.CONFIG_DIR}. Exiting."); return
 
     try:
         answers = {}
@@ -240,8 +244,13 @@ def main():
             pkl_choices = find_pkl_files(paths.PROCESSED_DATA_DIR)
             if not pkl_choices: logging.error(f"No .pkl files found in {paths.PROCESSED_DATA_DIR}."); return
             base_questions.append(inquirer.List('dataset_pkl', message="Select the dataset to train on", choices=pkl_choices))
+        base_questions.append(inquirer.List('config_file',
+                message="Select the configuration file used to build this dataset",
+                choices=config_choices))
         if args.arm_only is None:
             base_questions.append(inquirer.Confirm('arm_only', message="Train in ARM-ONLY mode?", default=False))
+        if args.validation is None:
+            base_questions.append(inquirer.Confirm('validation', message="Use validation loss during training?", default=False))
         if base_questions:
             answers.update(inquirer.prompt(base_questions) or {})
         
@@ -284,6 +293,7 @@ def main():
         if final_questions:
              answers.update(inquirer.prompt(final_questions) or {})
 
+
         # --- Combine args and answers ---
         final_args = argparse.Namespace(**vars(args))
         for key, value in answers.items():
@@ -293,7 +303,16 @@ def main():
                     else: value = int(value)
                 except (ValueError, TypeError): pass
                 setattr(final_args, key, value)
-        
+
+        # Config file
+        config_path_rel = final_args.config_file
+        config_path_abs = paths.WORKSPACE_ROOT / config_path_rel
+        with open(config_path_abs, 'r') as f:
+            config = yaml.safe_load(f)
+        logging.info(f"Loaded configuration from {config_path_abs}")
+        control_mode = config.get('control_mode', 'joint_space')
+        logging.info(f"Control mode: {control_mode}")
+
         if not final_args.dataset_pkl: logging.info("No dataset selected. Exiting."); return
         logging.info(f"Final training configuration: {final_args}")
 
@@ -302,56 +321,87 @@ def main():
         logging.info(f"Using device: {device}")
         set_seed(final_args.seed)
 
-        # FIX: Use the final_args object to get the output directory
+        #  Use the final_args object to get the output directory
         output_dir = Path(final_args.output_dir); debug_dir = output_dir / "debug"
         output_dir.mkdir(parents=True, exist_ok=True); debug_dir.mkdir(exist_ok=True)
 
         with open(paths.WORKSPACE_ROOT / final_args.dataset_pkl, "rb") as f:
             all_trajectories = pickle.load(f)
-        
+
+        # Train Test split
         random.seed(final_args.seed); random.shuffle(all_trajectories)
-        split_index = int(len(all_trajectories) * final_args.split_ratio)
-        train_trajectories = all_trajectories[:split_index]
-        val_trajectories = all_trajectories[split_index:]
-        logging.info(f"Loaded {len(all_trajectories)} trajectories: {len(train_trajectories)} train, {len(val_trajectories)} val.")
+
+        if final_args.validation:
+            split_index = int(len(all_trajectories) * final_args.split_ratio)
+            train_trajectories = all_trajectories[:split_index]
+            val_trajectories = all_trajectories[split_index:]
+            logging.info(f"Loaded {len(all_trajectories)} trajectories: {len(train_trajectories)} train, {len(val_trajectories)} val.")
+        else:
+            logging.info(f"Loaded {len(all_trajectories)} trajectories: Using for training only.")
 
         if final_args.arm_only:
-            logging.info(f"ARM-ONLY mode enabled. Slicing ACTIONS to the first {final_args.num_arm_joints} joints.")
-            n = final_args.num_arm_joints
-            
-            for traj in all_trajectories:
-                # We ONLY slice the action vector (the output of the policy).
-                traj['delta_q'] = traj['delta_q'][:, :n]
+            if control_mode == 'joint_space':
+                logging.info(f"ARM-ONLY mode enabled. Slicing ACTIONS to the first {final_args.num_arm_joints} joints.")
+                n = final_args.num_arm_joints
+                
+                for traj in all_trajectories:
+                    # We ONLY slice the action vector (the output of the policy).
+                    traj['action_t'] = traj['action_t'][:, :n]
 
-                # We DO NOT slice 'joints_t' or 'goal_t'.
-                # The policy's input (the state) should contain the full 23 joints.
+                    # We DO NOT slice 'joints_t' or 'goal_t'.
+                    # The policy's input (the state) should contain the full 23 joints.
+            else:
+                logging.info(f"ARM-ONLY mode enabled. Slicing ACTIONS to the arm 6D pose.")
+                
+                for traj in all_trajectories:
+                    # We ONLY slice the action vector (the output of the policy).
+                    traj['action_t'] = traj['action_t'][:, :6]
 
         logging.info("Preparing datasets and dataloaders...")
-        logging.info(f"Train dataset delta_q shape example: {train_trajectories[0]['delta_q'].shape}")
-        logging.info(f"Val dataset delta_q shape example: {val_trajectories[0]['delta_q'].shape}")
 
-        is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
-        train_dataset = TrajectoryFrameStackDataset(
-            train_trajectories, 
-            final_args.frame_stack, 
-            flatten=(not is_sequence_model),
-            is_train=True,         # <-- Enable training mode
-            noise_std=0.01         # <-- Add a small amount of noise
-        )
-        
-        # Validation dataset should NOT have noise
-        val_dataset = TrajectoryFrameStackDataset(
-            val_trajectories, 
-            final_args.frame_stack,
-            norm_stats=(train_dataset.X_mean, train_dataset.X_std, train_dataset.y_mean, train_dataset.y_std),
-            flatten=(not is_sequence_model),
-            is_train=False         # <-- Keep this False
-        )
-        if len(train_dataset) == 0:
-            logging.error("Training dataset is empty!"); return
+        if final_args.validation:
+            logging.info(f"Train dataset action shape example: {train_trajectories[0]['action_t'].shape}")
+            logging.info(f"Val dataset action shape example: {val_trajectories[0]['action_t'].shape}")
 
-        train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=final_args.batch_size * 2, num_workers=4)
+            is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
+            train_dataset = TrajectoryFrameStackDataset(
+                train_trajectories, 
+                final_args.frame_stack, 
+                flatten=(not is_sequence_model),
+                is_train=True,         # <-- Enable training mode
+                noise_std=0.01         # <-- Add a small amount of noise
+            )
+            
+            # Validation dataset should NOT have noise
+            val_dataset = TrajectoryFrameStackDataset(
+                val_trajectories, 
+                final_args.frame_stack,
+                norm_stats=(train_dataset.X_mean, train_dataset.X_std, train_dataset.y_mean, train_dataset.y_std),
+                flatten=(not is_sequence_model),
+                is_train=False         # <-- Keep this False
+            )
+            if len(train_dataset) == 0:
+                logging.error("Training dataset is empty!"); return
+
+            train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=4)
+            val_loader = DataLoader(val_dataset, batch_size=final_args.batch_size * 2, num_workers=4)
+
+        else:
+            logging.info(f"Train dataset action shape example: {all_trajectories[0]['action_t'].shape}")
+
+            is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
+            train_dataset = TrajectoryFrameStackDataset(
+                all_trajectories, 
+                final_args.frame_stack, 
+                flatten=(not is_sequence_model),
+                is_train=True,         # <-- Enable training mode
+                noise_std=0.01         # <-- Add a small amount of noise
+            )
+            
+            if len(train_dataset) == 0:
+                logging.error("Training dataset is empty!"); return
+
+            train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=4)
 
         single_frame_dim = train_dataset.X_mean.shape[0]
         output_dim = train_dataset.y_mean.shape[0]
@@ -373,6 +423,7 @@ def main():
 
         history = {"train_loss": [], "val_loss": []}
         best_val_loss = float('inf')
+        best_train_loss = float('inf')
         patience_counter = 0
         model_save_path = output_dir / f"policy_{final_args.model_type}_best.pt"
 
@@ -388,21 +439,28 @@ def main():
             avg_train_loss = total_train_loss / len(train_loader)
             history["train_loss"].append(avg_train_loss)
 
-            model.eval()
-            total_val_loss = 0.0
-            with torch.no_grad():
-                for state_norm, action_norm in val_loader:
-                    state_norm, action_norm = state_norm.to(device), action_norm.to(device)
-                    pred_norm = model(state_norm)
-                    loss = loss_fn(pred_norm, action_norm)
-                    total_val_loss += loss.item()
-            avg_val_loss = total_val_loss / len(val_loader)
-            history["val_loss"].append(avg_val_loss)
+            if final_args.validation:
+                model.eval()
+                total_val_loss = 0.0
+                with torch.no_grad():
+                    for state_norm, action_norm in val_loader:
+                        state_norm, action_norm = state_norm.to(device), action_norm.to(device)
+                        pred_norm = model(state_norm)
+                        loss = loss_fn(pred_norm, action_norm)
+                        total_val_loss += loss.item()
+                avg_val_loss = total_val_loss / len(val_loader)
+                history["val_loss"].append(avg_val_loss)
 
-            logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+                logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+            else:
+                logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}")
 
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+                
+            if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss<best_train_loss):
+                if final_args.validation:
+                    best_val_loss = avg_val_loss
+                else:
+                    best_train_loss = avg_train_loss
 
                 model_hyperparams = {
                     "width": final_args.width,
@@ -419,10 +477,19 @@ def main():
                     "X_mean": train_dataset.X_mean, "X_std": train_dataset.X_std,
                     "y_mean": train_dataset.y_mean, "y_std": train_dataset.y_std,
                     "frame_stack": final_args.frame_stack,
-                    "best_val_loss": best_val_loss, "epoch": epoch + 1,
+                    "validation": final_args.validation,
+                    "control_mode": control_mode,
+                    "training_config": config,
+                    "best_loss": best_val_loss if final_args.validation else best_train_loss,
+                    "epoch": epoch + 1,
                     "arm_only": final_args.arm_only, "num_arm_joints": final_args.num_arm_joints
                 }, model_save_path)
-                logging.info(f"  -> New best model saved to {model_save_path} (Val Loss: {best_val_loss:.6f})")
+
+                if final_args.validation:
+                    logging.info(f"  -> New best model saved to {model_save_path} (Val Loss: {best_val_loss:.6f})")
+                else:
+                    logging.info(f"  -> New best model saved to {model_save_path} (Train Loss: {best_train_loss:.6f})")
+
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -431,12 +498,20 @@ def main():
                 logging.info(f"Validation loss did not improve for {final_args.patience} epochs. Stopping early.")
                 break
         
-        logging.info(f"🏁 Training complete. Best validation loss: {best_val_loss:.6f}")
-        
+        if final_args.validation:
+            logging.info(f"🏁 Training complete. Best validation loss: {best_val_loss:.6f}")
+        else:
+            logging.info(f"🏁 Training complete. Best training loss: {best_train_loss:.6f}")
+
         plt.figure(figsize=(10, 5))
         plt.plot(history["train_loss"], label="Training Loss")
-        plt.plot(history["val_loss"], label="Validation Loss")
-        plt.xlabel("Epoch"); plt.ylabel("MSE Loss"); plt.title(f"Training and Validation Loss ({final_args.model_type})")
+
+        if final_args.validation:
+            plt.plot(history["val_loss"], label="Validation Loss")
+            plt.xlabel("Epoch"); plt.ylabel("MSE Loss"); plt.title(f"Training and Validation Loss ({final_args.model_type})")
+        else:
+            plt.xlabel("Epoch"); plt.ylabel("MSE Loss"); plt.title(f"Training Loss ({final_args.model_type})")
+
         plt.legend(); plt.grid(True)
         plot_save_path = debug_dir / f"loss_curve_{final_args.model_type}.png"
         plt.savefig(plot_save_path)

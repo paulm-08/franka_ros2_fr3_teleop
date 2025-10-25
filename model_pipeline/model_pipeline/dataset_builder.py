@@ -56,20 +56,20 @@ class VisionProcessor:
     """A wrapper class to handle different vision modules (ResNet/YOLO) seamlessly."""
     def __init__(self, config, device, data_dirs):
         state_config = config.get("state", {})
-        self.is_keypoint_extractor = state_config.get("use_keypoint_extractor", False)
+        self.use_keypoint_extractor = state_config.get("use_keypoint_extractor", False)
         self.use_3d_keypoints = state_config.get("use_3d_keypoints", False)
-        self.use_resnet_embeddingss = state_config.get("use_resnet_embeddingss", False)
+        self.use_resnet_embeddings = state_config.get("use_resnet_embeddings", False)
 
         vision_config = config.get("vision", {})
 
-        if not (self.is_keypoint_extractor or self.use_resnet_embeddings):
+        if not (self.use_keypoint_extractor or self.use_resnet_embeddings):
             raise ValueError("At least one vision module (Keypoint Extractor or ResNet Embedder) must be enabled.")
         
         self.keypoint_dim_per_cam = 0
         self.embedder_rgb_dim = 0
         self.embedder_depth_dim = 0
 
-        if self.is_keypoint_extractor:
+        if self.use_keypoint_extractor:
             logging.info("Initializing VisionProcessor with YOLO Keypoint Extractor...")
         
             # 1. Initialize the KeypointExtractor (for 2D or 3D features)
@@ -127,7 +127,7 @@ class VisionProcessor:
         embedding_feats1 = []
         embedding_feats2 = []
 
-        if self.is_keypoint_extractor:
+        if self.use_keypoint_extractor:
             def get_engineered_features(extractor, color, depth):
                 raw_kps = extractor.extract_scene_features(color, depth)
                 if raw_kps is None: return np.zeros(self.single_cam_dim, dtype=np.float32)
@@ -300,13 +300,27 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
             else:
                 logging.warning(f"Reference image for {sensor_name} not found.")
                 sensors[sensor_name] = None
-    
+
     # --- Stateful Tracking for Keypoints ---
-    # The output_dim of the extractor is for a SINGLE camera.
-    # We initialize the last known positions for each camera separately.
-    last_known_positions = {
-        'cam1': np.full(vision_processor.output_dim, -1.0, dtype=np.float32),
-        'cam2': np.full(vision_processor.output_dim, -1.0, dtype=np.float32)
+    # We now store the last known *position* vector separately from the *full feature* vector.
+    # The (x,y,z) or (u,v) part of the feature.
+    coord_dim = 3 if config.get('state', {}).get('use_3d_keypoints', False) else 2
+
+    # --- Get dimensions from the initialized vision_processor ---
+    # These are crucial for correctly parsing the feature vector
+    kp_raw_dim = vision_processor.extractor1.output_dim  # e.g., 10 (5 per object)
+    kp_engineered_dim = coord_dim
+    kp_total_dim = kp_raw_dim + kp_engineered_dim # e.g., 13
+    
+    single_cam_dim = vision_processor.single_cam_dim # e.g., 61
+
+    
+    # Store the last known [x,y,z] or [u,v]
+    last_known_coords = {
+        'cam1_tube': np.zeros(coord_dim, dtype=np.float32),
+        'cam1_peg':  np.zeros(coord_dim, dtype=np.float32),
+        'cam2_tube': np.zeros(coord_dim, dtype=np.float32),
+        'cam2_peg':  np.zeros(coord_dim, dtype=np.float32)
     }
 
     # --- Per-frame feature extraction ---
@@ -356,20 +370,62 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
         
         features_per_cam = vision_processor.process_cameras(color1, depth1, color2, depth2)
 
-        # Handle "Carry Forward" logic for keypoints
-        if vision_processor.is_keypoint_extractor:
-            for cam_id, features in features_per_cam.items():
-                if features is not None and np.all(features == 0): # Failed detection
-                    if np.all(last_known_positions[cam_id] != -1.0):
-                        features_per_cam[cam_id] = last_known_positions[cam_id]
-                elif features is not None and not np.all(features == 0): # Successful detection
-                    last_known_positions[cam_id] = features
-        
-        # Concatenate features into the final vector for this timestep
-        f1 = features_per_cam.get('cam1', np.zeros(vision_processor.single_cam_dim, dtype=np.float32))
-        f2 = features_per_cam.get('cam2', np.zeros(vision_processor.single_cam_dim, dtype=np.float32))
-        visual_list.append(np.concatenate([f1, f2]))
+        # --- "Carry Forward" Logic with Staleness Flag ---
+        def update_features(raw_feats, cam_id):
+            """
+            Parses a 'kitchen sink' vector, applies staleness logic to the
+            keypoint part, and preserves the embedding part.
+            """
+            if raw_feats is None: # Handle case where a camera failed
+                return np.zeros(single_cam_dim, dtype=np.float32)
 
+            # --- 1. Split the "kitchen sink" vector ---
+            kps_vec = raw_feats[:kp_total_dim]
+            embs_vec = raw_feats[kp_total_dim:]
+            
+            # Deconstruct the keypoint vector
+            # [tube(5), peg(5), rel(3)]
+            tube_feats = kps_vec[0:coord_dim+2]
+            peg_feats = kps_vec[coord_dim+2:2*coord_dim+4]
+            
+            tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
+
+            # --- 2. Apply Staleness Logic ---
+            # Check TUBE detection (flag is at index 4)
+            if tube_feats[coord_dim+1] > 0: # if flag is 1
+                last_known_coords[tube_key] = tube_feats[0:coord_dim] # Store new 3D pos
+            else:
+                tube_feats[0:coord_dim] = last_known_coords[tube_key] # Use stale position
+                tube_feats[coord_dim:coord_dim+2] = 0.0 # Set conf and flag to 0
+
+            # Check PEG detection (flag is at index 4 of its vector)
+            if peg_feats[coord_dim+1] > 0: # if flag is 1
+                last_known_coords[peg_key] = peg_feats[0:coord_dim]
+            else:
+                peg_feats[0:coord_dim] = last_known_coords[peg_key]
+                peg_feats[coord_dim:coord_dim+2] = 0.0
+            
+            # --- 3. Re-engineer the relative vector ---
+            # This is crucial: we recalculate the relative vector based on the
+            # (potentially stale) coordinates we are passing to the policy.
+            rel_vec = tube_feats[0:coord_dim] - peg_feats[0:coord_dim]
+            
+            # Reconstruct the final keypoint vector
+            final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
+            
+            # --- 4. Recombine with embeddings ---
+            # Return the full, corrected "kitchen sink" vector
+            return np.concatenate([final_kps_vec, embs_vec])
+
+        # Get the raw "kitchen sink" vectors
+        f1_raw = features_per_cam.get('cam1', np.zeros(single_cam_dim, dtype=np.float32))
+        f2_raw = features_per_cam.get('cam2', np.zeros(single_cam_dim, dtype=np.float32))
+
+        # Apply the staleness logic
+        f1_final = update_features(f1_raw, 'cam1')
+        f2_final = update_features(f2_raw, 'cam2')
+        
+        visual_list.append(np.concatenate([f1_final, f2_final]))
         # --- Kinematics (End-Effector Pose and Hand Joints) ---
         arm_joints = actions[i, :7]
         hand_joints = actions[i, 7:23]
@@ -413,7 +469,7 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
 
     # 4. Visual Features
     # The visual_feats is already the full [keypoints, embeddings] vector
-    if config['state']['use_3d_keypoints'] or config['state']['use_resnet_embeddingss']:
+    if config['state']['use_keypoint_extractor'] or config['state']['use_resnet_embeddings']:
         state_list.append(visual_feats)
         goal_list.append(visual_feats[-1])
         
@@ -448,9 +504,25 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
         "action_t": a_t.astype(np.float32)
     }
 
-def generate_dataset_summary(all_trajectories):
+# === NEW: Config-Aware Dataset Summary ===
+def print_stats(name, data):
+    """Helper function to print statistics for a data block."""
+    logging.info(f"\n--- {name} (Shape: {data.shape}) ---")
+    if np.isnan(data).any() or np.isinf(data).any():
+        logging.error(f"  ❌ Found NaN or Inf values in {name} data!")
+    else:
+        logging.info(f"  ✅ No NaN or Inf values detected.")
+    
+    min_val = np.min(data)
+    max_val = np.max(data)
+    mean_val = np.mean(data)
+    std_val = np.std(data)
+    
+    logging.info(f"  Min: {min_val:.4f}, Max: {max_val:.4f}, Mean: {mean_val:.4f}, Std: {std_val:.4f}")
+
+def generate_dataset_summary(all_trajectories, config, vision_processor):
     """
-    Calculates and prints a statistical summary of the entire dataset.
+    Calculates and prints a config-aware statistical summary of the new dataset structure.
     """
     if not all_trajectories:
         logging.warning("Cannot generate summary for an empty dataset.")
@@ -460,44 +532,81 @@ def generate_dataset_summary(all_trajectories):
     logging.info("          🤖 DATASET STATISTICAL SUMMARY 🤖")
     logging.info("="*60)
 
-    # --- Aggregate all data into single arrays for analysis ---
-    all_tactile = np.concatenate([traj['tactile_t'] for traj in all_trajectories], axis=0)
-    all_visual = np.concatenate([traj['visual_t'] for traj in all_trajectories], axis=0)
-    all_joints = np.concatenate([traj['joints_t'] for traj in all_trajectories], axis=0)
-    all_actions = np.concatenate([traj['delta_q'] for traj in all_trajectories], axis=0)
-    traj_lengths = [len(traj['joints_t']) for traj in all_trajectories]
-    
-    total_samples = all_joints.shape[0]
+    # --- Aggregate all data ---
+    all_states = np.concatenate([t['state_t'] for t in all_trajectories], axis=0)
+    all_goals = np.concatenate([t['goal_t'] for t in all_trajectories], axis=0)
+    all_actions = np.concatenate([t['action_t'] for t in all_trajectories], axis=0)
+    traj_lengths = [len(t['state_t']) for t in all_trajectories]
+    total_samples = all_states.shape[0]
 
     # --- Overall Summary ---
     logging.info(f"Number of trajectories: {len(all_trajectories)}")
-    logging.info(f"Total number of samples (state-action pairs): {total_samples}")
+    logging.info(f"Total number of samples: {total_samples}")
     logging.info(f"Trajectory Lengths | Min: {min(traj_lengths)}, Max: {max(traj_lengths)}, Avg: {np.mean(traj_lengths):.1f}")
+    
+    logging.info(f"\n--- State (s_t) Breakdown (Total Dim: {all_states.shape[1]}) ---")
+    current_idx = 0
 
-    # --- Per-Modality Summary ---
-    def print_stats(name, data):
-        logging.info(f"\n--- {name} (Shape: {data.shape}) ---")
-        # Check for NaN or Inf values
-        if np.isnan(data).any() or np.isinf(data).any():
-            logging.error(f"  ❌ Found NaN or Inf values in {name} data!")
-        else:
-            logging.info(f"  ✅ No NaN or Inf values detected.")
-        
-        # Calculate and print stats
-        min_vals = np.min(data, axis=0)
-        max_vals = np.max(data, axis=0)
-        mean_vals = np.mean(data, axis=0)
-        std_vals = np.std(data, axis=0)
-        
-        logging.info(f"  Min value (overall): {np.min(min_vals):.4f}")
-        logging.info(f"  Max value (overall): {np.max(max_vals):.4f}")
-        logging.info(f"  Mean value (overall): {np.mean(mean_vals):.4f}")
-        logging.info(f"  Std Dev (overall): {np.mean(std_vals):.4f}")
+    # 1. Tactile Features
+    tactile_dim = len(SENSOR_ORDER) * TACTILE_FEATURE_DIM
+    print_stats("  - Tactile Features", all_states[:, current_idx:current_idx+tactile_dim])
+    current_idx += tactile_dim
 
-    print_stats("Tactile Features", all_tactile)
-    print_stats("Visual Features", all_visual)
-    print_stats("Joint States (Proprioception)", all_joints)
-    print_stats("Joint Actions (delta_q)", all_actions)
+    # 2. Proprioceptive Features (Arm)
+    control_mode = config.get('control_mode', 'joint_space')
+    arm_proprio_dim = 7 # 7D pose [x,y,z,qx,qy,qz,qw] or 7D joints
+    if control_mode == 'task_space':
+        print_stats("  - Arm Proprio (Task Space Pose)", all_states[:, current_idx:current_idx+arm_proprio_dim])
+    else:
+        print_stats("  - Arm Proprio (Joint Space)", all_states[:, current_idx:current_idx+arm_proprio_dim])
+    current_idx += arm_proprio_dim
+
+    # 3. Proprioceptive Features (Hand)
+    hand_proprio_dim = 16 # 16D hand joints
+    print_stats("  - Hand Proprio (Joint Space)", all_states[:, current_idx:current_idx+hand_proprio_dim])
+    current_idx += hand_proprio_dim
+
+    # 4. 3D Tactile Poses
+    if config.get('state', {}).get('use_3d_tactile'):
+        tactile_frames = config.get('kinematics', {}).get('tactile_frames', [])
+        tactile_pose_dim = len(tactile_frames) * 7 # 7D pose per frame
+        print_stats(f"  - 3D Tactile Poses ({len(tactile_frames)} frames)", all_states[:, current_idx:current_idx+tactile_pose_dim])
+        current_idx += tactile_pose_dim
+
+    # 5. Visual Features
+    vis_dim = 0
+    if config.get('state', {}).get('use_keypoint_extractor') or config.get('state', {}).get('use_resnet_embeddings'):
+        vis_dim = vision_processor.output_dim
+        print_stats("  - Visual Features", all_states[:, current_idx:current_idx+vis_dim])
+        current_idx += vis_dim
+    
+    if current_idx != all_states.shape[1]:
+        logging.error(f"  ❌ STATE DIMENSION MISMATCH! Config implies {current_idx}D, but data has {all_states.shape[1]}D.")
+
+    # --- Goal Breakdown (Same structure as State) ---
+    # We can just do a high-level summary for the goal
+    print_stats("Full Goal (g_t)", all_goals)
+
+    # --- Action Breakdown ---
+    logging.info(f"\n--- Action (a_t) Breakdown (Total Dim: {all_actions.shape[1]}) ---")
+    current_idx = 0
+    
+    if control_mode == 'task_space':
+        arm_action_dim = 6 # 6D twist
+        print_stats("  - Arm Action (Task Space Delta)", all_actions[:, current_idx:current_idx+arm_action_dim])
+        current_idx += arm_action_dim
+    else: # joint_space
+        arm_action_dim = 7 # 7D joint delta
+        print_stats("  - Arm Action (Joint Space Delta)", all_actions[:, current_idx:current_idx+arm_action_dim])
+        current_idx += arm_action_dim
+    
+    hand_action_dim = 16
+    print_stats("  - Hand Action (Joint Space Delta)", all_actions[:, current_idx:current_idx+hand_action_dim])
+    current_idx += hand_action_dim
+    
+    if current_idx != all_actions.shape[1]:
+        logging.error(f"  ❌ ACTION DIMENSION MISMATCH! Config implies {current_idx}D, but data has {all_actions.shape[1]}D.")
+        
     logging.info("="*60)
 
 def log_detailed_tactile_analysis(all_trajectories):
@@ -629,8 +738,8 @@ def build_dataset(data_dirs, out_file, config):
                     logging.info("KeyboardInterrupt detected. Finalizing dataset...")
                     break
 
-                except ValueError as e:
-                    logging.warning(f"Clip range ({start_frame} -> {end_frame}) not found in {data_dir}, skipping. Error: {e}")
+                # except ValueError as e:
+                #     logging.warning(f"Clip range ({start_frame} -> {end_frame}) not found in {data_dir}, skipping. Error: {e}")
         else:
             logging.info("No clip_marks.json found, processing entire directory as one trajectory.")
             ref_frame_dir = all_frame_dirs[0]
@@ -639,8 +748,8 @@ def build_dataset(data_dirs, out_file, config):
                 all_trajectories.append(trajectory_data)
 
     # --- Generate and print dataset summary ---
-    generate_dataset_summary(all_trajectories)
-    log_detailed_tactile_analysis(all_trajectories)
+    generate_dataset_summary(all_trajectories, config, vision_processor)
+    # log_detailed_tactile_analysis(all_trajectories)
 
     # --- Save the dataset as a list of trajectories ---
     # This format is crucial for correct splitting later on.

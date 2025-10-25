@@ -105,7 +105,7 @@ class KeypointExtractor:
                 valid_depths = depth_patch[depth_patch > 0]
                 
                 if valid_depths.size == 0:
-                    logging.warning(f"No valid depth pixels found for {class_name} at ({u_clamped}, {v_clamped}).")
+                    # logging.warning(f"No valid depth pixels found for {class_name} at ({u_clamped}, {v_clamped}).")
                     continue # Invalid depth, keep the zero vector
 
                 Z_cam = np.median(valid_depths) / 1000.0 # Use median for robustness

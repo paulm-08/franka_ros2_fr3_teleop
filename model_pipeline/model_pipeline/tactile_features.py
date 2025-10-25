@@ -100,7 +100,7 @@ def process_tactile_image(img, ref_img=None, use_height_map=False, sensor=None, 
         major[1],            # Major axis vector y
         np.log(eigvals[0] + 1),          # Major eigenvalue (variance along major axis -> "length")
         np.log(eigvals[1] + 1),          # Minor eigenvalue (variance along minor axis -> "width")
-        height_map.max(),       # Total force proxy
+        height_map.max() if use_height_map else gray_inv.max(),       # Total force proxy
         1.0                  # Contact flag
     ], dtype=np.float32)
 

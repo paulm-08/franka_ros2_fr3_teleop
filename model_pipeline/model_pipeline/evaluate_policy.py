@@ -6,9 +6,13 @@ import logging, os, argparse, pickle, random
 from pathlib import Path
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import inquirer
+import yaml
+import pinocchio as pin
+import tempfile
 
-from model_pipeline.train import build_model, MLPPolicy, LSTMPolicy, GRUPolicy, TransformerPolicy  # Assuming train.py is in the same package
+from model_pipeline.train import build_model, MLPPolicy
 from model_pipeline import paths
+from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -31,81 +35,159 @@ def find_pkl_files(search_path):
     other_files = sorted([p for p in all_files if 'cleaned' not in str(p)])
     return [str(p) for p in cleaned_files + other_files]
 
-def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_stack_k, is_arm_only, num_arm_joints, device):
-    """Performs a plausible closed-loop rollout, compatible with all model types and arm_only mode."""
-    X_mean, X_std, y_mean, y_std = norm_stats
+def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_stack_k,
+                    is_arm_only, num_arm_joints, device, control_mode='joint_space'):
+    """
+    Closed-loop rollout that:
+      - uses ground-truth sensory channels each timestep (tactile, 3D-tactile, visual),
+      - uses model predictions to propagate proprioception (arm + optional hand),
+      - matches the dataset feature order: [24 tactile | 23 proprio(arm+hand) | 3D-tactile | visual].
+    Returns:
+      pred_np: (rollout_steps, proprio_dim) predicted absolute proprio values
+      gt_np:   (rollout_steps, proprio_dim) ground-truth absolute proprio values
+      metrics: dict with mse, mae, r2 (computed on arm-only or all proprio as requested)
+    """
+    model.eval()
+
+    # Unpack and ensure tensors on device
+    X_mean_t, X_std_t, y_mean_t, y_std_t = norm_stats
+    # Convert to tensors on device (they may already be tensors)
+    X_mean = torch.as_tensor(X_mean_t, dtype=torch.float32, device=device)
+    X_std  = torch.as_tensor(X_std_t, dtype=torch.float32, device=device)
+    y_mean = torch.as_tensor(y_mean_t, dtype=torch.float32, device=device)
+    y_std  = torch.as_tensor(y_std_t, dtype=torch.float32, device=device)
+
     joint_min, joint_max = joint_limits
 
-    # The full, un-sliced trajectory data
-    current_state_unstacked = torch.tensor(np.concatenate([trajectory['tactile_t'], trajectory['visual_t'], trajectory['joints_t']], axis=1), dtype=torch.float32, device=device)
-    goal_state_unstacked = torch.tensor(trajectory['goal_t'][0], dtype=torch.float32, device=device)
-    
-    joint_dim_full = trajectory['joints_t'].shape[1]
-    single_frame_dim_full = current_state_unstacked.shape[1]
-    JOINT_START_IDX_FULL = single_frame_dim_full - joint_dim_full
+    # Load trajectory arrays as tensors on device
+    state_t = torch.as_tensor(trajectory["state_t"], dtype=torch.float32, device=device)
+    goal_t  = torch.as_tensor(trajectory["goal_t"][0], dtype=torch.float32, device=device)  # single goal
+    # ground-truth proprio is inside state_t (we will slice it out for gt)
+    total_steps = state_t.shape[0]
+    state_dim = state_t.shape[1]
 
-    rollout_steps = min(horizon, len(current_state_unstacked) - frame_stack_k)
-    if rollout_steps <= 0: return None, None, None
-    
-    q_pred_history = current_state_unstacked[:frame_stack_k, JOINT_START_IDX_FULL:].clone()
-    predicted_q_trajectory = []
+    # default horizon handling
+    if horizon is None:
+        horizon = total_steps
 
-    is_sequence_model = not isinstance(model, MLPPolicy)
+    # constants per your spec
+    tactile_dim = 24
+    proprio_dim = 7 if is_arm_only else 23  # 7 arm + 16 hand
+    proprio_start = tactile_dim
+    proprio_end = proprio_start + proprio_dim
 
+    # Sanity check
+    if state_dim <= proprio_end:
+        raise RuntimeError(f"State vector too short ({state_dim}) to contain tactile+proprio ({proprio_end}).")
+
+    # Indices of sensory (non-proprio) features:
+    # sensory = [0 : tactile_dim] + [proprio_end : state_dim]  (this includes 3D tactile and visual)
+    sensory_idx_left = torch.arange(0, tactile_dim, device=device, dtype=torch.long)
+    sensory_idx_right = torch.arange(proprio_end, state_dim, device=device, dtype=torch.long)
+    sensory_indices = torch.cat([sensory_idx_left, sensory_idx_right], dim=0)
+
+    # Number of rollout steps we can produce (warm-start with K frames)
+    rollout_steps = min(horizon, total_steps - frame_stack_k)
+    if rollout_steps <= 0:
+        logging.warning("Rollout horizon too short — returning empty trajectory.")
+        return None, None, None
+
+    # --- Initialize q_pred_history with GT proprio from the first K frames (absolute values) ---
+    # q_pred_history shape: (K, proprio_dim)
+    q_pred_history = state_t[:frame_stack_k, proprio_start:proprio_end].clone()
+
+    predicted_q_trajectory = []  # will collect absolute predicted proprio per step
+
+    # Detect whether model expects sequence input or flattened MLP input
+    model_name = model.__class__.__name__.lower()
+    is_sequence_model = any(k in model_name for k in ['lstm', 'gru', 'transformer', 'rnn'])
+
+    # Main rollout loop
     for i in range(rollout_steps):
         t = i + frame_stack_k - 1
-        sensory_gt_stack = current_state_unstacked[t - frame_stack_k + 1 : t + 1, :JOINT_START_IDX_FULL]
-        
-        # --- PREPARE STATE (This logic must perfectly match train.py) ---
-        state_window = torch.cat([sensory_gt_stack, q_pred_history], dim=1)
-        goal_window = goal_state_unstacked.unsqueeze(0).repeat(frame_stack_k, 1)
-        full_state_sequence = torch.cat([state_window, goal_window], dim=1)
-        
-        # Apply normalization
+
+        # Build sensory stack: shape (K, sensory_dim)
+        sensory_stack = state_t[t - frame_stack_k + 1 : t + 1, sensory_indices]
+
+        # Build state_window by concatenating sensory_stack and q_pred_history
+        # sensory_stack: (K, sensory_dim)
+        # q_pred_history: (K, proprio_dim)
+        state_window = torch.cat([sensory_stack, q_pred_history], dim=1)  # (K, sensory_dim + proprio_dim) == (K, state_dim)
+
+        # Build goal window (repeat same goal K times). goal_t has shape (state_dim,)
+        goal_window = goal_t.unsqueeze(0).repeat(frame_stack_k, 1)  # (K, state_dim)
+
+        # Full state sequence: concat(state_window, goal_window) -> shape (K, 2*state_dim)
+        full_state_sequence = torch.cat([state_window, goal_window], dim=1)  # (K, 2*state_dim)
+
+        # --- Normalize exactly like training ---
+        # X_mean and X_std are expected to be 1D vectors of length D = 2*state_dim (state + goal).
         if is_sequence_model:
-            state_norm = (full_state_sequence - X_mean) / X_std
-            state_norm = state_norm.unsqueeze(0)
-        else: # MLP
-            state_norm = (full_state_sequence.flatten() - X_mean.repeat(frame_stack_k)) / X_std.repeat(frame_stack_k)
-            state_norm = state_norm.unsqueeze(0)
-        
-        with torch.no_grad():
-            action_norm = model(state_norm).squeeze(0)
-            delta_q_pred_arm = (action_norm * y_std) + y_mean # This will be 7-DOF if arm_only
-            
-        # Reconstruct full action if in arm_only mode
-        if is_arm_only:
-            hand_zeros = torch.zeros(joint_dim_full - num_arm_joints, device=device)
-            full_delta_q = torch.cat([delta_q_pred_arm, hand_zeros])
+            # full_state_sequence shape: (K, D)
+            # X_mean shape: (D,) -> broadcast to (K, D)
+            state_norm = (full_state_sequence - X_mean) / (X_std + 1e-8)
+            x_tensor = state_norm.unsqueeze(0)  # [B=1, T=K, D]
         else:
-            full_delta_q = delta_q_pred_arm
-            
-        q_pred_next = q_pred_history[-1] + full_delta_q
-        q_pred_next = torch.clamp(q_pred_next, min=joint_min, max=joint_max)
-        
-        predicted_q_trajectory.append(to_np(q_pred_next))
-        q_pred_history = torch.roll(q_pred_history, shifts=-1, dims=0); q_pred_history[-1] = q_pred_next
+            # flatten to (K*D,)
+            x_flat = full_state_sequence.flatten()
+            # X_mean.repeat(K) gives length K*D if X_mean has length D
+            x_mean_flat = X_mean.repeat(frame_stack_k)
+            x_std_flat  = X_std.repeat(frame_stack_k)
+            state_norm_flat = (x_flat - x_mean_flat) / (x_std_flat + 1e-8)
+            x_tensor = state_norm_flat.unsqueeze(0)  # [1, K*D]
 
-    pred_np = np.array(predicted_q_trajectory)
-    gt_np = to_np(current_state_unstacked[frame_stack_k : rollout_steps + frame_stack_k, JOINT_START_IDX_FULL:])
+        # --- Model forward (on device) ---
+        with torch.no_grad():
+            y_pred_norm = model(x_tensor).squeeze(0)  # shape: (action_dim,) or (proprio_dim,) depending on model
+            # denormalize
+            y_pred = (y_pred_norm * y_std) + y_mean  # all tensors on device
 
+        # y_pred may be longer than proprio_dim (e.g. full action -> arm+hand). We will take the first proprio_dim entries
+        # Ensure y_pred is same device and shape
+        y_pred = y_pred.cpu()
+        # slice to proprio length
+        delta_proprio = y_pred[:proprio_dim].numpy()  # numpy array length proprio_dim
+
+        # Reconstruct next absolute proprio (last predicted q + delta)
+        last_q = q_pred_history[-1].cpu().numpy()
+        q_next = last_q + delta_proprio  # numpy
+
+        # Clip using joint limits (joint_min/joint_max may be full-robot; slice first proprio_dim)
+        jm = joint_min.cpu().numpy()[:proprio_dim]
+        jM = joint_max.cpu().numpy()[:proprio_dim]
+        q_next = np.minimum(np.maximum(q_next, jm), jM)
+
+        predicted_q_trajectory.append(q_next.astype(np.float32))
+
+        # roll q_pred_history and insert q_next (as tensor)
+        q_next_tensor = torch.as_tensor(q_next, dtype=torch.float32, device=device)
+        q_pred_history = torch.roll(q_pred_history, shifts=-1, dims=0)
+        q_pred_history[-1] = q_next_tensor
+
+    # Convert predicted trajectory to numpy (shape: rollout_steps x proprio_dim)
+    pred_np = np.array(predicted_q_trajectory)  # absolute proprio predictions
+
+    # Ground-truth absolute proprio for the same timesteps:
+    # The GT proprio frames we compare to are taken from state_t starting at index frame_stack_k
+    gt_proprio_all = state_t[frame_stack_k : frame_stack_k + rollout_steps, proprio_start:proprio_end].cpu().numpy()
+
+    gt_np = gt_proprio_all
+
+    # Build metrics: if arm-only, compute only first num_arm_joints columns
     if is_arm_only:
-        # If in arm-only mode, slice both trajectories down to just the arm joints for scoring
         gt_for_metrics = gt_np[:, :num_arm_joints]
         pred_for_metrics = pred_np[:, :num_arm_joints]
-        logging.info(f"  (Calculating metrics on the first {num_arm_joints} arm joints only)")
+        logging.info(f"  (Metrics on {num_arm_joints}-DOF arm only)")
     else:
-        # If controlling the whole body, use all joints for scoring
         gt_for_metrics = gt_np
         pred_for_metrics = pred_np
 
     metrics = {
-        'mse': mean_squared_error(gt_for_metrics, pred_for_metrics),
-        'mae': mean_absolute_error(gt_for_metrics, pred_for_metrics),
-        'r2': r2_score(gt_for_metrics, pred_for_metrics)
+        "mse": mean_squared_error(gt_for_metrics, pred_for_metrics),
+        "mae": mean_absolute_error(gt_for_metrics, pred_for_metrics),
+        "r2": r2_score(gt_for_metrics, pred_for_metrics),
     }
-    
-    # We still return the full 23-DOF trajectories for comprehensive plotting
+
     return pred_np, gt_np, metrics
 
 def main():
@@ -163,15 +245,25 @@ def main():
         dataset_path = paths.WORKSPACE_ROOT / final_args.dataset_pkl
         
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        control_mode = checkpoint.get("control_mode","joint_space")
         frame_stack_k = checkpoint.get("frame_stack", 1)
         model_type = checkpoint["model_type"]
         is_arm_only = checkpoint.get("arm_only", False)
         num_arm_joints = checkpoint.get("num_arm_joints", checkpoint["output_dim"])
+        num_arm_joints_action = checkpoint["output_dim"] - 16 if is_arm_only else checkpoint["output_dim"]
+        validation = checkpoint.get("validation", False)
+        if "training_config" not in checkpoint:
+            logging.error("Model checkpoint does not contain a config. Using default config.")
+            config_path_abs = paths.WORKSPACE_ROOT / "config/config.yaml"
+            with open(config_path_abs, 'r') as f:
+                config = yaml.safe_load(f)
+        else:
+            config = checkpoint["training_config"]
         
-        # --- THE CRITICAL FIX: Read hyperparameters from the checkpoint ---
+        # --- Read hyperparameters from the checkpoint ---
         model_hyperparams = checkpoint.get("model_hyperparams", {})
         logging.info(f"Loaded model hyperparameters: {model_hyperparams}")
-        logging.info(f"Model was trained with K={frame_stack_k}, type='{model_type}'. Evaluating accordingly.")
+        logging.info(f"Model was trained in {control_mode}, with K={frame_stack_k}, type='{model_type}' and {'no' if validation else ''}validation loss. Evaluating accordingly.")
         if is_arm_only:
             logging.info(f"Evaluating an ARM-ONLY model with {num_arm_joints} joints.")
 
@@ -202,20 +294,59 @@ def main():
         
         logging.info(f"Loaded model and normalization stats from: {final_args.model}")
 
+        solver=None
+        if control_mode=='task_space':
+            # --- Initialize KinematicsSolver for task-space rollouts ---
+            urdf_content = get_urdf_string_from_xacro()
+            if not urdf_content: 
+                logging.error("Failed to generate URDF, cannot proceed."); return
+
+            urdf_temp_file = None
+            try:
+                # 2b. Save to a temporary file for Pinocchio to load
+                # This creates a file with a unique name in the system's temp directory
+                with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.urdf', encoding='utf-8') as f:
+                    f.write(urdf_content)
+                    urdf_temp_file = Path(f.name)
+            
+                kinematics_config = config.get("kinematics", {})
+                solver = KinematicsSolver(
+                    urdf_content=urdf_temp_file,
+                    end_effector_frame_name=kinematics_config.get("ee_frame", "fr3_hand_tcp"),
+                    tactile_frame_names=kinematics_config.get("tactile_frames", []),
+                    visualize=False,
+                )
+            except Exception as e:
+                logging.error(f"Error initializing KinematicsSolver: {e}")
+                return
+            finally:
+                # Clean up the temporary URDF file
+                if urdf_temp_file and urdf_temp_file.exists():
+                    urdf_temp_file.unlink()
+
+        # --- Load trajectories
         with open(dataset_path, "rb") as f: all_trajectories = pickle.load(f)
         random.seed(final_args.seed); random.shuffle(all_trajectories)
-        split_index = int(len(all_trajectories) * final_args.split_ratio)
-        val_trajectories = all_trajectories[split_index:]
+
+        if validation:
+            split_index = int(len(all_trajectories) * final_args.split_ratio)
+            val_trajectories = all_trajectories[split_index:]
+        else:
+            # Random or all trajectories
+            val_trajectories = all_trajectories
 
         # --- NEW: Slice the validation data if it's an arm-only model ---
         if is_arm_only:
             for traj in val_trajectories:
                 # traj['joints_t'] = traj['joints_t'][:, :num_arm_joints]
-                traj['delta_q'] = traj['delta_q'][:, :num_arm_joints]
+                if control_mode == "joint_space":
+                    traj['action_t'] = traj['action_t'][:, :num_arm_joints]
                 # if 'goal_t' in traj:
                 #     # Reconstruct the correct sliced goal dimension
                 #     goal_state_dim = traj['tactile_t'].shape[1] + traj['visual_t'].shape[1] + num_arm_joints
                 #     traj['goal_t'] = traj['goal_t'][:, :goal_state_dim]
+                else:
+                    traj['action_t'] = traj['action_t'][:, :6]
 
         output_dir = paths.MODELS_DIR / "debug"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -227,71 +358,109 @@ def main():
             all_metrics, all_preds, all_gts = [], [], []
             rollout_plot_dir = output_dir / "rollouts"
             rollout_plot_dir.mkdir(exist_ok=True)
-            logging.info(f"Starting per-trajectory closed-loop rollout evaluation...")
+            logging.info("Starting per-trajectory closed-loop rollout evaluation...")
 
-            # joint_limits = (torch.full((joint_dim,), -2*np.pi, device=device), torch.full((joint_dim,), 2*np.pi, device=device))
-            # Joint limits must always match the FULL robot's dimensionality (23),
-            # not the model's output dimensionality (7).
-            FULL_ROBOT_JOINT_DIM = 23 # Use a constant for clarity
+            FULL_ROBOT_JOINT_DIM = 23
             joint_limits = (
                 torch.full((FULL_ROBOT_JOINT_DIM,), -2*np.pi, device=device),
-                torch.full((FULL_ROBOT_JOINT_DIM,), 2*np.pi, device=device)
+                torch.full((FULL_ROBOT_JOINT_DIM,),  2*np.pi, device=device)
             )
 
-            for i, trajectory in enumerate(val_trajectories):
-                pred_np, gt_np, metrics = perform_rollout(model, trajectory, final_args.horizon, norm_stats, joint_limits, frame_stack_k, is_arm_only, num_arm_joints, device)
-                all_metrics.append(metrics); all_preds.append(pred_np); all_gts.append(gt_np)
+            num_arm_joints = 7
+            num_arm_task_dof = 6
+            num_hand_joints = 16
+
+            # ----- determine DOFs to plot -----
+            if control_mode == "joint_space":
+                arm_dim = num_arm_joints
+                arm_label = "Joint Angle (rad)"
+                arm_names = [f"Joint {i+1}" for i in range(arm_dim)]
+            else:
+                arm_dim = num_arm_task_dof
+                arm_label = "Task Δ (m / rad)"
+                arm_names = ["Δx","Δy","Δz","Δroll","Δpitch","Δyaw"]
+
+            for i, traj in enumerate(val_trajectories):
+                pred_np, gt_np, metrics = perform_rollout(
+                    model=model,
+                    trajectory=traj,
+                    horizon=None,
+                    norm_stats=norm_stats,
+                    joint_limits=joint_limits,
+                    frame_stack_k=frame_stack_k,
+                    is_arm_only=is_arm_only,
+                    num_arm_joints=7,
+                    device=device,
+                    control_mode=config.get("control_mode", "joint_space"),
+                )
+                all_metrics.append(metrics)
+                all_preds.append(pred_np)
+                all_gts.append(gt_np)
                 logging.info(f"  Trajectory {i+1}/{len(val_trajectories)} | R²={metrics['r2']:.4f}")
 
-                # Plot individual arm trajectories
-                fig_arm, ax_arm = plt.subplots(figsize=(12, 6))
-                num_arm_joints = min(7, joint_dim)
-                for j in range(num_arm_joints):
-                    ax_arm.plot(gt_np[:, j], color=f'C{j}', linestyle='--', label=f'GT Joint {j}')
-                    ax_arm.plot(pred_np[:, j], color=f'C{j}', label=f'Pred Joint {j}')
-                ax_arm.set_title(f'Rollout vs. GT - Arm Joints (Trajectory {i+1})')
-                ax_arm.set_xlabel('Timestep'); ax_arm.set_ylabel('Joint Angle (rad)')
-                ax_arm.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0)); ax_arm.grid(True, linestyle='--')
-                plt.tight_layout(); plt.savefig(rollout_plot_dir / f"rollout_traj_{i+1}_arm.png"); plt.close(fig_arm)
-                logging.info(f"    - Individual arm trajectory plot saved.")
+                if i >= 10:       # only plot first 10
+                    continue
 
-                if joint_dim > num_arm_joints:
-                    fig_hand, ax_hand = plt.subplots(figsize=(12, 6))
-                    for j in range(num_arm_joints, joint_dim):
-                        # Use a color cycle that restarts for clarity
-                        color_idx = j - num_arm_joints
-                        ax_hand.plot(gt_np[:, j], color=f'C{color_idx}', linestyle='--', label=f'GT Joint {j}')
-                        ax_hand.plot(pred_np[:, j], color=f'C{color_idx}', label=f'Pred Joint {j}')
-                    ax_hand.set_title(f'Rollout vs. GT - Hand Joints (Trajectory {i+1})')
-                    ax_hand.set_xlabel('Timestep'); ax_hand.set_ylabel('Joint Angle (rad)')
-                    ax_hand.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0)); ax_hand.grid(True, linestyle='--')
-                    plt.tight_layout(); plt.savefig(rollout_plot_dir / f"rollout_traj_{i+1}_hand.png"); plt.close(fig_hand)
-                    logging.info(f"    - Individual hand trajectory plot saved.")
-                
+                # ---------- Arm ----------
+                fig, ax = plt.subplots(figsize=(12,6))
+                for j in range(arm_dim):
+                    c = f"C{j%10}"
+                    ax.plot(gt_np[:, j], c=c, ls='--', label=f"GT {arm_names[j]}")
+                    ax.plot(pred_np[:, j], c=c, label=f"Pred {arm_names[j]}")
+                ax.set(title=f"Rollout vs GT – Arm DOFs (Traj {i+1})",
+                    xlabel="Timestep", ylabel=arm_label)
+                ax.legend(loc="upper right", bbox_to_anchor=(1.15,1))
+                ax.grid(ls='--')
+                plt.tight_layout()
+                plt.savefig(rollout_plot_dir/f"rollout_traj_{i+1}_arm.png")
+                plt.close(fig)
+
+                # ---------- Hand ----------
+                if not is_arm_only and gt_np.shape[1] > arm_dim:
+                    fig, ax = plt.subplots(figsize=(12,6))
+                    hand_start = arm_dim
+                    hand_to_plot = [0,3,7,11,15]   # sample subset
+                    for k,hj in enumerate(hand_to_plot):
+                        idx = hand_start + hj
+                        if idx >= gt_np.shape[1]: break
+                        c = f"C{k%10}"
+                        ax.plot(gt_np[:,idx], c=c, ls='--', label=f"GT Hand J{hj+1}")
+                        ax.plot(pred_np[:,idx], c=c, label=f"Pred Hand J{hj+1}")
+                    ax.set(title=f"Rollout vs GT – Hand DOFs (Traj {i+1})",
+                        xlabel="Timestep", ylabel="Joint Angle (rad)")
+                    ax.legend(loc="upper right", bbox_to_anchor=(1.15,1))
+                    ax.grid(ls='--')
+                    plt.tight_layout()
+                    plt.savefig(rollout_plot_dir/f"rollout_traj_{i+1}_hand.png")
+                    plt.close(fig)
+
+            # ---------- Aggregate ----------
             if all_preds:
-                # Plot drift over time
-                drift_per_step = np.sqrt(np.mean((all_preds[0] - all_gts[0]) ** 2, axis=1))
-                plt.figure(figsize=(10, 5))
-                plt.plot(drift_per_step)
-                plt.xlabel("Timestep in Rollout"); plt.ylabel("Root Mean Square Error (RMSE)")
-                plt.title("Prediction Drift Over Time (Sample Trajectory 1)"); plt.grid(True)
-                plt.savefig(output_dir / "rollout_drift_over_time.png"); plt.close()
+                drift = np.sqrt(np.mean((all_preds[0]-all_gts[0])**2, axis=1))
+                plt.figure(figsize=(10,5))
+                plt.plot(drift)
+                plt.xlabel("Timestep"); plt.ylabel("RMSE")
+                plt.title("Prediction Drift Over Time (Traj 1)")
+                plt.grid(True)
+                plt.savefig(output_dir/"rollout_drift_over_time.png")
+                plt.close()
 
-                # Plot per-joint error
-                all_preds_np = np.concatenate(all_preds, axis=0)
-                all_gts_np = np.concatenate(all_gts, axis=0)
-                per_joint_error = np.sqrt(np.mean((all_preds_np - all_gts_np) ** 2, axis=0))
-                plt.figure(figsize=(12, 6))
-                plt.bar(np.arange(len(per_joint_error)), per_joint_error)
-                plt.xlabel("Joint Index"); plt.ylabel("Overall RMSE")
-                plt.title("Per-Joint Rollout Error (Averaged Across All Validation Rollouts)"); plt.grid(True)
-                plt.savefig(output_dir / "rollout_per_joint_error.png"); plt.close()
-                logging.info(f"Aggregate rollout plots saved in: {output_dir}")
+                all_pred = np.concatenate(all_preds)
+                all_gt   = np.concatenate(all_gts)
+                rmse_per_dof = np.sqrt(np.mean((all_pred-all_gt)**2, axis=0))
+                plt.figure(figsize=(12,6))
+                plt.bar(np.arange(len(rmse_per_dof)), rmse_per_dof)
+                plt.xlabel("DOF Index"); plt.ylabel("Overall RMSE")
+                plt.title("Per-DOF Rollout Error (All Validation Rollouts)")
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(output_dir/"rollout_per_dof_error.png")
+                plt.close()
 
-            avg_metrics = {key: np.mean([m[key] for m in all_metrics]) for key in all_metrics[0]}
-            logging.info("\n" + "="*50 + "\n          📊 AVERAGE ROLLOUT METRICS 📊\n" + "="*50)
-            logging.info(f"Average MSE: {avg_metrics['mse']:.6f}\nAverage MAE: {avg_metrics['mae']:.6f}\nAverage R² : {avg_metrics['r2']:.4f}")
-            logging.info(f"Individual trajectory plots saved in: {rollout_plot_dir}")
+            avg = {k: np.mean([m[k] for m in all_metrics]) for k in all_metrics[0]}
+            logging.info("\n"+"="*50+"\n       📊 AVERAGE ROLLOUT METRICS 📊\n"+"="*50)
+            logging.info(f"Avg MSE: {avg['mse']:.6f}\nAvg MAE: {avg['mae']:.6f}\nAvg R² : {avg['r2']:.4f}")
+            logging.info(f"Plots saved in {rollout_plot_dir}")
 
         else:
             # --- ONE-STEP MODE ---
@@ -302,9 +471,9 @@ def main():
             X_val_list, y_val_list = [], []
             for traj in val_trajectories:
                 X_unstacked = np.concatenate([
-                    traj['tactile_t'], traj['visual_t'], traj['joints_t'], traj['goal_t']
+                    traj['state_t'], traj['goal_t']
                 ], axis=1)
-                y_unstacked = traj['delta_q']
+                y_unstacked = traj['action_t']
                 if len(X_unstacked) < frame_stack_k: continue
                 
                 for i in range(frame_stack_k - 1, len(X_unstacked)):
@@ -323,44 +492,94 @@ def main():
                 else: # Sequence models
                     X_val_norm = (X_val_raw - X_mean) / X_std
                 pred_norm = model(X_val_norm)
-                delta_q_pred = (pred_norm * y_std) + y_mean
+                action_pred = (pred_norm * y_std) + y_mean
             
-            delta_q_pred_np = to_np(delta_q_pred)
-            delta_q_true_np = to_np(y_val_true)
+            action_pred_np = to_np(action_pred)
+            action_true_np = to_np(y_val_true)
             
-            metrics = {'mse': mean_squared_error(delta_q_true_np, delta_q_pred_np), 
-                       'mae': mean_absolute_error(delta_q_true_np, delta_q_pred_np), 
-                       'r2': r2_score(delta_q_true_np, delta_q_pred_np)}
+            metrics = {'mse': mean_squared_error(action_true_np, action_pred_np), 
+                       'mae': mean_absolute_error(action_true_np, action_pred_np), 
+                       'r2': r2_score(action_true_np, action_pred_np)}
 
-            logging.info("\n" + "="*50 + "\n          📊 ONE-STEP (delta_q) METRICS 📊\n" + "="*50)
+            logging.info("\n" + "="*50 + "\n          📊 ONE-STEP (action) METRICS 📊\n" + "="*50)
             logging.info(f"MSE: {metrics['mse']:.6f}\nMAE: {metrics['mae']:.6f}\nR² : {metrics['r2']:.4f}")
             
-            # --- Plotting ---
-            joints_to_plot = {'Arm Base': 0, 'Arm Elbow': 4, 'Arm Wrist': 6, 'Hand Finger': 20}
-            fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-            fig.suptitle('One-Step Action Prediction (Δq) vs. Ground Truth', fontsize=16)
-            axes = axes.flatten()
+            # --- Plotting: Adaptive to control mode and arm_only flag ---
+        num_arm_joints = 7        # Franka arm
+        num_arm_task_dof = 6      # (x, y, z, roll, pitch, yaw)
+        num_hand_joints = 16
 
-            for i, (name, joint_idx) in enumerate(joints_to_plot.items()):
-                if joint_idx >= joint_dim: continue
-                ax = axes[i]
-                ax.scatter(delta_q_true_np[:, joint_idx], delta_q_pred_np[:, joint_idx], alpha=0.1)
-                mn, mx = delta_q_true_np[:, joint_idx].min(), delta_q_true_np[:, joint_idx].max()
-                ax.plot([mn, mx], [mn, mx], "r--", label='Perfect Prediction')
-                ax.set_title(f'Joint {joint_idx} ({name})')
-                ax.set_xlabel('Ground Truth Action (Δq)'); ax.set_ylabel('Predicted Action (Δq)')
-                ax.grid(True); ax.legend()
+        if control_mode == "joint_space":
+            arm_dim = num_arm_joints
+            arm_label = "Δq (rad)"
+            arm_names = [f"Joint {i+1}" for i in range(arm_dim)]
+        else:
+            arm_dim = num_arm_task_dof
+            arm_label = "Δx (m / rad)"
+            arm_names = ["Δx", "Δy", "Δz", "Δroll", "Δpitch", "Δyaw"]
 
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-            plt.savefig(output_dir / "onestep_eval_scatter_multi.png"); plt.close()
+        # --- Build list of plotted DOFs ---
+        plot_indices = []
+        plot_names = []
 
-            errors = delta_q_pred_np - delta_q_true_np
-            plt.figure(figsize=(10, 5)); plt.hist(errors.flatten(), bins=100)
-            plt.xlabel("Action Prediction Error (Δq, in rad)"); plt.ylabel("Frequency"); plt.title("One-Step Prediction Error Distribution")
-            plt.grid(True); plt.tight_layout()
-            plt.savefig(output_dir / "onestep_eval_error_hist.png"); plt.close()
-            
-            logging.info(f"Evaluation plots saved in: {output_dir}")
+        # → Always plot all arm DOFs
+        for i in range(arm_dim):
+            plot_indices.append(i)
+            plot_names.append(arm_names[i])
+
+        # → If not arm-only, plot a few representative hand joints
+        if not is_arm_only:
+            hand_start = arm_dim
+            hand_to_plot = [0, 3, 7, 11, 15]  # sample of 5 joints
+            for hj in hand_to_plot:
+                if hand_start + hj < action_true_np.shape[1]:
+                    plot_indices.append(hand_start + hj)
+                    plot_names.append(f"Hand J{hj+1}")
+
+        # --- Dynamic grid layout ---
+        num_plots = len(plot_indices)
+        ncols = 3 if num_plots > 3 else num_plots
+        nrows = int(np.ceil(num_plots / ncols))
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows))
+        axes = np.array(axes).flatten()
+        fig.suptitle("One-Step Action Prediction vs. Ground Truth", fontsize=16)
+
+        # --- Scatter plots per DOF ---
+        for i, (name, idx) in enumerate(zip(plot_names, plot_indices)):
+            ax = axes[i]
+            if idx >= action_true_np.shape[1]:
+                continue
+            ax.scatter(action_true_np[:, idx], action_pred_np[:, idx], alpha=0.15, s=10)
+            mn, mx = np.min(action_true_np[:, idx]), np.max(action_true_np[:, idx])
+            ax.plot([mn, mx], [mn, mx], "r--", linewidth=1, label="Perfect Prediction")
+            ax.set_title(name)
+            ax.set_xlabel(f"Ground Truth ({arm_label})")
+            ax.set_ylabel(f"Predicted ({arm_label})")
+            ax.grid(True)
+            ax.legend()
+
+        # Hide unused subplots (if any)
+        for j in range(i + 1, len(axes)):
+            axes[j].axis("off")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(output_dir / "onestep_eval_scatter_all.png")
+        plt.close()
+
+        # --- Error histogram ---
+        errors = action_pred_np - action_true_np
+        plt.figure(figsize=(10, 5))
+        plt.hist(errors.flatten(), bins=100, color="steelblue", alpha=0.8)
+        plt.xlabel(f"Action Prediction Error ({arm_label})")
+        plt.ylabel("Frequency")
+        plt.title("One-Step Prediction Error Distribution")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(output_dir / "onestep_eval_error_hist.png")
+        plt.close()
+
+        logging.info(f"Evaluation plots saved in: {output_dir}")
 
     except (KeyboardInterrupt, TypeError, RuntimeError) as e:
         logging.error(f"❌ An error occurred during evaluation: {e}", exc_info=True)
