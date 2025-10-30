@@ -14,10 +14,14 @@ from rclpy.executors import MultiThreadedExecutor
 import asyncio
 import threading
 from std_msgs.msg import Float64MultiArray
+import pinocchio as pin
+import tempfile
 
 # ROS 2 message types
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import PoseStamped # For task-space control
 from builtin_interfaces.msg import Duration
 
 # Direct Hardware API Imports (from your recorder)
@@ -28,9 +32,13 @@ import dex_retargeting.leap_hand_utils.leap_hand_utils as lhu
 
 # Your ML Pipeline Imports
 from model_pipeline.train import build_model, MLPPolicy
+from model_pipeline.dataset_builder import VisionProcessor, SENSOR_ORDER
 from model_pipeline.tactile_features import process_tactile_image
-from model_pipeline.keypoint_extractor import KeypointExtractor
-from model_pipeline.visual_embedder import VisualEmbedder
+# from model_pipeline.keypoint_extractor import KeypointExtractor
+# from model_pipeline.visual_embedder import VisualEmbedder
+from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
+from model_pipeline.evaluate_policy import to_np
+# from model_pipeline.utils import get_cfg_path, init_sensor
 
 from model_pipeline import paths
 
@@ -56,7 +64,10 @@ class PolicyRolloutNode(Node):
 
         # --- Load Model, Config, and Goal from provided paths ---
         with open(paths.DEFAULT_CONFIG_PATH, 'r') as f:
-            self.config = yaml.safe_load(f)
+            self.config = yaml.safe_load(f)            
+
+        self.control_mode = self.config.get('control_mode', {})
+        self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
 
         model_path_str = self.get_parameter('model_path').get_parameter_value().string_value
         goal_path_str = self.get_parameter('goal_state_path').get_parameter_value().string_value
@@ -108,11 +119,15 @@ class PolicyRolloutNode(Node):
         self.vision_processor = self.initialize_vision_processor()
         self.tactile_sensors = self.initialize_tactile_sensors()
         self.realsense = self.initialize_realsense()
+        self.solver = self.initialize_kinematics_solver()
         
         # --- ROS 2 Interfaces ---
         self.joint_state_sub = self.create_subscription(JointState, '/franka/joint_states', self.joint_state_callback, 10)
-        self.arm_command_pub = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
-        
+        if self.control_mode == "joint_space":
+            self.arm_command_pub = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
+        else:
+            self.arm_command_pub = self.create_publisher(PoseStamped, '/target_pose', 10)
+
         # --- LEAP Hand Service Client ---
         self.leap_position_client = self.create_client(LeapPosition, '/leap_position')
         self.hand_command_pub = self.create_publisher(Float64MultiArray, '/leap_hand/target_allegro_pose', 10)
@@ -126,17 +141,34 @@ class PolicyRolloutNode(Node):
         self.current_arm_states = None
         self.full_joint_names = None
         self.history_buffer = []
-        self.last_known_positions = {'cam1': np.full(self.vision_processor.feature_dim_per_object, -1.0, dtype=np.float32),
-                                     'cam2': np.full(self.vision_processor.feature_dim_per_object, -1.0, dtype=np.float32)}
+
+        # --- Stateful Tracking for Keypoints ---
+        # We now store the last known *position* vector separately from the *full feature* vector.
+        # The (x,y,z) or (u,v) part of the feature.
+        self.coord_dim = 3 if self.config.get('state', {}).get('use_3d_keypoints', False) else 2
+
+        # --- Get dimensions from the initialized vision_processor ---
+        # These are crucial for correctly parsing the feature vector
+        self.kp_raw_dim = self.vision_processor.extractor1.output_dim  # e.g., 10 (5 per object)
+        self.kp_engineered_dim = self.coord_dim
+        self.kp_total_dim = self.kp_raw_dim + self.kp_engineered_dim # e.g., 13
+        
+        self.single_cam_dim = self.vision_processor.single_cam_dim # e.g., 61
+
+        # Store the last known [x,y,z] or [u,v]
+        self.last_known_coords = {
+            'cam1_tube': np.zeros(self.coord_dim, dtype=np.float32),
+            'cam1_peg':  np.zeros(self.coord_dim, dtype=np.float32),
+            'cam2_tube': np.zeros(self.coord_dim, dtype=np.float32),
+            'cam2_peg':  np.zeros(self.coord_dim, dtype=np.float32)
+        }
 
         self.control_rate = self.get_parameter('control_rate_hz').get_parameter_value().double_value
         self.sample_period = 1.0 / self.control_rate
 
         logging.info("Commanding a slow, interpolated grasp...")
-        with open(paths.DEFAULT_CONFIG_PATH, 'r') as f:
-            config = yaml.safe_load(f).get('robot_setup', {})
-        start_pose_arm = config.get('start_pose_arm')
-        hand_grasp_pose = config.get('hand_grasp_pose')
+        start_pose_arm = self.config.get('robot_setup', {}).get('start_pose_arm')
+        hand_grasp_pose = self.config.get('robot_setup', {}).get('hand_grasp_pose')
 
         open_hand_pose = lhu.allegro_to_LEAPhand([0.0]*16, zeros=False)
         # Define grasp parameters
@@ -162,52 +194,55 @@ class PolicyRolloutNode(Node):
             time.sleep(grasp_duration / num_steps)
         
         logging.info("Grasp complete.")
-        time.sleep(1) # A final short pause after grasping
+        time.sleep(5) # A final short pause after grasping
         
         self.get_logger().info(f"✅ Policy rollout node initialized. Running at {self.control_rate} Hz.")
 
     def initialize_vision_processor(self):
-        vision_config = self.config.get("vision", {})
         data_dirs = [str(paths.RAW_DATA_DIR)] # For depth range calculation
+        return VisionProcessor(self.config, self.device, data_dirs)
+    
+        # vision_config = self.config.get("vision", {})
+        # state_config = self.config.get("state", {})
 
-        if vision_config.get("use_keypoint_extractor", False):
-            logging.info("Initializing KeypointExtractor (YOLO) for visual features.")
-            vision_module = KeypointExtractor(
-                model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
-                confidence_threshold=vision_config.get("confidence_threshold", 0.1),
-                use_3d=vision_config.get("use_3d", False),
-                intrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("intrinsics_path_cam1")),
-                extrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("extrinsics_path_cam1")),
-                device=self.device
-            )
-            vision_module.is_keypoint_extractor = True
-            return vision_module
+        # if state_config.get("use_keypoint_extractor", False):
+        #     logging.info("Initializing KeypointExtractor (YOLO) for visual features.")
+        #     vision_module = KeypointExtractor(
+        #         model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
+        #         confidence_threshold=vision_config.get("confidence_threshold", 0.1),
+        #         use_3d=vision_config.get("use_3d", False),
+        #         intrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("intrinsics_path_cam1")),
+        #         extrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("extrinsics_path_cam1")),
+        #         device=self.device
+        #     )
+        #     vision_module.is_keypoint_extractor = True
+        #     return vision_module
         
-        else: # Default to VisualEmbedder
-            logging.info("Initializing VisualEmbedder (ResNet) for visual features.")
-            global_depth_range = self.config.get("global_depth_range")
-            if not global_depth_range:
-                logging.warning("Global depth range not found, using default.")
-                global_depth_range = (0, 1000)
+        # if state_config.get("use_embeddings", False): # Default to VisualEmbedder
+        #     logging.info("Initializing VisualEmbedder (ResNet) for visual features.")
+        #     global_depth_range = self.config.get("global_depth_range")
+        #     if not global_depth_range:
+        #         logging.warning("Global depth range not found, using default.")
+        #         global_depth_range = (0, 1000)
 
-            class ResNetWrapper:
-                def __init__(self, config, device, depth_range):
-                    self.embedder = VisualEmbedder(
-                        backbone=config.get("backbone", "resnet18"), device=device,
-                        out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
-                        global_depth_range=depth_range
-                    )
-                    self.is_keypoint_extractor = False
-                    self.feature_dim_per_object = self.embedder.out_dim['rgb'] + self.embedder.out_dim['depth']
+        #     class ResNetWrapper:
+        #         def __init__(self, config, device, depth_range):
+        #             self.embedder = VisualEmbedder(
+        #                 backbone=config.get("backbone", "resnet18"), device=device,
+        #                 out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
+        #                 global_depth_range=depth_range
+        #             )
+        #             self.is_keypoint_extractor = False
+        #             self.feature_dim_per_object = self.embedder.out_dim['rgb'] + self.embedder.out_dim['depth']
                 
-                def extract_scene_features(self, color_img, depth_img):
-                    if color_img is None: return np.zeros(self.feature_dim_per_object, dtype=np.float32)
-                    rgb_emb = self.embedder.embed_rgb(color_img)
-                    depth_emb = self.embedder.embed_depth(depth_img)
-                    if rgb_emb is None or depth_emb is None: return np.zeros(self.feature_dim_per_object, dtype=np.float32)
-                    return np.concatenate([rgb_emb, depth_emb])
+        #         def extract_scene_features(self, color_img, depth_img):
+        #             if color_img is None: return np.zeros(self.feature_dim_per_object, dtype=np.float32)
+        #             rgb_emb = self.embedder.embed_rgb(color_img)
+        #             depth_emb = self.embedder.embed_depth(depth_img)
+        #             if rgb_emb is None or depth_emb is None: return np.zeros(self.feature_dim_per_object, dtype=np.float32)
+        #             return np.concatenate([rgb_emb, depth_emb])
             
-            return ResNetWrapper(self.config, self.device, global_depth_range)
+        #     return ResNetWrapper(self.config, self.device, global_depth_range)
 
     def initialize_tactile_sensors(self):
         self.get_logger().info("Initializing 9DTact sensors...")
@@ -290,6 +325,35 @@ class PolicyRolloutNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to get live observations: {e}")
             return None
+    
+    def initialize_kinematics_solver(self):
+        urdf_content = get_urdf_string_from_xacro()
+        if not urdf_content: 
+            logging.error("Failed to generate URDF, cannot proceed."); return
+
+        urdf_temp_file = None
+        try:
+            # 2b. Save to a temporary file for Pinocchio to load
+            # This creates a file with a unique name in the system's temp directory
+            with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.urdf', encoding='utf-8') as f:
+                f.write(urdf_content)
+                urdf_temp_file = Path(f.name)
+        
+            kinematics_config = self.config.get("kinematics", {})
+            self.solver = KinematicsSolver(
+                urdf_content=urdf_temp_file,
+                end_effector_frame_name=kinematics_config.get("ee_frame", "fr3_hand_tcp"),
+                tactile_frame_names=kinematics_config.get("tactile_frames", []),
+                visualize=False,
+            )
+        except Exception as e:
+            logging.error(f"Error initializing KinematicsSolver: {e}")
+            return
+        finally:
+            # Clean up the temporary URDF file
+            if urdf_temp_file and urdf_temp_file.exists():
+                urdf_temp_file.unlink()
+
         
     def joint_state_callback(self, msg: JointState):
         """Callback for the Franka arm's joint states ONLY."""
@@ -318,7 +382,7 @@ class PolicyRolloutNode(Node):
             return None
                         
     def control_loop(self):
-        """FIX: A regular, synchronous callback function."""
+        """A regular, synchronous callback function."""
         self.get_logger().info("Waiting for initial arm states...")
         while rclpy.ok() and self.current_arm_states is None:
             time.sleep(0.1)
@@ -328,7 +392,7 @@ class PolicyRolloutNode(Node):
         while rclpy.ok():
             time_start = time.perf_counter()
             
-            # --- Main Logic ---
+            # --- 1. SENSE ---
             obs = self.get_live_observations()
             if obs is None: 
                 time.sleep(self.sample_period)
@@ -339,59 +403,100 @@ class PolicyRolloutNode(Node):
                 time.sleep(self.sample_period)
                 continue
             
-            self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])        # 2. PREPARE STATE: Process sensor data into a feature vector
+            self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])
+
+            # --- 2. PREPARE STATE (Mirrors dataset_builder.py) ---
+            state_vector_list = []
+
+            # 2.1 Tactile Features
             tactile_feats = np.concatenate([
                 process_tactile_image(
                     img=obs['tactile_images'][name],
                     use_height_map=True,
                     sensor=self.tactile_sensors[name],
-                    ref_img=self.tactile_sensors[name].ref  # <-- The fix
+                    ref_img=self.tactile_sensors[name].ref
                 )[0] for name in SENSOR_ORDER
             ])            
+            state_vector_list.append(tactile_feats)
 
-            # --- Process each camera's data stream ---
-            raw_cam1_feats = self.vision_processor.extract_scene_features(obs['color1'], obs['depth1'])
-            raw_cam2_feats = self.vision_processor.extract_scene_features(obs['color2'], obs['depth2'])
+            # 2.2 Proprioceptive Features
+            if self.control_mode == 'task_space':
+                kinematic_poses = self.solver.get_all_poses(self.current_arm_states, leap_positions)
+                state_vector_list.append(kinematic_poses['ee']) # 7D EE Pose
+            else: # joint_space
+                state_vector_list.append(self.current_arm_states) # 7D Arm Joints
             
-            # --- THE CRITICAL FIX: Replicate the Feature Engineering ---
-            def get_engineered_features(raw_kps):
-                # This function MUST be identical to the one in dataset_builder
-                if raw_kps is None or np.all(raw_kps == 0):
-                    # If detection fails, return a zero vector of the correct final size (10)
-                    return np.zeros(self.vision_processor.output_dim + 2, dtype=np.float32)
+            state_vector_list.append(leap_positions) # 16D Hand Joints
 
-                tube_kp = raw_kps[0:4] # u, v, conf, flag
-                peg_kp = raw_kps[4:8]
+            # 2.3 3D Tactile Poses
+            if self.config.get('state', {}).get('use_3d_tactile'):
+                for frame_name in self.config['kinematics']['tactile_frames']:
+                    state_vector_list.append(kinematic_poses[frame_name])
 
-                if tube_kp[3] > 0 and peg_kp[3] > 0: # If both detected
-                    relative_vec = tube_kp[0:2] - peg_kp[0:2] # [du, dv]
-                else:
-                    relative_vec = np.zeros(2, dtype=np.float32)
+            # 2.4 Visual Features (with Carry-Forward Logic)
+            features_per_cam = self.vision_processor.process_cameras(obs['color1'], obs['depth1'], obs['color2'], obs['depth2'])
+            
+            # --- "Carry Forward" Logic with Staleness Flag ---
+            def update_features(raw_feats, cam_id):
+                """
+                Parses a 'kitchen sink' vector, applies staleness logic to the
+                keypoint part, and preserves the embedding part.
+                """
+                if raw_feats is None: # Handle case where a camera failed
+                    return np.zeros(self.single_cam_dim, dtype=np.float32)
+
+                # --- 1. Split the "kitchen sink" vector ---
+                kps_vec = raw_feats[:self.kp_total_dim]
+                embs_vec = raw_feats[self.kp_total_dim:]
                 
-                return np.concatenate([raw_kps, relative_vec])
+                # Deconstruct the keypoint vector
+                # [tube(5), peg(5), rel(3)]
+                tube_feats = kps_vec[0:self.coord_dim+2]
+                peg_feats = kps_vec[self.coord_dim+2:2*self.coord_dim+4]
+                
+                tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
 
-            cam1_feats_engineered = get_engineered_features(raw_cam1_feats)
-            cam2_feats_engineered = get_engineered_features(raw_cam2_feats)
+                # --- 2. Apply Staleness Logic ---
+                # Check TUBE detection (flag is at index 4)
+                if tube_feats[self.coord_dim+1] > 0: # if flag is 1
+                    self.last_known_coords[tube_key] = tube_feats[0:self.coord_dim] # Store new 3D pos
+                else:
+                    tube_feats[0:self.coord_dim] = self.last_known_coords[tube_key] # Use stale position
+                    tube_feats[self.coord_dim:self.coord_dim+2] = 0.0 # Set conf and flag to 0
+
+                # Check PEG detection (flag is at index 4 of its vector)
+                if peg_feats[self.coord_dim+1] > 0: # if flag is 1
+                    self.last_known_coords[peg_key] = peg_feats[0:self.coord_dim]
+                else:
+                    peg_feats[0:self.coord_dim] = self.last_known_coords[peg_key]
+                    peg_feats[self.coord_dim:self.coord_dim+2] = 0.0
+                
+                # --- 3. Re-engineer the relative vector ---
+                # This is crucial: we recalculate the relative vector based on the
+                # (potentially stale) coordinates we are passing to the policy.
+                rel_vec = tube_feats[0:self.coord_dim] - peg_feats[0:self.coord_dim]
+                
+                # Reconstruct the final keypoint vector
+                final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
+                
+                # --- 4. Recombine with embeddings ---
+                # Return the full, corrected "kitchen sink" vector
+                return np.concatenate([final_kps_vec, embs_vec])
+
+            # Get the raw "kitchen sink" vectors
+            f1_raw = features_per_cam.get('cam1', np.zeros(self.single_cam_dim, dtype=np.float32))
+            f2_raw = features_per_cam.get('cam2', np.zeros(self.single_cam_dim, dtype=np.float32))
+
+            # Apply the staleness logic
+            f1_final = update_features(f1_raw, 'cam1')
+            f2_final = update_features(f2_raw, 'cam2')
             
-            raw_features_per_cam = {'cam1': cam1_feats_engineered, 'cam2': cam2_feats_engineered}
+            visual_features = np.concatenate([f1_final, f2_final])
+            state_vector_list.append(visual_features)
 
-            # Handle "Carry Forward" logic if using KeypointExtractor
-            if self.vision_processor.is_keypoint_extractor:
-                for cam_id, features in raw_features_per_cam.items():
-                    if features is not None and np.all(features == 0): # Failed detection
-                        if np.all(self.last_known_positions[cam_id] != -1.0):
-                            raw_features_per_cam[cam_id] = self.last_known_positions[cam_id]
-                    elif features is not None and not np.all(features == 0): # Successful detection
-                        self.last_known_positions[cam_id] = features
-            
-            # Concatenate features into the final vector
-            f1 = raw_features_per_cam.get('cam1', np.zeros(self.vision_processor.output_dim, dtype=np.float32))
-            f2 = raw_features_per_cam.get('cam2', np.zeros(self.vision_processor.output_dim, dtype=np.float32))
-            visual_features = np.concatenate([f1, f2])
-
-            # proprio_data = self.current_joint_states[:self.num_arm_joints] if self.is_arm_only else self.current_joint_states 
-            proprio_data = self.current_joint_states           
-            current_state_np = np.concatenate([tactile_feats, visual_features, proprio_data])
+            # --- Final State Assembly ---
+            current_state_np = np.concatenate(state_vector_list)
+            full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
 
             # --- DIAGNOSTIC PRINTS ---
             self.get_logger().info(f"--- Shape Analysis ---")
@@ -405,15 +510,14 @@ class PolicyRolloutNode(Node):
             self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
             visual_log_msg = "Visual Detections: "
             # 'raw_features_per_cam' now contains the engineered 10-element vectors
-            for cam_id, feats in raw_features_per_cam.items():
+            for cam_id, feats in features_per_cam.items():
                 if feats is None: continue
-                # --- THE CRITICAL FIX: Use the correct indices for the flags ---
                 tube_flag = feats[3]
                 peg_flag = feats[7]
                 visual_log_msg += f"{cam_id} [Tube: {'✅' if tube_flag > 0 else '❌'}, Peg: {'✅' if peg_flag > 0 else '❌'}] | "
             self.get_logger().info(visual_log_msg)
 
-            self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
+            # self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
             self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
             self.get_logger().info(f"Goal State Vector Shape:    {self.goal_state.shape}")
             self.get_logger().info(f"------------------------")
@@ -440,38 +544,46 @@ class PolicyRolloutNode(Node):
                     state_norm = state_norm.unsqueeze(0)
                 
                 action_norm = self.model(state_norm).squeeze(0)
-                delta_q_pred = (action_norm * self.y_std) + self.y_mean
+                action_pred = (action_norm * self.y_std) + self.y_mean
 
             # 5. PUBLISH COMMAND
-            current_q_torch = torch.from_numpy(self.current_joint_states).to(self.device)
-            
-            if self.is_arm_only:
-                hand_zeros = torch.zeros(16, device=self.device)
-                full_delta_q = torch.cat([delta_q_pred, hand_zeros])
-            else:
-                full_delta_q = delta_q_pred
+            delta_arm = action_pred[:self.num_arm_actions]
+
+            if self.control_mode == 'task_space':
+                current_ee_pose = kinematic_poses['ee']
+                T_current = pin.XYZQUATToSE3(current_ee_pose)
+                T_delta = pin.exp(to_np(delta_arm))
+                T_next = T_current * T_delta
+                target_pose_7d = pin.se3ToXYZQUAT(T_next)
                 
-            target_q = current_q_torch + full_delta_q
-
-            # --- Split the command for each controller ---
-            target_q_arm = target_q[:self.num_arm_joints]
-            target_q_hand_allegro = target_q[self.num_arm_joints:]
-
-            # --- Publish Arm Command ---
-            traj_msg = JointTrajectory()
-            traj_msg.joint_names = self.full_joint_names[:self.num_arm_joints]
-            point = JointTrajectoryPoint()
-            point.positions = target_q_arm.cpu().tolist()
-            point.time_from_start = Duration(sec=0, nanosec=int(1e9 / self.control_rate))
-            traj_msg.points.append(point)
-            self.arm_command_pub.publish(traj_msg)
+                pose_msg = PoseStamped()
+                pose_msg.header.stamp = self.get_clock().now().to_msg()
+                pose_msg.header.frame_id = "base" # Or your robot's base frame
+                pose_msg.pose.position.x = target_pose_7d[0]
+                pose_msg.pose.position.y = target_pose_7d[1]
+                pose_msg.pose.position.z = target_pose_7d[2]
+                pose_msg.pose.orientation.x = target_pose_7d[3]
+                pose_msg.pose.orientation.y = target_pose_7d[4]
+                pose_msg.pose.orientation.z = target_pose_7d[5]
+                pose_msg.pose.orientation.w = target_pose_7d[6]
+                self.arm_command_pub.publish(pose_msg)
+            else: # joint_space
+                target_q_arm = self.current_arm_states + to_np(delta_arm)
+                traj_msg = JointTrajectory()
+                traj_msg.joint_names = self.full_joint_names[:self.num_arm_joints]
+                point = JointTrajectoryPoint()
+                point.positions = target_q_arm.tolist()
+                point.time_from_start = Duration(sec=0, nanosec=int(1e9 / self.control_rate))
+                traj_msg.points.append(point)
+                self.arm_command_pub.publish(traj_msg)
 
             # --- Publish Hand Command (only if not in arm_only mode) ---
             if not self.is_arm_only:
+                delta_hand = action_pred[self.num_arm_actions:]
+                target_q_hand_allegro = self.current_joint_states[7:] + to_np(delta_hand)
                 hand_msg = Float64MultiArray()
-                hand_msg.data = target_q_hand_allegro.cpu().tolist()
+                hand_msg.data = [float(p) for p in target_q_hand_allegro]
                 self.hand_command_pub.publish(hand_msg)
-                self.get_logger().info("Published arm and hand commands.")
             else:
                 self.get_logger().info("Published arm command (arm_only mode).")
 

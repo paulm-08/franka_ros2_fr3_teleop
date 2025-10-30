@@ -11,12 +11,13 @@ def create_goal_from_demo(demo_path, out_path):
     demo_traj = trajectories[0]
 
     # The goal is the last state of the trajectory
-    goal_tactile = demo_traj['tactile_t'][-1]
-    goal_visual = demo_traj['visual_t'][-1]
-    goal_joints = demo_traj['joints_t'][-1]
+    # goal_tactile = demo_traj['tactile_t'][-1]
+    # goal_visual = demo_traj['visual_t'][-1]
+    # goal_joints = demo_traj['joints_t'][-1]
+    goal_state = demo_traj['state_t'][-1]
 
-    # This concatenation order MUST match your dataset builder
-    goal_state = np.concatenate([goal_tactile, goal_visual, goal_joints])
+    # # This concatenation order MUST match your dataset builder
+    # goal_state = np.concatenate([goal_tactile, goal_visual, goal_joints])
 
     with open(out_path, 'wb') as f:
         pickle.dump(goal_state, f)

@@ -445,6 +445,105 @@ def plot_correlation_heatmap(X_train, tactile_total_dim, visual_dim, output_dir)
     plt.close(fig)
     logging.info(f"📊 Saved feature correlation heatmap to {save_path}")
     
+def plot_trajectory_analysis(all_trajectories, config, output_dir, num_trajectories_to_plot=10):
+    """
+    Plots the EE pose and 6D action for multiple sample trajectories to verify continuity.
+    Each trajectory gets a row of 3 subplots (3D Path, Linear Twist, Angular Twist).
+    """
+    if not all_trajectories:
+        logging.warning("No trajectories to analyze."); return
+
+    if config.get('control_mode', 'joint_space') != 'task_space':
+        logging.info("Skipping multi-trajectory analysis plot (not in task_space mode).")
+        return
+
+    logging.info(f"Generating multi-trajectory analysis plot for {min(len(all_trajectories), num_trajectories_to_plot)} trajectories...")
+    
+    # Limit to the number of available trajectories
+    num_to_plot = min(len(all_trajectories), num_trajectories_to_plot)
+
+    # Calculate overall min/max for linear and angular actions for consistent y-axis
+    all_delta_arm_linear = []
+    all_delta_arm_angular = []
+
+    for i in range(num_to_plot):
+        traj = all_trajectories[i]
+        ee_pose_start_idx = 24 
+        delta_arm = traj['action_t'][:, :6]
+        all_delta_arm_linear.append(delta_arm[:, :3])
+        all_delta_arm_angular.append(delta_arm[:, 3:])
+
+    if all_delta_arm_linear:
+        min_linear = np.min(np.concatenate(all_delta_arm_linear))
+        max_linear = np.max(np.concatenate(all_delta_arm_linear))
+        min_angular = np.min(np.concatenate(all_delta_arm_angular))
+        max_angular = np.max(np.concatenate(all_delta_arm_angular))
+    else:
+        min_linear, max_linear = -0.1, 0.1 # Default small range if no data
+        min_angular, max_angular = -0.5, 0.5 # Default small range
+
+    fig = plt.figure(figsize=(25, num_to_plot * 6)) # Adjust figure height based on number of rows
+    
+    for i in range(num_to_plot):
+        traj = all_trajectories[i]
+
+        # Extract EE Poses and Arm Actions
+        ee_pose_start_idx = 24 
+        ee_poses = traj['state_t'][:, ee_pose_start_idx : ee_pose_start_idx + 7]
+        delta_arm = traj['action_t'][:, :6]
+        timesteps = np.arange(len(ee_poses))
+
+        # --- Row Title ---
+        fig.text(0.01, (num_to_plot - i - 0.5) / num_to_plot + 0.5 / (2*num_to_plot), 
+                 f'Trajectory {i+1}', fontsize=14, va='center', ha='left', transform=fig.transFigure)
+
+        # Panel 1: 3D Path of the End-Effector
+        ax1 = fig.add_subplot(num_to_plot, 3, i * 3 + 1, projection='3d')
+        x, y, z = ee_poses[:, 0], ee_poses[:, 1], ee_poses[:, 2]
+        ax1.plot(x, y, z, label='EE Path')
+        ax1.scatter(x[0], y[0], z[0], color='green', s=50, label='Start', depthshade=False)
+        ax1.scatter(x[-1], y[-1], z[-1], color='red', s=50, label='End', depthshade=False)
+        ax1.set_title(f'Path (Traj {i+1})')
+        if i == num_to_plot - 1: # Only label last row
+            ax1.set_xlabel('X (m)'); ax1.set_ylabel('Y (m)'); ax1.set_zlabel('Z (m)')
+        else:
+            ax1.set_xticklabels([]); ax1.set_yticklabels([]); ax1.set_zticklabels([])
+        ax1.legend(loc='lower left', fontsize='small')
+        ax1.view_init(elev=20, azim=-60)
+        ax1.set_box_aspect([np.ptp(x), np.ptp(y), np.ptp(z)]) # Equal aspect ratio for dynamic ranges
+
+        # Panel 2: Linear components of the 6D Twist Action
+        ax2 = fig.add_subplot(num_to_plot, 3, i * 3 + 2)
+        ax2.plot(timesteps[:], delta_arm[:, 0], label='vx (Linear X)')
+        ax2.plot(timesteps[:], delta_arm[:, 1], label='vy (Linear Y)')
+        ax2.plot(timesteps[:], delta_arm[:, 2], label='vz (Linear Z)')
+        ax2.set_title(f'Linear Twist (Traj {i+1})')
+        ax2.set_ylabel('Velocity (m/step)')
+        if i == num_to_plot - 1: # Only label last row
+            ax2.set_xlabel('Timestep')
+        ax2.legend(loc='upper right', fontsize='small')
+        ax2.grid(True, linestyle='--')
+        ax2.set_ylim(min_linear * 1.1, max_linear * 1.1) # Consistent Y-limits
+
+        # Panel 3: Angular components of the 6D Twist Action
+        ax3 = fig.add_subplot(num_to_plot, 3, i * 3 + 3)
+        ax3.plot(timesteps[:], delta_arm[:, 3], label='wx (Roll)')
+        ax3.plot(timesteps[:], delta_arm[:, 4], label='wy (Pitch)')
+        ax3.plot(timesteps[:], delta_arm[:, 5], label='wz (Yaw)')
+        ax3.set_title(f'Angular Twist (Traj {i+1})')
+        ax3.set_ylabel('Angular Velocity (rad/step)')
+        if i == num_to_plot - 1: # Only label last row
+            ax3.set_xlabel('Timestep')
+        ax3.legend(loc='upper right', fontsize='small')
+        ax3.grid(True, linestyle='--')
+        ax3.set_ylim(min_angular * 1.1, max_angular * 1.1) # Consistent Y-limits
+    
+    plt.tight_layout(rect=[0.02, 0.03, 1, 0.98]) # Adjust rect for left-side labels
+    save_path = output_dir / f"trajectory_sanity_check_{num_to_plot}_trajectories.png"
+    plt.savefig(save_path)
+    plt.close(fig)
+    logging.info(f"📊 Saved multi-trajectory analysis plot to {save_path}")
+
 # ===================================================================
 # === MAIN SCRIPT LOGIC ===
 # ===================================================================
@@ -496,6 +595,8 @@ def visualize_and_split_dataset(input_path, output_path, split_ratio=0.8, seed=4
     plot_dir = Path(output_path).parent if output_path else Path("./data/visualizations")
     plot_dir.mkdir(parents=True, exist_ok=True)
     logging.info(f"Generating visualizations in {plot_dir}...")
+
+    plot_trajectory_analysis(all_trajectories, config, plot_dir)
     
     if X_val.shape[0] > 0:
         plot_tactile_distributions(X_train, X_val, plot_dir)

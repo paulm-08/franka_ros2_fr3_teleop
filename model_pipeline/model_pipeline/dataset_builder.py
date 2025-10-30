@@ -314,7 +314,6 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
     
     single_cam_dim = vision_processor.single_cam_dim # e.g., 61
 
-    
     # Store the last known [x,y,z] or [u,v]
     last_known_coords = {
         'cam1_tube': np.zeros(coord_dim, dtype=np.float32),
@@ -431,6 +430,14 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
         hand_joints = actions[i, 7:23]
         
         _, kinematic_poses = solver.get_all_poses(arm_joints, hand_joints)
+
+        # Canonicalize all poses to prevent sign flipping
+        for frame_name in kinematic_poses:
+            pose_7d = kinematic_poses[frame_name]
+            if pose_7d[6] < 0: # if qw is negative
+                pose_7d[3:] *= -1 # Flip the entire quaternion [qx, qy, qz, qw]
+            kinematic_poses[frame_name] = pose_7d
+            
         kinematic_pose_list.append(kinematic_poses)
         hand_joint_list.append(hand_joints)
 

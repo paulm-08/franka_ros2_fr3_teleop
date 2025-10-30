@@ -106,14 +106,18 @@ class TransformerPolicy(nn.Module):
 # === DATASET CLASS ===
 # ===================================================================
 class TrajectoryFrameStackDataset(Dataset):
-    def __init__(self, trajectories, frame_stack_k, norm_stats=None, flatten=True, is_train=False, noise_std=0.0):
+    def __init__(self, trajectories, frame_stack_k, config, arm_only, norm_stats=None, flatten=True, is_train=False, noise_std=0.0):
         self.trajectories = trajectories
         self.k = frame_stack_k
         self.flatten = flatten
-        # --- NEW: Flags for augmentation ---
         self.is_train = is_train
         self.noise_std = noise_std
         
+        # --- Get settings from config ---
+        self.arm_only = arm_only
+        control_mode = config.get('control_mode', 'joint_space')
+        self.num_arm_actions = 6 if control_mode == 'task_space' else 7
+
         self.indices = []
         for traj_idx, traj in enumerate(self.trajectories):
             num_samples = traj['state_t'].shape[0]
@@ -129,7 +133,17 @@ class TrajectoryFrameStackDataset(Dataset):
                 np.concatenate([t['state_t'], t['goal_t']], axis=1) 
                 for t in trajectories
             ], axis=0)
-            y_unstacked = np.concatenate([t['action_t'] for t in trajectories], axis=0)
+            y_unstacked_full = np.concatenate([t['action_t'] for t in trajectories], axis=0)
+            
+            # --- THE DEFINITIVE FIX ---
+            # If training in arm_only mode, compute y_stats ONLY on the arm actions.
+            if self.arm_only:
+                y_unstacked = y_unstacked_full[:, :self.num_arm_actions]
+                logging.info(f"ARM-ONLY mode: Calculating action stats on the first {self.num_arm_actions} dimensions.")
+            else:
+                y_unstacked = y_unstacked_full
+                logging.info("FULL-BODY mode: Calculating action stats on all dimensions.")
+
             self.X_mean = X_unstacked.mean(axis=0); self.X_std = X_unstacked.std(axis=0)
             self.y_mean = y_unstacked.mean(axis=0); self.y_std = y_unstacked.std(axis=0)
             self.X_std[self.X_std < 1e-9] = 1.0; self.y_std[self.y_std < 1e-9] = 1.0
@@ -145,28 +159,31 @@ class TrajectoryFrameStackDataset(Dataset):
         
         start_idx, end_idx = frame_idx - self.k + 1, frame_idx + 1
         
-        # --- 1. Build the full state sequence (current + goal) ---
+        # --- (The rest of your __getitem__ is correct) ---
+        # It correctly builds the state, adds noise, and normalizes the action.
+        # Now, it will use the CORRECT y_mean and y_std.
+        
         full_state_sequence = np.concatenate([
             traj['state_t'][start_idx:end_idx],
             traj['goal_t'][start_idx:end_idx],
         ], axis=1)
         
-        # --- 2. Normalize the entire sequence ---
         full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
         
-        # --- 3. Split state and goal BEFORE adding noise ---
         current_state_norm = full_state_norm[:, :self.current_state_dim]
         goal_state_norm = full_state_norm[:, self.current_state_dim:]
         
-        # --- 4. Add noise ONLY to the current state during training ---
         if self.is_train and self.noise_std > 0:
             noise = np.random.normal(0, self.noise_std, current_state_norm.shape).astype(np.float32)
             current_state_norm += noise
         
-        # --- 5. Recombine the (potentially noisy) state with the CLEAN goal ---
         final_state_norm = np.concatenate([current_state_norm, goal_state_norm], axis=1)
         
+        # Slice the action based on the mode
         action = traj['action_t'][frame_idx]
+        if self.arm_only:
+            action = action[:self.num_arm_actions]
+            
         action_norm = (action - self.y_mean) / self.y_std
         
         state_output = final_state_norm.flatten() if self.flatten else final_state_norm
@@ -366,7 +383,9 @@ def main():
             is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
             train_dataset = TrajectoryFrameStackDataset(
                 train_trajectories, 
-                final_args.frame_stack, 
+                final_args.frame_stack,
+                config,
+                final_args.arm_only, 
                 flatten=(not is_sequence_model),
                 is_train=True,         # <-- Enable training mode
                 noise_std=0.01         # <-- Add a small amount of noise
@@ -376,6 +395,8 @@ def main():
             val_dataset = TrajectoryFrameStackDataset(
                 val_trajectories, 
                 final_args.frame_stack,
+                config,
+                final_args.arm_only,
                 norm_stats=(train_dataset.X_mean, train_dataset.X_std, train_dataset.y_mean, train_dataset.y_std),
                 flatten=(not is_sequence_model),
                 is_train=False         # <-- Keep this False
@@ -392,7 +413,9 @@ def main():
             is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
             train_dataset = TrajectoryFrameStackDataset(
                 all_trajectories, 
-                final_args.frame_stack, 
+                final_args.frame_stack,
+                config,
+                final_args.arm_only,
                 flatten=(not is_sequence_model),
                 is_train=True,         # <-- Enable training mode
                 noise_std=0.01         # <-- Add a small amount of noise
@@ -427,76 +450,80 @@ def main():
         patience_counter = 0
         model_save_path = output_dir / f"policy_{final_args.model_type}_best.pt"
 
-        for epoch in range(final_args.epochs):
-            model.train()
-            total_train_loss = 0.0
-            for state_norm, action_norm in train_loader:
-                state_norm, action_norm = state_norm.to(device), action_norm.to(device)
-                pred_norm = model(state_norm)
-                loss = loss_fn(pred_norm, action_norm)
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
-                total_train_loss += loss.item()
-            avg_train_loss = total_train_loss / len(train_loader)
-            history["train_loss"].append(avg_train_loss)
+        try:
+            for epoch in range(final_args.epochs):
+                model.train()
+                total_train_loss = 0.0
+                for state_norm, action_norm in train_loader:
+                    state_norm, action_norm = state_norm.to(device), action_norm.to(device)
+                    pred_norm = model(state_norm)
+                    loss = loss_fn(pred_norm, action_norm)
+                    optimizer.zero_grad(); loss.backward(); optimizer.step()
+                    total_train_loss += loss.item()
+                avg_train_loss = total_train_loss / len(train_loader)
+                history["train_loss"].append(avg_train_loss)
 
-            if final_args.validation:
-                model.eval()
-                total_val_loss = 0.0
-                with torch.no_grad():
-                    for state_norm, action_norm in val_loader:
-                        state_norm, action_norm = state_norm.to(device), action_norm.to(device)
-                        pred_norm = model(state_norm)
-                        loss = loss_fn(pred_norm, action_norm)
-                        total_val_loss += loss.item()
-                avg_val_loss = total_val_loss / len(val_loader)
-                history["val_loss"].append(avg_val_loss)
+                if final_args.validation:
+                    model.eval()
+                    total_val_loss = 0.0
+                    with torch.no_grad():
+                        for state_norm, action_norm in val_loader:
+                            state_norm, action_norm = state_norm.to(device), action_norm.to(device)
+                            pred_norm = model(state_norm)
+                            loss = loss_fn(pred_norm, action_norm)
+                            total_val_loss += loss.item()
+                    avg_val_loss = total_val_loss / len(val_loader)
+                    history["val_loss"].append(avg_val_loss)
 
-                logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
-            else:
-                logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}")
+                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+                else:
+                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}")
 
+                    
+                if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss<best_train_loss):
+                    if final_args.validation:
+                        best_val_loss = avg_val_loss
+                    else:
+                        best_train_loss = avg_train_loss
+
+                    model_hyperparams = {
+                        "width": final_args.width,
+                        "hidden_dim": final_args.hidden_dim,
+                        "num_layers": final_args.num_layers,
+                        "num_heads": final_args.num_heads
+                    }
+
+                    torch.save({
+                        "state_dict": model.state_dict(),
+                        "model_type": final_args.model_type,
+                        "input_dim": input_dim, "output_dim": output_dim,
+                        "model_hyperparams": model_hyperparams,
+                        "X_mean": train_dataset.X_mean, "X_std": train_dataset.X_std,
+                        "y_mean": train_dataset.y_mean, "y_std": train_dataset.y_std,
+                        "frame_stack": final_args.frame_stack,
+                        "validation": final_args.validation,
+                        "control_mode": control_mode,
+                        "training_config": config,
+                        "best_loss": best_val_loss if final_args.validation else best_train_loss,
+                        "epoch": epoch + 1,
+                        "arm_only": final_args.arm_only, "num_arm_joints": final_args.num_arm_joints
+                    }, model_save_path)
+
+                    if final_args.validation:
+                        logging.info(f"  -> New best model saved to {model_save_path} (Val Loss: {best_val_loss:.6f})")
+                    else:
+                        logging.info(f"  -> New best model saved to {model_save_path} (Train Loss: {best_train_loss:.6f})")
+
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= final_args.patience:
+                    logging.info(f"Validation loss did not improve for {final_args.patience} epochs. Stopping early.")
+                    break
                 
-            if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss<best_train_loss):
-                if final_args.validation:
-                    best_val_loss = avg_val_loss
-                else:
-                    best_train_loss = avg_train_loss
-
-                model_hyperparams = {
-                    "width": final_args.width,
-                    "hidden_dim": final_args.hidden_dim,
-                    "num_layers": final_args.num_layers,
-                    "num_heads": final_args.num_heads
-                }
-
-                torch.save({
-                    "state_dict": model.state_dict(),
-                    "model_type": final_args.model_type,
-                    "input_dim": input_dim, "output_dim": output_dim,
-                    "model_hyperparams": model_hyperparams,
-                    "X_mean": train_dataset.X_mean, "X_std": train_dataset.X_std,
-                    "y_mean": train_dataset.y_mean, "y_std": train_dataset.y_std,
-                    "frame_stack": final_args.frame_stack,
-                    "validation": final_args.validation,
-                    "control_mode": control_mode,
-                    "training_config": config,
-                    "best_loss": best_val_loss if final_args.validation else best_train_loss,
-                    "epoch": epoch + 1,
-                    "arm_only": final_args.arm_only, "num_arm_joints": final_args.num_arm_joints
-                }, model_save_path)
-
-                if final_args.validation:
-                    logging.info(f"  -> New best model saved to {model_save_path} (Val Loss: {best_val_loss:.6f})")
-                else:
-                    logging.info(f"  -> New best model saved to {model_save_path} (Train Loss: {best_train_loss:.6f})")
-
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if patience_counter >= final_args.patience:
-                logging.info(f"Validation loss did not improve for {final_args.patience} epochs. Stopping early.")
-                break
+        except KeyboardInterrupt:
+            logging.info("Training interrupted.")
         
         if final_args.validation:
             logging.info(f"🏁 Training complete. Best validation loss: {best_val_loss:.6f}")
