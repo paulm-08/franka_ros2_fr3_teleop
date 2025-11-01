@@ -18,11 +18,10 @@ import dex_retargeting.leap_hand_utils.leap_hand_utils as lhu
 
 from model_pipeline import paths
 from model_pipeline.leap_node import LeapNode
+from model_pipeline.evaluate_policy import find_policy_models
+
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-def find_policy_models(search_path):
-    return sorted([p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*_best.pt")])
 
 def find_goal_files(search_path):
     return sorted([p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*_goal.pkl")])

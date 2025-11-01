@@ -16,6 +16,7 @@ import threading
 from std_msgs.msg import Float64MultiArray
 import pinocchio as pin
 import tempfile
+import random
 
 # ROS 2 message types
 from sensor_msgs.msg import JointState
@@ -44,12 +45,21 @@ from model_pipeline import paths
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-SENSOR_ORDER = ["rindex", "rmiddle", "rthumb"]
 TACT_BASE_PATH = str(Path(get_package_share_directory('tact9d')) / 'shape_reconstruction')
 
 class PolicyRolloutNode(Node):
     def __init__(self):
         super().__init__('policy_rollout_node')
+
+        SEED = 42
+        os.environ["PYTHONHASHSEED"] = str(SEED)
+        random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
         # --- State Flags ---
         self.dependencies_ready = False
@@ -83,18 +93,18 @@ class PolicyRolloutNode(Node):
         self.frame_stack_k = checkpoint.get("frame_stack", 1)
         self.is_arm_only = checkpoint.get("arm_only", False)
         self.num_arm_joints = checkpoint.get("num_arm_joints", 7)
-        model_type = checkpoint["model_type"]
+        self.model_type = checkpoint["model_type"]
 
         # --- THE CRITICAL FIX: Read hyperparameters from the checkpoint ---
         model_hyperparams = checkpoint.get("model_hyperparams", {})
         logging.info(f"Loaded model hyperparameters: {model_hyperparams}")
-        logging.info(f"Model was trained with K={self.frame_stack_k}, type='{model_type}'. Evaluating accordingly.")
+        logging.info(f"Model was trained with K={self.frame_stack_k}, type='{self.model_type}'. Evaluating accordingly.")
         if self.is_arm_only:
             logging.info(f"Evaluating an ARM-ONLY model with {self.num_arm_joints} joints.")
 
-        inferred_width = checkpoint['state_dict']['net.0.bias'].shape[0] if model_type == 'mlp' else None
+        inferred_width = checkpoint['state_dict']['net.0.bias'].shape[0] if self.model_type == 'mlp' else None
         self.model = build_model(
-            model_type, 
+            self.model_type, 
             checkpoint["input_dim"], 
             checkpoint["output_dim"],
             # Pass all saved hyperparameters. The build_model function
@@ -122,6 +132,13 @@ class PolicyRolloutNode(Node):
         self.solver = self.initialize_kinematics_solver()
         
         # --- ROS 2 Interfaces ---
+        self.policy_arm_joint_names = [
+            'fr3_joint1', 'fr3_joint2', 'fr3_joint3', 'fr3_joint4', 
+            'fr3_joint5', 'fr3_joint6', 'fr3_joint7'
+        ]
+        self.received_state_order = None 
+        self.state_to_policy_indices = None 
+        
         self.joint_state_sub = self.create_subscription(JointState, '/franka/joint_states', self.joint_state_callback, 10)
         if self.control_mode == "joint_space":
             self.arm_command_pub = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
@@ -163,7 +180,12 @@ class PolicyRolloutNode(Node):
             'cam2_peg':  np.zeros(self.coord_dim, dtype=np.float32)
         }
 
+        self.proprio_history = []
+        self.prediction_history = []
+        self.timestamp_history = []
+
         self.control_rate = self.get_parameter('control_rate_hz').get_parameter_value().double_value
+        self.control_rate = self.control_rate  # Slower rollout for testing
         self.sample_period = 1.0 / self.control_rate
 
         logging.info("Commanding a slow, interpolated grasp...")
@@ -194,7 +216,7 @@ class PolicyRolloutNode(Node):
             time.sleep(grasp_duration / num_steps)
         
         logging.info("Grasp complete.")
-        time.sleep(5) # A final short pause after grasping
+        time.sleep(10) # A final short pause after grasping
         
         self.get_logger().info(f"✅ Policy rollout node initialized. Running at {self.control_rate} Hz.")
 
@@ -357,11 +379,42 @@ class PolicyRolloutNode(Node):
         
     def joint_state_callback(self, msg: JointState):
         """Callback for the Franka arm's joint states ONLY."""
-        # This runs in the background, keeping the arm state fresh.
-        if len(msg.position) >= 7:
-            self.current_arm_states = np.array(msg.position[:7])
-            if not self.full_joint_names: # Assume hand names are fixed
-                self.full_joint_names = list(msg.name[:7]) + [f'joint{i+7}' for i in range(16)]
+        
+        if len(msg.position) < 7:
+            return
+
+        # --- Dynamic Mapping Check (Run only once) ---
+        if self.received_state_order is None:
+            # The first 7 names are the arm joints (in whatever order the publisher sends)
+            self.received_state_order = msg.name[:7]
+            
+            # Create the index map: For each joint in our policy order, find its index 
+            # in the received state order.
+            self.state_to_policy_indices = np.array([
+                self.received_state_order.index(name) 
+                for name in self.policy_arm_joint_names
+            ])
+            # self.get_logger().info(f"Dynamically mapped arm joint order for policy input.")
+            # self.get_logger().info(f"Received Order: {self.received_state_order}")
+            # self.get_logger().info(f"Policy Order:   {self.policy_arm_joint_names}")
+            # self.get_logger().info(f"Reorder Indices: {self.state_to_policy_indices}")
+
+
+        # --- State Processing ---
+        # 1. Take the received joint positions (in received order)
+        arm_positions_received_order = np.array(msg.position[:7])
+        
+        # 2. Re-order the data using the computed index map
+        # self.current_arm_states is now guaranteed to be in the self.policy_arm_joint_names order (J1-J7)
+        self.current_arm_states = arm_positions_received_order[self.state_to_policy_indices]
+        
+        # --- Update full_joint_names (if needed for the policy input vector) ---
+        # Assuming policy input requires all 23 joints in a specific order:
+        if self.full_joint_names is None:
+            # full_joint_names (23 joints) must be the order your POLICY expects
+            # Example: [J1...J7, Hand_J1...Hand_J16]
+            hand_names = msg.name[7:] # Get the rest of the joints (hand, etc.)
+            self.full_joint_names = self.policy_arm_joint_names + hand_names
 
     def get_current_leap_position(self):
         """Calls the LEAP position service to get the current hand joint positions."""
@@ -386,210 +439,311 @@ class PolicyRolloutNode(Node):
         self.get_logger().info("Waiting for initial arm states...")
         while rclpy.ok() and self.current_arm_states is None:
             time.sleep(0.1)
+
+        # --- SAFETY INITIALIZATION ---
+        # Initialize previous commands to zero to ensure a smooth start.
+        # It's best practice to define these in your node's __init__ method.
+        self.previous_arm_command = np.zeros(self.num_arm_actions)
+        if not self.is_arm_only:
+            self.previous_hand_command = np.zeros(16) 
+
+        # --- SAFETY PARAMETERS (Tune these for your hardware!) ---
+        self.MAX_ARM_DELTA = 0.05   # Absolute max delta (rad or m)
+        self.ARM_RATE_LIMIT = 0.02  # Max change from the last command
+        self.MAX_HAND_DELTA = 0.1   # Absolute max delta for hand joints
+        self.HAND_RATE_LIMIT = 0.05 # Max change for hand commands
+        # ---`--------------------------------------------------------
         
         self.get_logger().info("✅ All dependencies ready. Starting autonomous control loop.")
 
-        while rclpy.ok():
-            time_start = time.perf_counter()
-            
-            # --- 1. SENSE ---
-            obs = self.get_live_observations()
-            if obs is None: 
-                time.sleep(self.sample_period)
-                continue
-
-            leap_positions = self.get_current_leap_position()
-            if leap_positions is None: 
-                time.sleep(self.sample_period)
-                continue
-            
-            self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])
-
-            # --- 2. PREPARE STATE (Mirrors dataset_builder.py) ---
-            state_vector_list = []
-
-            # 2.1 Tactile Features
-            tactile_feats = np.concatenate([
-                process_tactile_image(
-                    img=obs['tactile_images'][name],
-                    use_height_map=True,
-                    sensor=self.tactile_sensors[name],
-                    ref_img=self.tactile_sensors[name].ref
-                )[0] for name in SENSOR_ORDER
-            ])            
-            state_vector_list.append(tactile_feats)
-
-            # 2.2 Proprioceptive Features
-            if self.control_mode == 'task_space':
-                kinematic_poses = self.solver.get_all_poses(self.current_arm_states, leap_positions)
-                state_vector_list.append(kinematic_poses['ee']) # 7D EE Pose
-            else: # joint_space
-                state_vector_list.append(self.current_arm_states) # 7D Arm Joints
-            
-            state_vector_list.append(leap_positions) # 16D Hand Joints
-
-            # 2.3 3D Tactile Poses
-            if self.config.get('state', {}).get('use_3d_tactile'):
-                for frame_name in self.config['kinematics']['tactile_frames']:
-                    state_vector_list.append(kinematic_poses[frame_name])
-
-            # 2.4 Visual Features (with Carry-Forward Logic)
-            features_per_cam = self.vision_processor.process_cameras(obs['color1'], obs['depth1'], obs['color2'], obs['depth2'])
-            
-            # --- "Carry Forward" Logic with Staleness Flag ---
-            def update_features(raw_feats, cam_id):
-                """
-                Parses a 'kitchen sink' vector, applies staleness logic to the
-                keypoint part, and preserves the embedding part.
-                """
-                if raw_feats is None: # Handle case where a camera failed
-                    return np.zeros(self.single_cam_dim, dtype=np.float32)
-
-                # --- 1. Split the "kitchen sink" vector ---
-                kps_vec = raw_feats[:self.kp_total_dim]
-                embs_vec = raw_feats[self.kp_total_dim:]
+        try:
+            while rclpy.ok():
+                time_start = time.perf_counter()
                 
-                # Deconstruct the keypoint vector
-                # [tube(5), peg(5), rel(3)]
-                tube_feats = kps_vec[0:self.coord_dim+2]
-                peg_feats = kps_vec[self.coord_dim+2:2*self.coord_dim+4]
+                # --- 1. SENSE ---
+                obs = self.get_live_observations()
+                if obs is None: 
+                    time.sleep(self.sample_period)
+                    continue
+
+                leap_positions = self.get_current_leap_position()
+                if leap_positions is None: 
+                    time.sleep(self.sample_period)
+                    continue
                 
-                tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
+                self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])
 
-                # --- 2. Apply Staleness Logic ---
-                # Check TUBE detection (flag is at index 4)
-                if tube_feats[self.coord_dim+1] > 0: # if flag is 1
-                    self.last_known_coords[tube_key] = tube_feats[0:self.coord_dim] # Store new 3D pos
-                else:
-                    tube_feats[0:self.coord_dim] = self.last_known_coords[tube_key] # Use stale position
-                    tube_feats[self.coord_dim:self.coord_dim+2] = 0.0 # Set conf and flag to 0
+                # --- 2. PREPARE STATE (Mirrors dataset_builder.py) ---
+                state_vector_list = []
+                current_proprio = None
 
-                # Check PEG detection (flag is at index 4 of its vector)
-                if peg_feats[self.coord_dim+1] > 0: # if flag is 1
-                    self.last_known_coords[peg_key] = peg_feats[0:self.coord_dim]
-                else:
-                    peg_feats[0:self.coord_dim] = self.last_known_coords[peg_key]
-                    peg_feats[self.coord_dim:self.coord_dim+2] = 0.0
+                # 2.1 Tactile Features
+                tactile_feats = np.concatenate([
+                    process_tactile_image(
+                        img=obs['tactile_images'][name],
+                        use_height_map=True,
+                        sensor=self.tactile_sensors[name],
+                        ref_img=self.tactile_sensors[name].ref
+                    )[0] for name in SENSOR_ORDER
+                ])            
+                state_vector_list.append(tactile_feats)
+
+                # 2.2 Proprioceptive Features
+                if self.control_mode == 'task_space':
+                    kinematic_poses = self.solver.get_all_poses(self.current_arm_states, leap_positions)
+                    arm_proprio = kinematic_poses['ee'] # 7D EE Pose
+                    state_vector_list.append(arm_proprio)
+                else: # joint_space
+                    arm_proprio = self.current_arm_states # 7D Arm Joints
+                    state_vector_list.append(arm_proprio)            
+
+                hand_proprio = leap_positions # 16D Hand Joints
+                state_vector_list.append(hand_proprio)
+                current_proprio = np.concatenate([arm_proprio, hand_proprio])
+
+                # 2.3 3D Tactile Poses
+                if self.config.get('state', {}).get('use_3d_tactile'):
+                    for frame_name in self.config['kinematics']['tactile_frames']:
+                        state_vector_list.append(kinematic_poses[frame_name])
+
+                # 2.4 Visual Features (with Carry-Forward Logic)
+                features_per_cam = self.vision_processor.process_cameras(obs['color1'], obs['depth1'], obs['color2'], obs['depth2'])
                 
-                # --- 3. Re-engineer the relative vector ---
-                # This is crucial: we recalculate the relative vector based on the
-                # (potentially stale) coordinates we are passing to the policy.
-                rel_vec = tube_feats[0:self.coord_dim] - peg_feats[0:self.coord_dim]
+                # --- "Carry Forward" Logic with Staleness Flag ---
+                def update_features(raw_feats, cam_id):
+                    """
+                    Parses a 'kitchen sink' vector, applies staleness logic to the
+                    keypoint part, and preserves the embedding part.
+                    """
+                    if raw_feats is None: # Handle case where a camera failed
+                        return np.zeros(self.single_cam_dim, dtype=np.float32)
+
+                    # --- 1. Split the "kitchen sink" vector ---
+                    kps_vec = raw_feats[:self.kp_total_dim]
+                    embs_vec = raw_feats[self.kp_total_dim:]
+                    
+                    # Deconstruct the keypoint vector
+                    # [tube(5), peg(5), rel(3)]
+                    tube_feats = kps_vec[0:self.coord_dim+2]
+                    peg_feats = kps_vec[self.coord_dim+2:2*self.coord_dim+4]
+                    
+                    tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
+
+                    # --- 2. Apply Staleness Logic ---
+                    # Check TUBE detection (flag is at index 4)
+                    if tube_feats[self.coord_dim+1] > 0: # if flag is 1
+                        self.last_known_coords[tube_key] = tube_feats[0:self.coord_dim] # Store new 3D pos
+                    else:
+                        tube_feats[0:self.coord_dim] = self.last_known_coords[tube_key] # Use stale position
+                        tube_feats[self.coord_dim:self.coord_dim+2] = 0.0 # Set conf and flag to 0
+
+                    # Check PEG detection (flag is at index 4 of its vector)
+                    if peg_feats[self.coord_dim+1] > 0: # if flag is 1
+                        self.last_known_coords[peg_key] = peg_feats[0:self.coord_dim]
+                    else:
+                        peg_feats[0:self.coord_dim] = self.last_known_coords[peg_key]
+                        peg_feats[self.coord_dim:self.coord_dim+2] = 0.0
+                    
+                    # --- 3. Re-engineer the relative vector ---
+                    # This is crucial: we recalculate the relative vector based on the
+                    # (potentially stale) coordinates we are passing to the policy.
+                    rel_vec = tube_feats[0:self.coord_dim] - peg_feats[0:self.coord_dim]
+                    
+                    # Reconstruct the final keypoint vector
+                    final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
+                    
+                    # --- 4. Recombine with embeddings ---
+                    # Return the full, corrected "kitchen sink" vector
+                    return np.concatenate([final_kps_vec, embs_vec])
+
+                # Get the raw "kitchen sink" vectors
+                f1_raw = features_per_cam.get('cam1', np.zeros(self.single_cam_dim, dtype=np.float32))
+                f2_raw = features_per_cam.get('cam2', np.zeros(self.single_cam_dim, dtype=np.float32))
+
+                # Apply the staleness logic
+                f1_final = update_features(f1_raw, 'cam1')
+                f2_final = update_features(f2_raw, 'cam2')
                 
-                # Reconstruct the final keypoint vector
-                final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
+                visual_features = np.concatenate([f1_final, f2_final])
+                state_vector_list.append(visual_features)
+
+                # --- Final State Assembly ---
+                current_state_np = np.concatenate(state_vector_list)
+                full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
+
+                # --- DIAGNOSTIC PRINTS ---
+                # self.get_logger().info(f"--- Shape Analysis ---")
+                # self.get_logger().info(f"Tactile Features Shape: {tactile_feats.shape}")
+                tactile_log_msg = "Tactile Contact: "
+                for i, name in enumerate(SENSOR_ORDER):
+                    flag = tactile_feats[i * 8 + 7]  # Correctly checks the flag at the end of each sensor's 8 features
+                    tactile_log_msg += f"✅ {name.upper()} | " if flag > 0 else f"❌ {name.upper()} | "
+                self.get_logger().info(tactile_log_msg)
+
+                # self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
+                visual_log_msg = "Visual Detections: "
+                # 'raw_features_per_cam' now contains the engineered 10-element vectors
+                for cam_id, feats in features_per_cam.items():
+                    if feats is None: continue
+                    tube_flag = feats[3]
+                    peg_flag = feats[7]
+                    visual_log_msg += f"{cam_id} [Tube: {'✅' if tube_flag > 0 else '❌'}, Peg: {'✅' if peg_flag > 0 else '❌'}] | "
+                self.get_logger().info(visual_log_msg)
+
+                # self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
+                # self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
+                # self.get_logger().info(f"Goal State Vector Shape:    {self.goal_state.shape}")
+                full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
                 
-                # --- 4. Recombine with embeddings ---
-                # Return the full, corrected "kitchen sink" vector
-                return np.concatenate([final_kps_vec, embs_vec])
+                # 3. HANDLE HISTORY (Frame Stacking)
+                self.history_buffer.append(full_state_np)
+                if len(self.history_buffer) > self.frame_stack_k:
+                    self.history_buffer.pop(0)
+                if len(self.history_buffer) < self.frame_stack_k:
+                    self.get_logger().info(f"Filling history buffer... {len(self.history_buffer)}/{self.frame_stack_k}")
+                    continue
+                self.get_logger().info(f"------------------------")
 
-            # Get the raw "kitchen sink" vectors
-            f1_raw = features_per_cam.get('cam1', np.zeros(self.single_cam_dim, dtype=np.float32))
-            f2_raw = features_per_cam.get('cam2', np.zeros(self.single_cam_dim, dtype=np.float32))
-
-            # Apply the staleness logic
-            f1_final = update_features(f1_raw, 'cam1')
-            f2_final = update_features(f2_raw, 'cam2')
-            
-            visual_features = np.concatenate([f1_final, f2_final])
-            state_vector_list.append(visual_features)
-
-            # --- Final State Assembly ---
-            current_state_np = np.concatenate(state_vector_list)
-            full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
-
-            # --- DIAGNOSTIC PRINTS ---
-            self.get_logger().info(f"--- Shape Analysis ---")
-            self.get_logger().info(f"Tactile Features Shape: {tactile_feats.shape}")
-            tactile_log_msg = "Tactile Contact: "
-            for i, name in enumerate(SENSOR_ORDER):
-                flag = tactile_feats[i * 8 + 7]  # Correctly checks the flag at the end of each sensor's 8 features
-                tactile_log_msg += f"✅ {name.upper()} | " if flag > 0 else f"❌ {name.upper()} | "
-            self.get_logger().info(tactile_log_msg)
-
-            self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
-            visual_log_msg = "Visual Detections: "
-            # 'raw_features_per_cam' now contains the engineered 10-element vectors
-            for cam_id, feats in features_per_cam.items():
-                if feats is None: continue
-                tube_flag = feats[3]
-                peg_flag = feats[7]
-                visual_log_msg += f"{cam_id} [Tube: {'✅' if tube_flag > 0 else '❌'}, Peg: {'✅' if peg_flag > 0 else '❌'}] | "
-            self.get_logger().info(visual_log_msg)
-
-            # self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
-            self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
-            self.get_logger().info(f"Goal State Vector Shape:    {self.goal_state.shape}")
-            self.get_logger().info(f"------------------------")
-            full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
-            
-            # 3. HANDLE HISTORY (Frame Stacking)
-            self.history_buffer.append(full_state_np)
-            if len(self.history_buffer) > self.frame_stack_k:
-                self.history_buffer.pop(0)
-            if len(self.history_buffer) < self.frame_stack_k:
-                self.get_logger().info(f"Filling history buffer... {len(self.history_buffer)}/{self.frame_stack_k}")
-                continue
-
-            state_sequence = torch.from_numpy(np.array(self.history_buffer)).float().to(self.device)
-            
-            # 4. INFER ACTION
-            with torch.no_grad():
-                is_sequence_model = not isinstance(self.model, MLPPolicy)
-                if is_sequence_model:
-                    state_norm = (state_sequence - self.X_mean) / self.X_std
-                    state_norm = state_norm.unsqueeze(0)
-                else: # MLP
-                    state_norm = (state_sequence.flatten() - self.X_mean.repeat(self.frame_stack_k)) / self.X_std.repeat(self.frame_stack_k)
-                    state_norm = state_norm.unsqueeze(0)
+                state_sequence = torch.from_numpy(np.array(self.history_buffer)).float().to(self.device)
                 
-                action_norm = self.model(state_norm).squeeze(0)
-                action_pred = (action_norm * self.y_std) + self.y_mean
+                # 4. INFER ACTION
+                with torch.no_grad():
+                    is_sequence_model = not isinstance(self.model, MLPPolicy)
+                    if is_sequence_model:
+                        state_norm = (state_sequence - self.X_mean) / self.X_std
+                        state_norm = state_norm.unsqueeze(0)
+                    else: # MLP
+                        state_norm = (state_sequence.flatten() - self.X_mean.repeat(self.frame_stack_k)) / self.X_std.repeat(self.frame_stack_k)
+                        state_norm = state_norm.unsqueeze(0)
+                    
+                    action_norm = self.model(state_norm).squeeze(0)
+                    action_pred = (action_norm * self.y_std) + self.y_mean
 
-            # 5. PUBLISH COMMAND
-            delta_arm = action_pred[:self.num_arm_actions]
+                if current_proprio is not None:
+                    self.timestamp_history.append(time_start)
+                    self.proprio_history.append(current_proprio)
+                    self.prediction_history.append(action_pred.cpu().numpy())
 
-            if self.control_mode == 'task_space':
-                current_ee_pose = kinematic_poses['ee']
-                T_current = pin.XYZQUATToSE3(current_ee_pose)
-                T_delta = pin.exp(to_np(delta_arm))
-                T_next = T_current * T_delta
-                target_pose_7d = pin.se3ToXYZQUAT(T_next)
+                # 5. PUBLISH COMMAND
+                action_pred_np = to_np(action_pred)
+
+                # --- 5.1 Process Arm Command ---
+                raw_delta_arm = action_pred_np[:self.num_arm_actions]
+
+                # Step A: Clipping (Saturation)
+                # Enforces a hard limit on the command's magnitude.
+                clipped_delta_arm = np.clip(raw_delta_arm, -self.MAX_ARM_DELTA, self.MAX_ARM_DELTA)
+
+                # Step B: Rate Limiting (Slew Rate Limiter)
+                # Ensures a smooth ramp-up from the previous command. This is KEY.
+                change_arm = clipped_delta_arm - self.previous_arm_command
+                limited_change_arm = np.clip(change_arm, -self.ARM_RATE_LIMIT, self.ARM_RATE_LIMIT)
+                safe_delta_arm = self.previous_arm_command + limited_change_arm
                 
-                pose_msg = PoseStamped()
-                pose_msg.header.stamp = self.get_clock().now().to_msg()
-                pose_msg.header.frame_id = "base" # Or your robot's base frame
-                pose_msg.pose.position.x = target_pose_7d[0]
-                pose_msg.pose.position.y = target_pose_7d[1]
-                pose_msg.pose.position.z = target_pose_7d[2]
-                pose_msg.pose.orientation.x = target_pose_7d[3]
-                pose_msg.pose.orientation.y = target_pose_7d[4]
-                pose_msg.pose.orientation.z = target_pose_7d[5]
-                pose_msg.pose.orientation.w = target_pose_7d[6]
-                self.arm_command_pub.publish(pose_msg)
-            else: # joint_space
-                target_q_arm = self.current_arm_states + to_np(delta_arm)
-                traj_msg = JointTrajectory()
-                traj_msg.joint_names = self.full_joint_names[:self.num_arm_joints]
-                point = JointTrajectoryPoint()
-                point.positions = target_q_arm.tolist()
-                point.time_from_start = Duration(sec=0, nanosec=int(1e9 / self.control_rate))
-                traj_msg.points.append(point)
-                self.arm_command_pub.publish(traj_msg)
+                # Update the state for the next cycle's rate limiter
+                self.previous_arm_command = safe_delta_arm
 
-            # --- Publish Hand Command (only if not in arm_only mode) ---
-            if not self.is_arm_only:
-                delta_hand = action_pred[self.num_arm_actions:]
-                target_q_hand_allegro = self.current_joint_states[7:] + to_np(delta_hand)
-                hand_msg = Float64MultiArray()
-                hand_msg.data = [float(p) for p in target_q_hand_allegro]
-                self.hand_command_pub.publish(hand_msg)
-            else:
-                self.get_logger().info("Published arm command (arm_only mode).")
+                # --- Diagnostic Logging for Arm ---
+                was_limited = not np.allclose(raw_delta_arm, safe_delta_arm, atol=1e-6)
+                limit_status = "⚠️ CLIPPED/LIMITED" if was_limited else "✅ OK"
+                self.get_logger().info(
+                    f"ARM CMD | Status: {limit_status} | "
+                    f"Raw: {np.round(raw_delta_arm, 4)} -> "
+                    f"Safe: {np.round(safe_delta_arm, 4)}"
+                )
 
-            time_end = time.perf_counter()
-            time_sleep = max(0, self.sample_period - (time_end - time_start))
-            time.sleep(time_sleep)
+                # --- Publish Arm Command ---
+                if self.control_mode == 'task_space':
+                    current_ee_pose = kinematic_poses['ee']
+                    T_current = pin.XYZQUATToSE3(current_ee_pose)
+                    # Use the SAFE command to compute the next pose
+                    T_delta = pin.exp(safe_delta_arm)
+                    T_next = T_current * T_delta
+                    target_pose_7d = pin.se3ToXYZQUAT(T_next)
+                    
+                    pose_msg = PoseStamped()
+                    pose_msg.header.stamp = self.get_clock().now().to_msg()
+                    pose_msg.header.frame_id = "base"
+                    pose_msg.pose.position.x = target_pose_7d[0]
+                    pose_msg.pose.position.y = target_pose_7d[1]
+                    pose_msg.pose.position.z = target_pose_7d[2]
+                    pose_msg.pose.orientation.x = target_pose_7d[3]
+                    pose_msg.pose.orientation.y = target_pose_7d[4]
+                    pose_msg.pose.orientation.z = target_pose_7d[5]
+                    pose_msg.pose.orientation.w = target_pose_7d[6]
+                    self.arm_command_pub.publish(pose_msg)
+
+                else: # joint_space
+                    # target_q_arm is in the CANONICAL (J1-J7) order. NO REORDERING NEEDED.
+                    target_q_arm = self.current_arm_states + safe_delta_arm
+                    
+                    traj_msg = JointTrajectory()
+                    
+                    traj_msg.joint_names = self.policy_arm_joint_names # Use the known canonical order
+                    
+                    point = JointTrajectoryPoint()
+                    point.positions = target_q_arm.tolist()
+                    
+                    # Use a safer duration (e.g., 0.5s)
+                    duration_ns = int(1e9/self.control_rate)
+                    point.time_from_start = Duration(sec=0, nanosec=duration_ns)
+                    
+                    traj_msg.points.append(point)
+                    self.arm_command_pub.publish(traj_msg)
+
+                # --- 5.2 Process Hand Command (with same safety logic) ---
+                if not self.is_arm_only:
+                    raw_delta_hand = action_pred_np[self.num_arm_actions:]
+                    
+                    # Apply clipping and rate limiting to the hand
+                    clipped_delta_hand = np.clip(raw_delta_hand, -self.MAX_HAND_DELTA, self.MAX_HAND_DELTA)
+                    change_hand = clipped_delta_hand - self.previous_hand_command
+                    limited_change_hand = np.clip(change_hand, -self.HAND_RATE_LIMIT, self.HAND_RATE_LIMIT)
+                    safe_delta_hand = self.previous_hand_command + limited_change_hand
+                    
+                    # Update for the next cycle
+                    self.previous_hand_command = safe_delta_hand
+
+                    # --- Diagnostic Logging for Hand ---
+                    was_limited_hand = not np.allclose(raw_delta_hand, safe_delta_hand, atol=1e-6)
+                    limit_status_hand = "⚠️ CLIPPED/LIMITED" if was_limited_hand else "✅ OK"
+                    self.get_logger().info(
+                        f"HAND CMD | Status: {limit_status_hand} | "
+                        f"Raw: {np.round(raw_delta_hand[:4], 4)}... -> " # Log first 4 joints for brevity
+                        f"Safe: {np.round(safe_delta_hand[:4], 4)}..."
+                    )
+                    # Use the SAFE hand command
+                    target_q_hand_allegro = self.current_joint_states[7:] + safe_delta_hand
+                    hand_msg = Float64MultiArray()
+                    hand_msg.data = [float(p) for p in target_q_hand_allegro]
+                    self.hand_command_pub.publish(hand_msg)
+
+                time_end = time.perf_counter()
+                time_sleep = max(0, self.sample_period - (time_end - time_start))
+                time.sleep(time_sleep)
+
+        except KeyboardInterrupt:
+            logging.info("Rollout interrupted by user.")
+
+        finally:
+            self.save_trajectory_data()
+
+    def save_trajectory_data(self):
+        """Saves the collected trajectory data to a compressed numpy file."""
+        if not self.proprio_history:
+            self.get_logger().info("No trajectory data to save.")
+            return
+
+        self.get_logger().info(f"💾 Saving trajectory data to rollout_data.npz...")
+        
+        # Use np.stack to convert list of arrays into a single large array
+        np.savez_compressed(
+            str(paths.MODELS_DIR/f"rollout/rollout_{self.model_type}_{self.control_mode}.npz"),
+            timestamps=np.array(self.timestamp_history),
+            proprioception=np.stack(self.proprio_history),
+            predictions=np.stack(self.prediction_history)
+        )
+        self.get_logger().info("✅ Trajectory data saved successfully.")
 
 def main(args=None):
     rclpy.init(args=args)

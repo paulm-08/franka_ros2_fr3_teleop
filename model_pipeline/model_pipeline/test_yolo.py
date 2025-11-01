@@ -28,20 +28,6 @@ def find_yolo_models(search_path):
     logging.info(f"Found {len(found_models)} models.")
     return found_models
 
-def find_demo_dirs(root_search_path):
-    """
-    Recursively searches for directories that contain 'frame_*' folders.
-    """
-    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
-    found_demos = []
-    for dirpath, _, _ in os.walk(root_search_path):
-        if glob.glob(os.path.join(dirpath, 'frame_*')):
-            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
-            found_demos.append(str(relative_path))
-            
-    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
-    return sorted(found_demos)
-
 def draw_detections(image, results, model_names):
     """
     Finds the most confident bounding box for each class and draws it.

@@ -11,6 +11,8 @@ import json
 import torch
 
 from model_pipeline.visual_embedder import VisualEmbedder
+from model_pipeline import paths
+
 from tact9d.shape_reconstruction.sensor import Sensor   # if you rename 9dtact → tact9d
 
 # ---------------- Logger ----------------
@@ -38,6 +40,44 @@ TACT9D_CFG_DIR = REPO_ROOT / "tact9d" / "tact9d" / "shape_reconstruction"
 def get_cfg_path(sensor_name):
     """Return full path to the sensor YAML config file."""
     return TACT9D_CFG_DIR / f"shape_config_{sensor_name}.yaml"
+
+def find_policy_models(search_path):
+    """Finds all policy checkpoint files in the specified directory."""
+    logging.info(f"Searching for trained policy models (.pt) in: {search_path}...")
+    # Find all files ending in _best.pt
+    found_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pt")]
+    logging.info(f"Found {len(found_files)} models.")
+    return [str(p) for p in sorted(found_files)]
+
+def find_pkl_files(search_path):
+    """Finds all .pkl dataset files, prioritizing cleaned files."""
+    logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
+    all_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
+    cleaned_files = sorted([p for p in all_files if 'cleaned' in str(p)])
+    other_files = sorted([p for p in all_files if 'cleaned' not in str(p)])
+    return [str(p) for p in cleaned_files + other_files]
+
+def find_demo_dirs(root_search_path):
+    """
+    Recursively finds all valid demonstration directories.
+    """
+    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
+    found_demos = []
+    for dirpath, _, _ in os.walk(root_search_path):
+        if glob.glob(os.path.join(dirpath, 'frame_*')):
+            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
+            found_demos.append(str(relative_path))
+    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
+    return sorted(found_demos)
+
+def find_config_files(root_search_path):
+    """
+    Finds all .yaml configuration files in the specified directory.
+    """
+    logging.info(f"Searching for configuration files in: {root_search_path}...")
+    found_configs = [p.relative_to(paths.WORKSPACE_ROOT) for p in root_search_path.glob("*.yaml")]
+    logging.info(f"Found {len(found_configs)} config files.")
+    return [str(p) for p in found_configs]
 
 # ---------------- Helpers ----------------
 def load_frame_paths(data_dir="dataset"):

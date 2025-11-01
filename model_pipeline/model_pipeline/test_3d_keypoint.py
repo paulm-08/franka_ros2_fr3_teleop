@@ -14,26 +14,10 @@ import pickle
 # Import your pipeline components
 from model_pipeline import paths
 from model_pipeline.keypoint_extractor import KeypointExtractor
-from model_pipeline.utils import load_frame_paths, load_actions
-from model_pipeline.kinematics import get_urdf_string_from_xacro, KinematicsSolver
+from model_pipeline.utils import load_frame_paths, find_demo_dirs
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 np.set_printoptions(precision=4, suppress=True)
-
-def find_demo_dirs(root_search_path):
-    """Recursively finds all valid demonstration directories."""
-    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
-    found_demos = []
-    for dirpath, _, _ in os.walk(root_search_path):
-        if glob.glob(os.path.join(dirpath, 'frame_*')):
-            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
-            found_demos.append(str(relative_path))
-    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
-    return sorted(found_demos)
-
-def find_pkl_files(search_path):
-    """Finds all .pkl dataset files."""
-    return [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
 
 def draw_detections(image, results, model_names):
     """

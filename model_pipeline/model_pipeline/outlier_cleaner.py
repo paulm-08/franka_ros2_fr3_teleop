@@ -7,6 +7,7 @@ from pathlib import Path
 import inquirer
 
 from model_pipeline import paths
+from model_pipeline.utils import find_pkl_files
 
 
 # --- Logger Setup ---
@@ -85,14 +86,6 @@ def find_and_clean_outliers(input_path, output_path, threshold_action, threshold
         pickle.dump(clean_trajectories, f)
         
     logging.info(f"✅ Successfully saved cleaned dataset to {output_path}")
-
-
-def find_pkl_files(search_path):
-    """Finds all .pkl files in the specified directory."""
-    logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
-    found_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
-    logging.info(f"Found {len(found_files)} files.")
-    return [str(p) for p in found_files]
 
 def main():
     parser = argparse.ArgumentParser(description="Interactively clean outlier trajectories from a .pkl dataset.")

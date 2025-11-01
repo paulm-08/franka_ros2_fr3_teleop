@@ -42,6 +42,7 @@ setup(
             'test_kinematics = model_pipeline.kinematics_test:main',
             'save_calibration = model_pipeline.save_calibration:main',
             'test_3d_keypoint = model_pipeline.test_3d_keypoint:main',
+            'visualize_rollout = model_pipeline.visualize_rollout:main',
         ],
     },
 )

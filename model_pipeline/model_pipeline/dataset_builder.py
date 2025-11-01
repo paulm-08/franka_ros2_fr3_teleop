@@ -33,17 +33,33 @@ import yaml
 import pinocchio as pin
 import inquirer
 import tempfile
+import random
 
 from model_pipeline.visual_embedder import VisualEmbedder
 from model_pipeline.keypoint_extractor import KeypointExtractor
 from model_pipeline.tactile_features import process_tactile_image, TACTILE_FEATURE_DIM
-from model_pipeline.utils import load_frame_paths, load_actions, get_cfg_path, init_sensor
+from model_pipeline.utils import load_frame_paths, load_actions, get_cfg_path, init_sensor, find_demo_dirs, find_config_files
 from model_pipeline import paths
 from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
 
 
 # It's good practice to define sensor names for consistent ordering
 SENSOR_ORDER = ["rindex", "rmiddle", "rthumb"]
+
+# --- Full deterministic mode ---
+SEED = 42
+os.environ["PYTHONHASHSEED"] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.use_deterministic_algorithms(True, warn_only=True)
+
+# Ensure CuDNN doesn't introduce randomness
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+print(f"[INFO] Deterministic mode enabled with seed={SEED}")
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -99,17 +115,24 @@ class VisionProcessor:
             logging.info("Initializing VisionProcessor with ResNet Embedder...")
 
             # 2. Initialize the ResNet Embedder (for RGB and Depth context)
-            global_depth_range = config.get("global_depth_range")
-            if not global_depth_range:
+            global_depth_range = config.get("global_depth_range", None)
+            if global_depth_range is None:
                 logging.warning("Global depth range not found in config, computing it now. This can be slow.")
                 global_depth_range = compute_global_depth_range(data_dirs)
+            else:
+                logging.info(f"Global depth range used: {global_depth_range}")
 
-            # ... (load depth range)
             self.embedder = VisualEmbedder(
                 backbone=config.get("backbone", "resnet18"), device=device,
                 out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
                 global_depth_range=global_depth_range
             )
+            # Force deterministic inference
+            self.embedder.eval()
+            torch.set_grad_enabled(False)
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+
             self.embedder_rgb_dim = self.embedder.out_dim['rgb']
             self.embedder_depth_dim = self.embedder.out_dim['depth']
             logging.info(f"VisualEmbedder initialized. RGB dim: {self.embedder_rgb_dim}, Depth dim: {self.embedder_depth_dim}.")
@@ -188,28 +211,6 @@ def calculate_6d_pose_delta(pose_start: np.ndarray, pose_end: np.ndarray) -> np.
     # This is the "action" that moves from T_start to T_end
     return pin.log(T_delta).vector
     
-def find_demo_dirs(root_search_path):
-    """
-    Recursively finds all valid demonstration directories.
-    """
-    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
-    found_demos = []
-    for dirpath, _, _ in os.walk(root_search_path):
-        if glob.glob(os.path.join(dirpath, 'frame_*')):
-            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
-            found_demos.append(str(relative_path))
-    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
-    return sorted(found_demos)
-
-def find_config_files(root_search_path):
-    """
-    Finds all .yaml configuration files in the specified directory.
-    """
-    logging.info(f"Searching for configuration files in: {root_search_path}...")
-    found_configs = [p.relative_to(paths.WORKSPACE_ROOT) for p in root_search_path.glob("*.yaml")]
-    logging.info(f"Found {len(found_configs)} config files.")
-    return [str(p) for p in found_configs]
-
 def compute_global_depth_range(data_dirs, percentile=99.5):
     """
     (Memory-Efficient Version)
@@ -425,6 +426,7 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
         f2_final = update_features(f2_raw, 'cam2')
         
         visual_list.append(np.concatenate([f1_final, f2_final]))
+        
         # --- Kinematics (End-Effector Pose and Hand Joints) ---
         arm_joints = actions[i, :7]
         hand_joints = actions[i, 7:23]
@@ -437,7 +439,7 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
             if pose_7d[6] < 0: # if qw is negative
                 pose_7d[3:] *= -1 # Flip the entire quaternion [qx, qy, qz, qw]
             kinematic_poses[frame_name] = pose_7d
-            
+
         kinematic_pose_list.append(kinematic_poses)
         hand_joint_list.append(hand_joints)
 
@@ -672,7 +674,6 @@ def build_dataset(data_dirs, out_file, config):
     Args:
         data_dirs (list): List of paths to the raw demonstration directories.
         out_file (str): Path to save the output .pkl file.
-        use_height_map (bool): Whether to use the height map for tactile processing.
         config (dict): A configuration dictionary.
     """
     

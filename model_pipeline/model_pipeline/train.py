@@ -12,9 +12,12 @@ import numpy as np
 import random
 import matplotlib.pyplot as plt
 import yaml
+import math
 
-from model_pipeline.dataset_builder import find_config_files
+from model_pipeline.utils import find_config_files
 from model_pipeline import paths
+from model_pipeline.utils import find_pkl_files
+
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -81,73 +84,147 @@ class GRUPolicy(nn.Module):
         x = self.relu(self.fc1(last_timestep_out))
         return self.fc2(x)
     
-class TransformerPolicy(nn.Module):
-    def __init__(self, input_dim, output_dim, num_heads=4, hidden_dim=256, num_layers=2):
+class PositionalEncoding(nn.Module):
+    """
+    A standard sinusoidal positional encoding module.
+    This is an alternative to learned embeddings.
+    """
+    def __init__(self, d_model, max_len=50):
         super().__init__()
-        # PyTorch's Transformer modules require d_model to be divisible by nhead
-        if input_dim % num_heads != 0:
-            raise ValueError(f"input_dim ({input_dim}) must be divisible by num_heads ({num_heads}).")
-            
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim, batch_first=True, dropout=0.1
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(input_dim, output_dim)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x is expected to be (Batch, SequenceLength, FeatureDim)
-        # For Transformer, we often use a special [CLS] token, but for simple BC,
-        # taking the output of the last token is a strong baseline.
-        transformer_out = self.transformer_encoder(x)
-        last_timestep_out = transformer_out[:, -1, :]
-        return self.fc(last_timestep_out)
+        """
+        x: Shape (Batch, SequenceLength, d_model)
+        """
+        # x.size(1) is the sequence length
+        return x + self.pe[:, :x.size(1), :]
+
+
+class TransformerPolicy(nn.Module):
+    """
+    A Transformer Policy.
+    
+    This version includes:
+    1. An input projection layer (Linear) to map input_dim -> hidden_dim (d_model).
+    2. Learned positional embeddings.
+    3. A final output layer that maps hidden_dim -> output_dim.
+    """
+    def __init__(self, input_dim, output_dim, num_heads=4, hidden_dim=256, num_layers=2, max_seq_len=50):
+        super().__init__()
+        
+        # --- 1. Fix: Project input_dim to hidden_dim (d_model) ---
+        # The Transformer's internal dimension (d_model) should be hidden_dim.
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        
+        # --- 2. Fix: Add Positional Embeddings ---
+        # We need to tell the Transformer the *order* of the states.
+        # Using learned embeddings is common. max_seq_len should be >= your frame_stack size.
+        self.positional_embeddings = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
+        
+        # Alternative: Use fixed sinusoidal embeddings
+        # self.positional_encoding = PositionalEncoding(hidden_dim, max_seq_len)
+
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads}).")
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,  # <-- Use hidden_dim as d_model
+            nhead=num_heads, 
+            dim_feedforward=hidden_dim * 4, # Common practice
+            batch_first=True, 
+            dropout=0.1
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # --- 3. Fix: Final layer maps from hidden_dim to output_dim ---
+        self.output_head = nn.Linear(hidden_dim, output_dim)   
+        self.max_seq_len = max_seq_len
+
+    def forward(self, x):
+        # x is (Batch, SequenceLength, input_dim)
+        if x.size(1) > self.max_seq_len:
+             raise ValueError(f"Input sequence length ({x.size(1)}) exceeds model's max_seq_len ({self.max_seq_len})")
+
+        # 1. Project to hidden_dim
+        x_proj = self.input_projection(x)  # (Batch, SeqLen, hidden_dim)
+        
+        # 2. Add positional embeddings
+        seq_len = x.size(1)
+        x_with_pos = x_proj + self.positional_embeddings[:, :seq_len, :]
+        # Alternative: Use fixed sinusoidal embeddings
+        # x_with_pos = self.positional_encoding(x_proj)
+
+        # 3. Pass through Transformer
+        transformer_out = self.transformer_encoder(x_with_pos) # (Batch, SeqLen, hidden_dim)
+        
+        # 4. Get the output for the *last* token
+        last_timestep_out = transformer_out[:, -1, :] # (Batch, hidden_dim)
+        
+        # 5. Map to action
+        return self.output_head(last_timestep_out) # (Batch, output_dim)
 
 # ===================================================================
 # === DATASET CLASS ===
 # ===================================================================
 class TrajectoryFrameStackDataset(Dataset):
-    def __init__(self, trajectories, frame_stack_k, config, arm_only, norm_stats=None, flatten=True, is_train=False, noise_std=0.0):
+    def __init__(self, trajectories, frame_stack_k, config, arm_only,
+                 norm_stats=None, flatten=True, is_train=False,
+                 obs_noise_std=0.0, drift_noise_std=0.0, return_joints=False):
+        """
+        obs_noise_std  : small noise for robustness to observations (all features)
+        drift_noise_std: larger noise for training drift recovery (only q_t)
+        """
         self.trajectories = trajectories
         self.k = frame_stack_k
         self.flatten = flatten
         self.is_train = is_train
-        self.noise_std = noise_std
-        
-        # --- Get settings from config ---
-        self.arm_only = arm_only
-        control_mode = config.get('control_mode', 'joint_space')
-        self.num_arm_actions = 6 if control_mode == 'task_space' else 7
+        self.obs_noise_std = obs_noise_std
+        self.drift_noise_std = drift_noise_std
+        self.return_joints = return_joints
 
+        # --- Config options ---
+        self.arm_only = arm_only
+        self.control_mode = config.get('control_mode', 'joint_space')
+        self.use_goal = config.get('use_goal', False)
+        self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
+
+        # --- Build sample indices ---
         self.indices = []
         for traj_idx, traj in enumerate(self.trajectories):
             num_samples = traj['state_t'].shape[0]
             if num_samples >= self.k:
-                for frame_idx in range(self.k - 1, num_samples):
+                for frame_idx in range(self.k - 1, num_samples - 1):  # leave one for q_next
                     self.indices.append((traj_idx, frame_idx))
-        
+
+        # --- Normalization stats ---
         if norm_stats:
             self.X_mean, self.X_std, self.y_mean, self.y_std = norm_stats
         else:
-            # The X_unstacked now includes the goal state
-            X_unstacked = np.concatenate([
-                np.concatenate([t['state_t'], t['goal_t']], axis=1) 
-                for t in trajectories
-            ], axis=0)
-            y_unstacked_full = np.concatenate([t['action_t'] for t in trajectories], axis=0)
-            
-            # --- THE DEFINITIVE FIX ---
-            # If training in arm_only mode, compute y_stats ONLY on the arm actions.
-            if self.arm_only:
-                y_unstacked = y_unstacked_full[:, :self.num_arm_actions]
-                logging.info(f"ARM-ONLY mode: Calculating action stats on the first {self.num_arm_actions} dimensions.")
+            if self.use_goal:
+                X_unstacked = np.concatenate([
+                    np.concatenate([t['state_t'], t['goal_t']], axis=1)
+                    for t in trajectories
+                ], axis=0)
             else:
-                y_unstacked = y_unstacked_full
-                logging.info("FULL-BODY mode: Calculating action stats on all dimensions.")
+                X_unstacked = np.concatenate([t['state_t'] for t in trajectories], axis=0)
 
-            self.X_mean = X_unstacked.mean(axis=0); self.X_std = X_unstacked.std(axis=0)
-            self.y_mean = y_unstacked.mean(axis=0); self.y_std = y_unstacked.std(axis=0)
-            self.X_std[self.X_std < 1e-9] = 1.0; self.y_std[self.y_std < 1e-9] = 1.0
-        
+            y_unstacked_full = np.concatenate([t['action_t'] for t in trajectories], axis=0)
+            y_unstacked = (y_unstacked_full[:, :self.num_arm_actions]
+                           if self.arm_only else y_unstacked_full)
+
+            self.X_mean = X_unstacked.mean(axis=0)
+            self.X_std  = X_unstacked.std(axis=0)
+            self.y_mean = y_unstacked.mean(axis=0)
+            self.y_std  = y_unstacked.std(axis=0)
+            self.X_std[self.X_std < 1e-9] = 1.0
+            self.y_std[self.y_std < 1e-9] = 1.0
+
         self.current_state_dim = trajectories[0]['state_t'].shape[1]
 
     def __len__(self):
@@ -156,39 +233,72 @@ class TrajectoryFrameStackDataset(Dataset):
     def __getitem__(self, idx):
         traj_idx, frame_idx = self.indices[idx]
         traj = self.trajectories[traj_idx]
-        
         start_idx, end_idx = frame_idx - self.k + 1, frame_idx + 1
-        
-        # --- (The rest of your __getitem__ is correct) ---
-        # It correctly builds the state, adds noise, and normalizes the action.
-        # Now, it will use the CORRECT y_mean and y_std.
-        
-        full_state_sequence = np.concatenate([
-            traj['state_t'][start_idx:end_idx],
-            traj['goal_t'][start_idx:end_idx],
-        ], axis=1)
-        
+
+        # --- Build stacked states ---
+        if self.use_goal:
+            full_state_sequence = np.concatenate([
+                traj['state_t'][start_idx:end_idx],
+                traj['goal_t'][start_idx:end_idx],
+            ], axis=1)
+        else:
+            full_state_sequence = traj['state_t'][start_idx:end_idx]
+
+        # --- Normalize first ---
         full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
-        
         current_state_norm = full_state_norm[:, :self.current_state_dim]
-        goal_state_norm = full_state_norm[:, self.current_state_dim:]
-        
-        if self.is_train and self.noise_std > 0:
-            noise = np.random.normal(0, self.noise_std, current_state_norm.shape).astype(np.float32)
-            current_state_norm += noise
-        
-        final_state_norm = np.concatenate([current_state_norm, goal_state_norm], axis=1)
-        
-        # Slice the action based on the mode
+        goal_state_norm = full_state_norm[:, self.current_state_dim:] if self.use_goal else None
+
+        # --- Observation noise (all features) ---
+        if self.is_train and self.obs_noise_std > 0:
+            obs_noise = np.random.normal(0, self.obs_noise_std, current_state_norm.shape).astype(np.float32)
+            current_state_norm += obs_noise
+        else:
+            obs_noise = None
+
+        # --- Combine with goal if used ---
+        if self.use_goal:
+            final_state_norm = np.concatenate([current_state_norm, goal_state_norm], axis=1)
+        else:
+            final_state_norm = current_state_norm
+
+        # --- Action normalization ---
         action = traj['action_t'][frame_idx]
         if self.arm_only:
             action = action[:self.num_arm_actions]
-            
         action_norm = (action - self.y_mean) / self.y_std
-        
+
         state_output = final_state_norm.flatten() if self.flatten else final_state_norm
-            
-        return torch.from_numpy(state_output).float(), torch.from_numpy(action_norm).float()
+
+        # --- Drift regularizer / q_t_noisy ---
+        if self.return_joints:
+            joint_start_idx = 24
+            joint_end_idx = joint_start_idx + 7  # arm joints
+
+            # clean q_next (always ground truth)
+            q_next = traj['state_t'][frame_idx + 1, joint_start_idx:joint_end_idx].astype(np.float32)
+
+            # q_t with drift noise (only if training)
+            q_t_clean = traj['state_t'][frame_idx, joint_start_idx:joint_end_idx].astype(np.float32)
+            if self.is_train and self.drift_noise_std > 0:
+                q_t_noisy = q_t_clean + np.random.normal(0, self.drift_noise_std, q_t_clean.shape).astype(np.float32)
+            else:
+                q_t_noisy = q_t_clean
+
+            # --- Replace proprio part of final_state_norm with drifted q_t if needed ---
+            final_state_norm_drifted = final_state_norm.copy()
+            final_state_norm_drifted[-1, joint_start_idx:joint_end_idx] = q_t_noisy
+
+            # Flatten if needed
+            state_output_drifted = final_state_norm_drifted.flatten() if self.flatten else final_state_norm_drifted
+
+            return (torch.from_numpy(state_output_drifted).float(),
+                    torch.from_numpy(action_norm).float(),
+                    torch.from_numpy(q_t_noisy).float(),
+                    torch.from_numpy(q_next).float())
+
+        return (torch.from_numpy(state_output).float(),
+                torch.from_numpy(action_norm).float())
     
 # ===================================================================
 # === UTILITY FUNCTIONS ===
@@ -213,13 +323,6 @@ def build_model(model_type, input_dim, output_dim, **kwargs):
         )
     else:
         raise ValueError(f"Unknown model_type '{model_type}'")
-
-def find_pkl_files(search_path):
-    logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
-    all_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
-    cleaned_files = sorted([p for p in all_files if 'cleaned' in str(p)])
-    other_files = sorted([p for p in all_files if 'cleaned' not in str(p)])
-    return [str(p) for p in cleaned_files + other_files]
 
 # ===================================================================
 # === MAIN FUNCTION ===
@@ -329,6 +432,24 @@ def main():
         logging.info(f"Loaded configuration from {config_path_abs}")
         control_mode = config.get('control_mode', 'joint_space')
         logging.info(f"Control mode: {control_mode}")
+        action_representation = config.get("action_representation", "delta")
+        logging.info(f"Action representation: {action_representation}")
+        use_goal = config.get("use_goal", False)
+        logging.info(f"Use goal conditioning: {use_goal}")
+        use_drift_regularizer = config.get("use_drift_regularizer", False)
+        logging.info(f"Use drift regularizer: {use_drift_regularizer}")
+        drift_loss_weight = config.get("drift_loss_weight", 0.1)
+        if use_drift_regularizer:
+            logging.info(f"     Drift loss weight: {drift_loss_weight}")
+        joint_indices = config.get("joint_indices", [24, 31])
+        obs_noise_std_train = config.get("obs_noise_std_train", 0.01)
+        obs_noise_std_val = config.get("obs_noise_std_val", 0.0)
+        drift_noise_std = config.get("drift_noise_std", 0.05)
+
+        logging.info(f"Observation noise std (train): {obs_noise_std_train}")
+        if final_args.validation:
+            logging.info(f"Observation noise std (val): {obs_noise_std_val}")
+        logging.info(f"Drift noise std: {drift_noise_std}")
 
         if not final_args.dataset_pkl: logging.info("No dataset selected. Exiting."); return
         logging.info(f"Final training configuration: {final_args}")
@@ -382,25 +503,29 @@ def main():
 
             is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
             train_dataset = TrajectoryFrameStackDataset(
-                train_trajectories, 
+                train_trajectories,
                 final_args.frame_stack,
                 config,
-                final_args.arm_only, 
+                final_args.arm_only,
                 flatten=(not is_sequence_model),
-                is_train=True,         # <-- Enable training mode
-                noise_std=0.01         # <-- Add a small amount of noise
+                is_train=True,
+                obs_noise_std=obs_noise_std_train,
+                drift_noise_std=drift_noise_std,
+                return_joints=use_drift_regularizer
             )
-            
-            # Validation dataset should NOT have noise
+
             val_dataset = TrajectoryFrameStackDataset(
-                val_trajectories, 
+                val_trajectories,
                 final_args.frame_stack,
                 config,
                 final_args.arm_only,
                 norm_stats=(train_dataset.X_mean, train_dataset.X_std, train_dataset.y_mean, train_dataset.y_std),
                 flatten=(not is_sequence_model),
-                is_train=False         # <-- Keep this False
+                is_train=False,
+                obs_noise_std=obs_noise_std_val,
+                return_joints=use_drift_regularizer
             )
+
             if len(train_dataset) == 0:
                 logging.error("Training dataset is empty!"); return
 
@@ -409,30 +534,32 @@ def main():
 
         else:
             logging.info(f"Train dataset action shape example: {all_trajectories[0]['action_t'].shape}")
-
             is_sequence_model = final_args.model_type in ["lstm", "gru", "transformer"]
+
             train_dataset = TrajectoryFrameStackDataset(
-                all_trajectories, 
+                all_trajectories,
                 final_args.frame_stack,
                 config,
                 final_args.arm_only,
                 flatten=(not is_sequence_model),
-                is_train=True,         # <-- Enable training mode
-                noise_std=0.01         # <-- Add a small amount of noise
+                is_train=True,
+                obs_noise_std=obs_noise_std_train,
+                drift_noise_std=drift_noise_std,
+                return_joints=use_drift_regularizer
             )
-            
+
             if len(train_dataset) == 0:
                 logging.error("Training dataset is empty!"); return
 
             train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=4)
 
+        # --- Model setup ---
         single_frame_dim = train_dataset.X_mean.shape[0]
         output_dim = train_dataset.y_mean.shape[0]
         input_dim = single_frame_dim * final_args.frame_stack if not is_sequence_model else single_frame_dim
 
-        # --- Build Model ---
         model = build_model(
-            final_args.model_type, input_dim, output_dim, 
+            final_args.model_type, input_dim, output_dim,
             width=final_args.width,
             num_heads=final_args.num_heads,
             hidden_dim=final_args.hidden_dim,
@@ -448,39 +575,71 @@ def main():
         best_val_loss = float('inf')
         best_train_loss = float('inf')
         patience_counter = 0
-        model_save_path = output_dir / f"policy_{final_args.model_type}_best.pt"
+        model_save_path = output_dir / f"policy_{final_args.model_type}_{control_mode}.pt"
 
+        # --- Training loop ---
         try:
             for epoch in range(final_args.epochs):
                 model.train()
                 total_train_loss = 0.0
-                for state_norm, action_norm in train_loader:
+
+                for batch in train_loader:
+                    if use_drift_regularizer:
+                        state_norm, action_norm, q_t_noisy, q_next = batch
+                        q_t_noisy, q_next = q_t_noisy.to(device), q_next.to(device)
+                    else:
+                        state_norm, action_norm = batch
+
                     state_norm, action_norm = state_norm.to(device), action_norm.to(device)
+
+                    # --- Main imitation loss ---
                     pred_norm = model(state_norm)
                     loss = loss_fn(pred_norm, action_norm)
-                    optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+                    # --- Drift loss ---
+                    if use_drift_regularizer:
+                        loss = (1 - drift_loss_weight) * loss
+                        drift_pred = q_t_noisy + pred_norm[:, :q_t_noisy.shape[1]]
+                        drift_loss = loss_fn(drift_pred, q_next)
+                        loss += drift_loss_weight * drift_loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
                     total_train_loss += loss.item()
+
                 avg_train_loss = total_train_loss / len(train_loader)
                 history["train_loss"].append(avg_train_loss)
 
+                # --- Validation phase ---
                 if final_args.validation:
                     model.eval()
                     total_val_loss = 0.0
                     with torch.no_grad():
-                        for state_norm, action_norm in val_loader:
+                        for batch in val_loader:
+                            if use_drift_regularizer:
+                                state_norm, action_norm, q_t, q_next = batch
+                                q_t, q_next = q_t.to(device), q_next.to(device)
+                            else:
+                                state_norm, action_norm = batch
+
                             state_norm, action_norm = state_norm.to(device), action_norm.to(device)
                             pred_norm = model(state_norm)
                             loss = loss_fn(pred_norm, action_norm)
+                            if use_drift_regularizer:
+                                drift_pred = q_t + pred_norm[:, :q_t.shape[1]]
+                                drift_loss = loss_fn(drift_pred, q_next)
+                                loss += drift_loss_weight * drift_loss
                             total_val_loss += loss.item()
+
                     avg_val_loss = total_val_loss / len(val_loader)
                     history["val_loss"].append(avg_val_loss)
-
-                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}")
                 else:
                     logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}")
 
-                    
-                if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss<best_train_loss):
+                # --- Model saving logic (unchanged) ---
+                if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss < best_train_loss):
                     if final_args.validation:
                         best_val_loss = avg_val_loss
                     else:
@@ -506,22 +665,21 @@ def main():
                         "training_config": config,
                         "best_loss": best_val_loss if final_args.validation else best_train_loss,
                         "epoch": epoch + 1,
-                        "arm_only": final_args.arm_only, "num_arm_joints": final_args.num_arm_joints
+                        "arm_only": final_args.arm_only,
+                        "num_arm_joints": final_args.num_arm_joints
                     }, model_save_path)
 
-                    if final_args.validation:
-                        logging.info(f"  -> New best model saved to {model_save_path} (Val Loss: {best_val_loss:.6f})")
-                    else:
-                        logging.info(f"  -> New best model saved to {model_save_path} (Train Loss: {best_train_loss:.6f})")
-
+                    msg = f"  -> New best model saved to {model_save_path} "
+                    msg += f"(Val Loss: {best_val_loss:.6f})" if final_args.validation else f"(Train Loss: {best_train_loss:.6f})"
+                    logging.info(msg)
                     patience_counter = 0
                 else:
                     patience_counter += 1
 
                 if patience_counter >= final_args.patience:
-                    logging.info(f"Validation loss did not improve for {final_args.patience} epochs. Stopping early.")
+                    logging.info(f"Early stopping: no improvement for {final_args.patience} epochs.")
                     break
-                
+
         except KeyboardInterrupt:
             logging.info("Training interrupted.")
         
@@ -540,7 +698,7 @@ def main():
             plt.xlabel("Epoch"); plt.ylabel("MSE Loss"); plt.title(f"Training Loss ({final_args.model_type})")
 
         plt.legend(); plt.grid(True)
-        plot_save_path = debug_dir / f"loss_curve_{final_args.model_type}.png"
+        plot_save_path = debug_dir / f"loss_curve_{final_args.model_type}_{control_mode}.png"
         plt.savefig(plot_save_path)
         logging.info(f"📉 Saved loss curve to {plot_save_path}")
 

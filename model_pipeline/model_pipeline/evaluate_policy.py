@@ -10,10 +10,12 @@ import yaml
 import pinocchio as pin
 import tempfile
 import math
+from scipy.spatial.transform import Rotation as R
 
 from model_pipeline.train import build_model, MLPPolicy
 from model_pipeline import paths
 from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
+from model_pipeline.utils import find_policy_models, find_pkl_files
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -68,24 +70,8 @@ def quaternion_multiply(q1, q2):
     norm = np.sqrt(x*x + y*y + z*z + w*w)
     return np.array([x/norm, y/norm, z/norm, w/norm], dtype=np.float32)
 
-def find_policy_models(search_path):
-    """Finds all policy checkpoint files in the specified directory."""
-    logging.info(f"Searching for trained policy models (.pt) in: {search_path}...")
-    # Find all files ending in _best.pt
-    found_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*_best.pt")]
-    logging.info(f"Found {len(found_files)} models.")
-    return [str(p) for p in sorted(found_files)]
-
-def find_pkl_files(search_path):
-    """Finds all .pkl dataset files, prioritizing cleaned files."""
-    logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
-    all_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
-    cleaned_files = sorted([p for p in all_files if 'cleaned' in str(p)])
-    other_files = sorted([p for p in all_files if 'cleaned' not in str(p)])
-    return [str(p) for p in cleaned_files + other_files]
-
 def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_stack_k,
-                    is_arm_only, num_arm_joints, device, control_mode='joint_space'):
+                    is_arm_only, num_arm_joints, device, control_mode='joint_space', use_goal=False):
     """
     Closed-loop rollout with corrected T|P|V feature alignment and task-space pose propagation.
     The Proprioception (P) dimension now represents 7D EE Pose + 16D Hand Joints.
@@ -144,8 +130,11 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
         
         # Add goal
         goal_window = goal_t.unsqueeze(0).repeat(frame_stack_k, 1)
-        full_state_sequence = torch.cat([state_window, goal_window], dim=1)
-        
+        if use_goal:
+            full_state_sequence = torch.cat([state_window, goal_window], dim=1)
+        else:
+            full_state_sequence = state_window
+
         # Apply normalization (X_mean/X_std)
         if is_sequence_model:
             x_tensor = ((full_state_sequence - X_mean) / (X_std + 1e-8)).unsqueeze(0)
@@ -431,14 +420,17 @@ def main():
         
         # --- ONE-STEP MODE ---
         logging.info("Starting one-step evaluation with frame stacking...")
-        is_sequence_model = model_type in ["lstm", "gru"]
+        is_sequence_model = model_type in ["lstm", "gru", "transformer"]
         flatten_data = not is_sequence_model
         
         X_val_list, y_val_list = [], []
         for traj in val_trajectories:
-            X_unstacked = np.concatenate([
-                traj['state_t'], traj['goal_t']
-            ], axis=1)
+            if config.get('use_goal', False):
+                X_unstacked = np.concatenate([
+                    traj['state_t'], traj['goal_t']
+                ], axis=1)
+            else:
+                X_unstacked = traj['state_t']
             y_unstacked = traj['action_t']
             if len(X_unstacked) < frame_stack_k: continue
             
@@ -571,8 +563,8 @@ def main():
                 arm_names = [f"Joint {i+1}" for i in range(arm_dim)]
             else:
                 arm_dim = num_arm_task_dof
-                arm_label = "Task Δ (m / rad)"
-                arm_names = ["Δx","Δy","Δz","Δroll","Δpitch","Δyaw"]
+                arm_label = "Position (m) / Euler Angle (rad)"
+                arm_names = ["x", "y", "z", "roll", "pitch", "yaw"]
 
             for i, traj in enumerate(val_trajectories[:50]):
                 pred_np, gt_np, metrics = perform_rollout(
@@ -586,6 +578,7 @@ def main():
                     num_arm_joints=7,
                     device=device,
                     control_mode=config.get("control_mode", "joint_space"),
+                    use_goal=config.get("use_goal", False)
                 )
                 all_metrics.append(metrics)
                 all_preds.append(pred_np)
@@ -595,18 +588,52 @@ def main():
                 if i >= 10:       # only plot first 10
                     continue
 
+                # --- DATA PREPARATION FOR PLOTTING ---
+                # By default, use the raw numpy arrays
+                gt_to_plot = gt_np
+                pred_to_plot = pred_np
+                
+                # If in task space, convert quaternions to Euler angles for smooth plots
+                if control_mode == 'task_space':
+                    # Prepare empty arrays for position + euler angles
+                    gt_plot_data = np.zeros((gt_np.shape[0], 6))
+                    pred_plot_data = np.zeros((pred_np.shape[0], 6))
+
+                    # Copy over the position data (x, y, z)
+                    gt_plot_data[:, :3] = gt_np[:, :3]
+                    pred_plot_data[:, :3] = pred_np[:, :3]
+                    
+                    # --- STEP 1: Convert Quaternions to Euler Angles ---
+                    # NOTE: Scipy expects quaternion as [x, y, z, w]
+                    gt_euler = R.from_quat(gt_np[:, 3:7]).as_euler('xyz', degrees=False)
+                    pred_euler = R.from_quat(pred_np[:, 3:7]).as_euler('xyz', degrees=False)
+
+                    # --- STEP 2: "Unwrap" the angles to remove discontinuities ---
+                    # This is the key fix. We apply it column-by-column (axis=0).
+                    gt_euler_unwrapped = np.unwrap(gt_euler, axis=0)
+                    pred_euler_unwrapped = np.unwrap(pred_euler, axis=0)
+                    
+                    # --- STEP 3: Place the continuous angles into the plot data ---
+                    gt_plot_data[:, 3:] = gt_euler_unwrapped
+                    pred_plot_data[:, 3:] = pred_euler_unwrapped
+                    
+                    # Update the variables used for plotting
+                    gt_to_plot = gt_plot_data
+                    pred_to_plot = pred_plot_data
+
                 # ---------- Arm ----------
-                fig, ax = plt.subplots(figsize=(12,6))
+                fig, ax = plt.subplots(figsize=(12, 6))
                 for j in range(arm_dim):
                     c = f"C{j%10}"
-                    ax.plot(gt_np[:, j], c=c, ls='--', label=f"GT {arm_names[j]}")
-                    ax.plot(pred_np[:, j], c=c, label=f"Pred {arm_names[j]}")
+                    # UPDATED: Use the processed data for plotting
+                    ax.plot(gt_to_plot[:, j], c=c, ls='--', label=f"GT {arm_names[j]}")
+                    ax.plot(pred_to_plot[:, j], c=c, label=f"Pred {arm_names[j]}")
                 ax.set(title=f"Rollout vs GT – Arm DOFs (Traj {i+1})",
                     xlabel="Timestep", ylabel=arm_label)
-                ax.legend(loc="upper right", bbox_to_anchor=(1.15,1))
+                ax.legend(loc="upper right", bbox_to_anchor=(1.15, 1))
                 ax.grid(ls='--')
                 plt.tight_layout()
-                plt.savefig(rollout_plot_dir/f"rollout_traj_{i+1}_arm.png")
+                plt.savefig(rollout_plot_dir / f"rollout_traj_{i+1}_arm.png")
                 plt.close(fig)
 
                 # ---------- Hand ----------
@@ -629,28 +656,76 @@ def main():
                     plt.close(fig)
 
             # ---------- Aggregate ----------
-            if all_preds:
-                drift = np.sqrt(np.mean((all_preds[0]-all_gts[0])**2, axis=1))
-                plt.figure(figsize=(10,5))
-                plt.plot(drift)
-                plt.xlabel("Timestep"); plt.ylabel("RMSE")
-                plt.title("Prediction Drift Over Time (Traj 1)")
-                plt.grid(True)
-                plt.savefig(output_dir/"rollout_drift_over_time.png")
-                plt.close()
+            valid_pairs = [
+                (p, g) for p, g in zip(all_preds, all_gts)
+                if p is not None and g is not None and len(p) > 0 and p.shape == g.shape
+            ]
 
-                all_pred = np.concatenate(all_preds)
-                all_gt   = np.concatenate(all_gts)
-                rmse_per_dof = np.sqrt(np.mean((all_pred-all_gt)**2, axis=0))
-                plt.figure(figsize=(12,6))
-                plt.bar(np.arange(len(rmse_per_dof)), rmse_per_dof)
-                plt.xlabel("DOF Index"); plt.ylabel("Overall RMSE")
-                plt.title("Per-DOF Rollout Error (All Validation Rollouts)")
+            if len(valid_pairs) == 0:
+                logging.warning("⚠️ No valid rollout predictions found — skipping aggregate plots.")
+            else:
+                logging.info(f"Generating aggregate rollout plots for {len(valid_pairs)} trajectories...")
+
+                num_to_plot = min(3, len(valid_pairs))
+                num_arm_joints = 7
+                num_hand_joints = 16
+                total_dofs = num_arm_joints if is_arm_only else (num_arm_joints + num_hand_joints)
+
+                fig, axes = plt.subplots(num_to_plot, 1, figsize=(10, 4*num_to_plot), sharex=True)
+                if num_to_plot == 1:
+                    axes = [axes]
+
+                for idx in range(num_to_plot):
+                    pred_np, gt_np = valid_pairs[idx]
+
+                    # --- Always slice the relevant DOFs ---
+                    pred_np = pred_np[:, :total_dofs]
+                    gt_np   = gt_np[:, :total_dofs]
+
+                    if is_arm_only:
+                        # --- Arm-only drift ---
+                        drift_arm = np.sqrt(np.mean((pred_np - gt_np) ** 2, axis=1))
+                        axes[idx].plot(drift_arm, label="Arm Drift", color="C0")
+
+                    else:
+                        # --- Separate Arm and Hand drift curves ---
+                        drift_arm  = np.sqrt(np.mean(
+                            (pred_np[:, :num_arm_joints] - gt_np[:, :num_arm_joints]) ** 2, axis=1
+                        ))
+                        drift_hand = np.sqrt(np.mean(
+                            (pred_np[:, num_arm_joints:total_dofs] - gt_np[:, num_arm_joints:total_dofs]) ** 2, axis=1
+                        ))
+
+                        axes[idx].plot(drift_arm,  label="Arm Drift",  color="C0")
+                        axes[idx].plot(drift_hand, label="Hand Drift", color="C1")
+
+                    axes[idx].set_title(f"Prediction Drift Over Time – Traj {idx+1}")
+                    axes[idx].set_ylabel("RMSE")
+                    axes[idx].grid(ls='--')
+                    axes[idx].legend()
+
+                axes[-1].set_xlabel("Timestep")
+                plt.tight_layout()
+                plt.savefig(output_dir / "rollout_drift_over_time.png")
+                plt.close(fig)
+
+                # ---------- Per-DOF Rollout Error ----------
+                all_pred = np.concatenate([p[:, :total_dofs] for p, _ in valid_pairs], axis=0)
+                all_gt   = np.concatenate([g[:, :total_dofs] for _, g in valid_pairs], axis=0)
+
+                rmse_per_dof = np.sqrt(np.mean((all_pred - all_gt) ** 2, axis=0))
+
+                plt.figure(figsize=(12, 6))
+                plt.bar(np.arange(total_dofs), rmse_per_dof, color='C0' if is_arm_only else 'C2')
+                plt.xlabel("DOF Index")
+                plt.ylabel("Overall RMSE")
+                title_suffix = " (Arm-only)" if is_arm_only else " (Arm + Hand)"
+                plt.title(f"Per-DOF Rollout Error{title_suffix}")
                 plt.grid(True)
                 plt.tight_layout()
-                plt.savefig(output_dir/"rollout_per_dof_error.png")
+                plt.savefig(output_dir / "rollout_per_dof_error.png")
                 plt.close()
-
+    
             avg = {k: np.mean([m[k] for m in all_metrics]) for k in all_metrics[0]}
             logging.info("\n"+"="*50+"\n       📊 AVERAGE ROLLOUT METRICS 📊\n"+"="*50)
             logging.info(f"Avg MSE: {avg['mse']:.6f}\nAvg MAE: {avg['mae']:.6f}\nAvg R² : {avg['r2']:.4f}")

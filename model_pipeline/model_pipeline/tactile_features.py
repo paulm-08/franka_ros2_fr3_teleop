@@ -13,6 +13,7 @@ import logging
 # Assuming utils.py is in the same directory or Python path
 from model_pipeline.utils import make_binary_mask, compute_PCA_weighted
 from model_pipeline import paths
+from model_pipeline.utils import find_demo_dirs
 
 # It's good practice to define the feature dimension as a constant
 TACTILE_FEATURE_DIM = 8
@@ -274,7 +275,7 @@ def main():
     parser = argparse.ArgumentParser(description="Utilities for tactile feature processing.")
     parser.add_argument("--mode", choices=["browse"], default="browse", help="Operation to perform.")
     # Use the dynamic path from paths.py as the default
-    parser.add_argument("--data_dirs", nargs="+", default=[str(paths.RAW_DATA_DIR)], help="List of dataset directories.")
+    parser.add_argument("--data_dirs", nargs="+", default=[str(paths.RAW_DATA_DIR)+'/clipped_data/'], help="List of dataset directories.")
     parser.add_argument("--height_map", action="store_true", help="Use 9DTact height map.")
     args = parser.parse_args()
 

@@ -8,28 +8,10 @@ from pathlib import Path
 import inquirer
 
 from model_pipeline import paths
+from model_pipeline.utils import find_demo_dirs
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-def find_demo_dirs(root_search_path):
-    """
-    Recursively searches a root directory to find all subdirectories that
-    contain 'frame_*' folders, indicating they are valid demonstration datasets.
-    
-    Returns a list of paths relative to the workspace root.
-    """
-    logging.info(f"Searching for demonstration directories in: {root_search_path}...")
-    found_demos = []
-    for dirpath, _, _ in os.walk(root_search_path):
-        # A directory is considered a "demo" if it directly contains frame_* folders
-        if glob.glob(os.path.join(dirpath, 'frame_*')):
-            # Store the path relative to the workspace root for a cleaner display
-            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
-            found_demos.append(str(relative_path))
-            
-    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
-    return sorted(found_demos)
 
 def sample_frames_by_clip(demo_dirs, output_dir, step):
     """

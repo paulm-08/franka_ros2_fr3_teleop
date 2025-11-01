@@ -20,6 +20,29 @@ class KeypointExtractor:
 
         # --- Model and Class Setup ---
         self.model = YOLO(model_path).to(self.device)
+
+        # --- Force deterministic inference ---
+        try:
+            self.model.model.eval()  # put internal nn.Module in eval mode (for BN/dropout)
+        except AttributeError:
+            pass  # some YOLO versions don't have .model attribute directly
+
+        torch.set_grad_enabled(False)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+        # --- Disable augmentation safely ---
+        # Ultralytics builds the predictor lazily, so this may fail before the first inference
+        if hasattr(self.model, "predictor") and self.model.predictor is not None:
+            if hasattr(self.model.predictor, "args"):
+                self.model.predictor.args.augment = False
+                self.model.predictor.args.half = False
+        else:
+            # Patch config directly to ensure same behavior when predictor is built
+            if hasattr(self.model, "overrides"):
+                self.model.overrides["augment"] = False
+                self.model.overrides["half"] = False
+
         self.class_names = self.model.names
         self.target_classes = ['tube_tip', 'peg'] 
         

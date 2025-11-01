@@ -13,16 +13,10 @@ import yaml
 from model_pipeline import paths # Import the new paths module
 from model_pipeline.dataset_builder import SENSOR_ORDER, find_config_files
 from model_pipeline.tactile_features import TACTILE_FEATURE_DIM
+from model_pipeline.utils import find_pkl_files
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-def find_pkl_files(search_path):
-    """Finds all .pkl files in the specified directory."""
-    logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
-    found_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
-    logging.info(f"Found {len(found_files)} files.")
-    return [str(p) for p in found_files]
 
 # ===================================================================
 # === VISUALIZATION HELPER FUNCTIONS ===
@@ -384,7 +378,7 @@ def plot_proprio_action_distributions(X_train, y_train, X_val, y_val, joint_star
     plt.close(fig)
     logging.info(f"📊 Saved proprioception and action plot to {save_path}")
 
-def plot_correlation_heatmap(X_train, tactile_total_dim, visual_dim, output_dir):
+def plot_correlation_heatmap(X_train, tactile_total_dim, proprio_dim, output_dir):
     """
     Generates and saves a feature correlation heatmap, dynamically drawing lines
     to separate feature modalities even after removing constant columns.
@@ -410,7 +404,7 @@ def plot_correlation_heatmap(X_train, tactile_total_dim, visual_dim, output_dir)
     
     # Original boundaries
     tactile_end_orig = tactile_total_dim
-    visual_end_orig = tactile_total_dim + visual_dim
+    visual_end_orig = tactile_total_dim + proprio_dim
 
     # Count how many non-constant columns fall within each original modality block
     new_tactile_boundary = np.sum(non_constant_cols_mask[:tactile_end_orig])
@@ -584,6 +578,7 @@ def visualize_and_split_dataset(input_path, output_path, split_ratio=0.8, seed=4
     
     hand_proprio_dim = 16
     current_idx += hand_proprio_dim
+    proprio_dim = hand_proprio_dim + arm_proprio_dim
     
     if state_config.get('use_3d_tactile'):
         current_idx += len(config['kinematics']['tactile_frames']) * 7
@@ -602,7 +597,7 @@ def visualize_and_split_dataset(input_path, output_path, split_ratio=0.8, seed=4
         plot_tactile_distributions(X_train, X_val, plot_dir)
         plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, plot_dir, config)
         plot_proprio_action_distributions(X_train, y_train, X_val, y_val, joint_start_idx, plot_dir, config)
-        plot_correlation_heatmap(X_train, tactile_total_dim, visual_dim, plot_dir)
+        plot_correlation_heatmap(X_train, tactile_total_dim, proprio_dim, plot_dir)
     
     # --- 5. Save Split Dataset (Optional) ---
     if output_path is None:

@@ -15,14 +15,11 @@ from ament_index_python.packages import get_package_share_directory
 from model_pipeline import paths
 # We can now import the solver and the new helper function
 from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
+from model_pipeline.utils import find_pkl_files
 import dex_retargeting.leap_hand_utils.leap_hand_utils as lhu
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-def find_pkl_files(search_path):
-    """Finds all .pkl dataset files."""
-    return [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
 
 def get_urdf_string_from_xacro():
     """
