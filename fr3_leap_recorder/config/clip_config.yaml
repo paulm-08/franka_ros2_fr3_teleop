@@ -1,0 +1,41 @@
+dataset_root: "/home/user/franka_ros2_ws/data/recorded_data/tube13"
+
+frame_folder_regex: "^frame_(\\d+)$"
+
+# NEW: filename patterns with a {cam} placeholder
+color_pattern: "color_image{cam}.jpg"
+depth_pattern: "depth_image{cam}.png"
+
+tactile_patterns:
+  - "rindex_raw_image.jpg"
+  - "rmiddle_raw_image.jpg"
+  - "rthumb_raw_image.jpg"
+
+
+# number of frames to skip when pressing 4/6
+jump_step: 10
+
+# Option A: let the tool auto-detect cam indices in the first frame (recommended)
+auto_detect_cams: true
+
+# Option B: force an explicit list (e.g., cameras 1..4)
+# cam_ids: [1, 2, 3, 4]
+
+preview: true
+skip_empty_frames: true
+
+# Optional display tuning
+depth_heatmap: "JET"        # JET, TURBO, INFERNO (mapped to OpenCV colormaps)
+normalize_depth_per_image: false   # true = per-image min/max; false = global min/max over first 100 frames
+max_preview_width: 1920     # resize montage to fit this width while keeping aspect ratio
+
+# (Optional) camera metadata (not required for clipping)
+cameras:
+  - id: cam0
+    intrinsics: {fx: 606.0, fy: 606.0, ppx: 320.0, ppy: 240.0}
+    extrinsics:
+      matrix:
+        - [ -1, 0, 0, 0.04 ]
+        - [  0, 0, 1, 0.05 ]
+        - [  0, 1, 0,-0.08 ]
+        - [  0, 0, 0, 1.0 ]

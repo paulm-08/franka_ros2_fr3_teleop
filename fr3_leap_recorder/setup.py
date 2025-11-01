@@ -21,6 +21,9 @@ setup(
     entry_points={
         'console_scripts': [
             'fr3_leap_recorder = fr3_leap_recorder.fr3_leap_recorder:main',
+            'clip = fr3_leap_recorder.demo_clip_sim:main',
+            'merge = fr3_leap_recorder.merge_datasets:main',
+            'delete_frames = fr3_leap_recorder.delete_frames:main',
         ],
     },
 )

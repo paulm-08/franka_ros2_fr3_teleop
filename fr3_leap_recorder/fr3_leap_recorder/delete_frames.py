@@ -55,7 +55,7 @@ def delete_frames(dataset_dir, between=None, dry_run=False):
     else:
         print(f"Deleted {len(deleted)} frames.")
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Delete frame directories by suffix number.")
     parser.add_argument("dataset_dir", help="Path to dataset directory")
     parser.add_argument("--between", nargs="+", type=int, help="One value: delete ≤ N. Two values: delete between N and M inclusive.")
@@ -68,3 +68,6 @@ if __name__ == "__main__":
         between=args.between,
         dry_run=args.dry_run
     )
+
+if __name__ == "__main__":
+    main()

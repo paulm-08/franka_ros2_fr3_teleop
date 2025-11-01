@@ -111,6 +111,9 @@ def merge_datasets(base_dir):
         print(f" -> Final frame count: {next_frame_id} frames")
         print(f" -> Total clip marks: {len(merged_marks)}")
 
-if __name__ == "__main__":
+def main():
     merge_datasets(BASE_DIR)
     print("\nAll merges complete ✅")
+    
+if __name__ == "__main__":
+    main()
