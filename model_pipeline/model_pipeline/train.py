@@ -194,14 +194,14 @@ class TrajectoryFrameStackDataset(Dataset):
         self.use_goal = config.get('use_goal', False)
         self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
 
-        # --- Build sample indices ---
         self.indices = []
         for traj_idx, traj in enumerate(self.trajectories):
             num_samples = traj['state_t'].shape[0]
-            if num_samples >= self.k:
-                for frame_idx in range(self.k - 1, num_samples - 1):  # leave one for q_next
+            # -1 to leave one sample for q_next
+            if num_samples >= self.k + 1: 
+                for frame_idx in range(self.k - 1, num_samples - 1):
                     self.indices.append((traj_idx, frame_idx))
-
+        
         # --- Normalization stats ---
         if norm_stats:
             self.X_mean, self.X_std, self.y_mean, self.y_std = norm_stats
@@ -226,6 +226,17 @@ class TrajectoryFrameStackDataset(Dataset):
             self.y_std[self.y_std < 1e-9] = 1.0
 
         self.current_state_dim = trajectories[0]['state_t'].shape[1]
+        
+        # --- FIX: Get the mean/std for ONLY the proprioceptive state ---
+        # This is needed to normalize q_t_noisy
+        TACTILE_DIM = 24
+        ARM_PROP_DIM = 7 # 7D for pose or 7D for joints
+        self.proprio_start_idx = TACTILE_DIM
+        self.proprio_end_idx = self.proprio_start_idx + ARM_PROP_DIM
+
+        # --- Extract the mean/std for ONLY the arm proprioceptive state ---
+        self.proprio_mean = self.X_mean[self.proprio_start_idx:self.proprio_end_idx]
+        self.proprio_std = self.X_std[self.proprio_start_idx:self.proprio_end_idx]
 
     def __len__(self):
         return len(self.indices)
@@ -244,62 +255,60 @@ class TrajectoryFrameStackDataset(Dataset):
         else:
             full_state_sequence = traj['state_t'][start_idx:end_idx]
 
-        # --- Normalize first ---
         full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
         current_state_norm = full_state_norm[:, :self.current_state_dim]
         goal_state_norm = full_state_norm[:, self.current_state_dim:] if self.use_goal else None
 
-        # --- Observation noise (all features) ---
+        # --- 1. Create the state for IMITATION loss (obs_noise only) ---
+        current_state_obs_noise = current_state_norm.copy()
         if self.is_train and self.obs_noise_std > 0:
-            obs_noise = np.random.normal(0, self.obs_noise_std, current_state_norm.shape).astype(np.float32)
-            current_state_norm += obs_noise
-        else:
-            obs_noise = None
+            current_state_obs_noise += np.random.normal(0, self.obs_noise_std, current_state_norm.shape)
 
-        # --- Combine with goal if used ---
         if self.use_goal:
-            final_state_norm = np.concatenate([current_state_norm, goal_state_norm], axis=1)
+            final_state_obs_noise = np.concatenate([current_state_obs_noise, goal_state_norm], axis=1)
         else:
-            final_state_norm = current_state_norm
+            final_state_obs_noise = current_state_obs_noise
+            
+        state_output_bc = final_state_obs_noise.flatten() if self.flatten else final_state_obs_noise
 
-        # --- Action normalization ---
+        # --- 2. Get the standard action (for IMITATION loss) ---
         action = traj['action_t'][frame_idx]
         if self.arm_only:
             action = action[:self.num_arm_actions]
         action_norm = (action - self.y_mean) / self.y_std
 
-        state_output = final_state_norm.flatten() if self.flatten else final_state_norm
+        if not self.return_joints:
+            return torch.from_numpy(state_output_bc).float(), torch.from_numpy(action_norm).float()
 
-        # --- Drift regularizer / q_t_noisy ---
-        if self.return_joints:
-            joint_start_idx = 24
-            joint_end_idx = joint_start_idx + 7  # arm joints
+        # --- 3. Create the state for DRIFT loss ---
+        q_t_clean = traj['state_t'][frame_idx, self.proprio_start_idx:self.proprio_end_idx].astype(np.float32)
+        q_next_gt = traj['state_t'][frame_idx + 1, self.proprio_start_idx:self.proprio_end_idx].astype(np.float32)
 
-            # clean q_next (always ground truth)
-            q_next = traj['state_t'][frame_idx + 1, joint_start_idx:joint_end_idx].astype(np.float32)
+        if self.is_train and self.drift_noise_std > 0:
+            q_t_noisy = q_t_clean + np.random.normal(0, self.drift_noise_std, q_t_clean.shape).astype(np.float32)
+        else:
+            q_t_noisy = q_t_clean # Use clean state for validation drift loss
 
-            # q_t with drift noise (only if training)
-            q_t_clean = traj['state_t'][frame_idx, joint_start_idx:joint_end_idx].astype(np.float32)
-            if self.is_train and self.drift_noise_std > 0:
-                q_t_noisy = q_t_clean + np.random.normal(0, self.drift_noise_std, q_t_clean.shape).astype(np.float32)
-            else:
-                q_t_noisy = q_t_clean
+        # Normalize the noisy state
+        q_t_noisy_norm = (q_t_noisy - self.proprio_mean) / self.proprio_std
+        
+        # Create the drifted state vector (uses obs_noise on all features)
+        final_state_norm_drifted = final_state_obs_noise.copy()
+        
+        # --- Inject the large drift noise ---
+        # We replace the arm proprio features in the *last* frame of the stack
+        final_state_norm_drifted[-1, self.proprio_start_idx:self.proprio_end_idx] = q_t_noisy_norm
+        
+        state_output_drift = final_state_norm_drifted.flatten() if self.flatten else final_state_norm_drifted
 
-            # --- Replace proprio part of final_state_norm with drifted q_t if needed ---
-            final_state_norm_drifted = final_state_norm.copy()
-            final_state_norm_drifted[-1, joint_start_idx:joint_end_idx] = q_t_noisy
-
-            # Flatten if needed
-            state_output_drifted = final_state_norm_drifted.flatten() if self.flatten else final_state_norm_drifted
-
-            return (torch.from_numpy(state_output_drifted).float(),
-                    torch.from_numpy(action_norm).float(),
-                    torch.from_numpy(q_t_noisy).float(),
-                    torch.from_numpy(q_next).float())
-
-        return (torch.from_numpy(state_output).float(),
-                torch.from_numpy(action_norm).float())
-    
+        return (
+            torch.from_numpy(state_output_bc).float(),    # State for BC loss
+            torch.from_numpy(state_output_drift).float(), # State for Drift loss
+            torch.from_numpy(action_norm).float(),       # Target for BC loss
+            torch.from_numpy(q_t_noisy).float(),         # Un-normalized q_t
+            torch.from_numpy(q_next_gt).float()          # Target for Drift loss
+        )
+        
 # ===================================================================
 # === UTILITY FUNCTIONS ===
 # ===================================================================
@@ -568,6 +577,9 @@ def main():
         optimizer = optim.Adam(model.parameters(), lr=final_args.lr, weight_decay=1e-3)
         loss_fn = nn.MSELoss()
 
+        y_mean_t = torch.from_numpy(train_dataset.y_mean).float().to(device)
+        y_std_t  = torch.from_numpy(train_dataset.y_std).float().to(device)
+
         logging.info(f"Training with Frame Stacking (K={final_args.frame_stack}) for '{final_args.model_type.upper()}' model.")
         logging.info(f"  Input Dim: {input_dim}, Output Dim: {output_dim}")
 
@@ -582,61 +594,112 @@ def main():
             for epoch in range(final_args.epochs):
                 model.train()
                 total_train_loss = 0.0
+                total_imitation_loss = 0.0
+                total_drift_loss = 0.0
 
                 for batch in train_loader:
-                    if use_drift_regularizer:
-                        state_norm, action_norm, q_t_noisy, q_next = batch
-                        q_t_noisy, q_next = q_t_noisy.to(device), q_next.to(device)
+                    if use_drift_regularizer and control_mode == 'joint_space':
+                        state_bc_norm, state_drift_norm, action_norm, q_t_noisy, q_next_gt = batch
+                        state_drift_norm = state_drift_norm.to(device)
+                        q_t_noisy, q_next_gt = q_t_noisy.to(device), q_next_gt.to(device)
                     else:
-                        state_norm, action_norm = batch
+                        state_bc_norm, action_norm = batch
+                        use_drift_regularizer = False
 
-                    state_norm, action_norm = state_norm.to(device), action_norm.to(device)
-
-                    # --- Main imitation loss ---
-                    pred_norm = model(state_norm)
-                    loss = loss_fn(pred_norm, action_norm)
-
-                    # --- Drift loss ---
-                    if use_drift_regularizer:
-                        loss = (1 - drift_loss_weight) * loss
-                        drift_pred = q_t_noisy + pred_norm[:, :q_t_noisy.shape[1]]
-                        drift_loss = loss_fn(drift_pred, q_next)
-                        loss += drift_loss_weight * drift_loss
-
+                    state_bc_norm, action_norm = state_bc_norm.to(device), action_norm.to(device)
                     optimizer.zero_grad()
+
+                    # --- 1. Imitation Loss (BC Loss) ---
+                    # Use the state with only observation noise
+                    pred_norm_bc = model(state_bc_norm)
+                    imitation_loss = loss_fn(pred_norm_bc, action_norm)
+
+                    if use_drift_regularizer:
+                        # --- 2. Drift Loss ---
+                        # Use the state with the large drift noise
+                        pred_norm_drift = model(state_drift_norm)
+                        
+                        # Denormalize using the Tensors
+                        delta_q_pred = (pred_norm_drift * y_std_t) + y_mean_t
+                        
+                        # Predict the next state in UN-NORMALIZED space
+                        q_pred_next = q_t_noisy + delta_q_pred
+                        
+                        # Compare two UN-NORMALIZED states
+                        drift_loss = loss_fn(q_pred_next, q_next_gt)
+                        
+                        # --- 3. Combine the losses ---
+                        loss = (1 - drift_loss_weight) * imitation_loss + (drift_loss_weight * drift_loss)
+                        
+                        total_imitation_loss += imitation_loss.item()
+                        total_drift_loss += drift_loss.item()
+                    else:
+                        loss = imitation_loss # No drift loss
+
                     loss.backward()
                     optimizer.step()
                     total_train_loss += loss.item()
 
                 avg_train_loss = total_train_loss / len(train_loader)
+                avg_imitation_loss = total_imitation_loss / len(train_loader) if use_drift_regularizer else avg_train_loss
+                avg_drift_loss = total_drift_loss / len(train_loader)
                 history["train_loss"].append(avg_train_loss)
 
                 # --- Validation phase ---
                 if final_args.validation:
                     model.eval()
                     total_val_loss = 0.0
+                    total_val_imitation_loss = 0.0
+                    total_val_drift_loss = 0.0
+                    
                     with torch.no_grad():
                         for batch in val_loader:
                             if use_drift_regularizer:
-                                state_norm, action_norm, q_t, q_next = batch
-                                q_t, q_next = q_t.to(device), q_next.to(device)
+                                state_bc_norm, state_drift_norm, action_norm, q_t_noisy, q_next_gt = batch
+                                state_drift_norm = state_drift_norm.to(device)
+                                q_t_noisy, q_next_gt = q_t_noisy.to(device), q_next_gt.to(device)
                             else:
-                                state_norm, action_norm = batch
+                                state_bc_norm, action_norm = batch
+                                use_drift_regularizer = False
 
-                            state_norm, action_norm = state_norm.to(device), action_norm.to(device)
-                            pred_norm = model(state_norm)
-                            loss = loss_fn(pred_norm, action_norm)
+                            # --- 1. Imitation Loss ---
+                            pred_norm_bc = model(state_bc_norm)
+                            imitation_loss = loss_fn(pred_norm_bc, action_norm)
+
                             if use_drift_regularizer:
-                                drift_pred = q_t + pred_norm[:, :q_t.shape[1]]
-                                drift_loss = loss_fn(drift_pred, q_next)
-                                loss += drift_loss_weight * drift_loss
+                                # --- 2. Drift Loss ---
+                                pred_norm_drift = model(state_drift_norm)
+                                delta_q_pred = (pred_norm_drift * y_std_t) + y_mean_t
+                                q_pred_next = q_t_noisy + delta_q_pred # q_t_noisy is clean in validation
+                                drift_loss = loss_fn(q_pred_next, q_next_gt)
+                                
+                                loss = (1 - drift_loss_weight) * imitation_loss + (drift_loss_weight * drift_loss)
+                                
+                                total_val_imitation_loss += imitation_loss.item()
+                                total_val_drift_loss += drift_loss.item()
+                            else:
+                                loss = imitation_loss
+                                
                             total_val_loss += loss.item()
 
                     avg_val_loss = total_val_loss / len(val_loader)
+                    avg_val_imitation = total_val_imitation_loss / len(val_loader) if use_drift_regularizer else avg_val_loss
+                    avg_val_drift = total_val_drift_loss / len(val_loader)
                     history["val_loss"].append(avg_val_loss)
-                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}")
+                    
+                    # --- NEW: Updated logging ---
+                    log_msg = f"Epoch {epoch+1:03d}/{final_args.epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}"
+                    if use_drift_regularizer:
+                        log_msg += f" | (Train BC: {avg_imitation_loss:.6f}, Drift: {avg_drift_loss:.6f})"
+                        log_msg += f" | (Val BC: {avg_val_imitation:.6f}, Drift: {avg_val_drift:.6f})"
+                    logging.info(log_msg)
+                    
                 else:
-                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}")
+                    log_msg = f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}"
+                    if use_drift_regularizer:
+                        log_msg += f" | (Train BC: {avg_imitation_loss:.6f}, Drift: {avg_drift_loss:.6f})"
+                    logging.info(log_msg)
+
 
                 # --- Model saving logic (unchanged) ---
                 if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss < best_train_loss):
