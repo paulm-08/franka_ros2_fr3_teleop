@@ -455,7 +455,7 @@ class DexPilotOptimizer(Optimizer):
         return projected, s2_project_index_origin, s2_project_index_task, projected_dist
 
     def get_objective_function(
-        self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray
+        self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray, orientation_targets = None
     ):
         qpos = np.zeros(self.num_joints)
         qpos[self.idx_pin2fixed] = fixed_qpos

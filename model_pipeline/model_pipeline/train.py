@@ -19,6 +19,13 @@ from model_pipeline.utils import find_config_files
 from model_pipeline import paths
 from model_pipeline.utils import find_pkl_files
 
+try:
+    import pinocchio as pin
+    PINOCCHIO_AVAILABLE = True
+except ImportError:
+    PINOCCHIO_AVAILABLE = False
+    print("Warning: Pinocchio not installed. Task-space drift regularization will not work.")
+
 num_cpus = os.cpu_count() # Get the number of available cores
 TARGET_WORKERS = min(4, num_cpus // 2) 
 
@@ -179,25 +186,22 @@ class TransformerPolicy(nn.Module):
 class TrajectoryFrameStackDataset(Dataset):
     def __init__(self, trajectories, frame_stack_k, config, arm_only,
                  norm_stats=None, flatten=True, is_train=False,
-                 obs_noise_std=0.0, drift_noise_std=0.0, return_joints=False):
-        """
-        obs_noise_std  : small noise for robustness to observations (all features)
-        drift_noise_std: larger noise for training drift recovery (only q_t)
-        """
+                 obs_noise_std=0.0, drift_noise_std=0.0, return_drift_data=False):
+        
         self.trajectories = trajectories
         self.k = frame_stack_k
         self.flatten = flatten
         self.is_train = is_train
         self.obs_noise_std = obs_noise_std
         self.drift_noise_std = drift_noise_std
-        self.return_joints = return_joints
+        self.return_drift_data = return_drift_data
 
         # --- Config options ---
         self.arm_only = arm_only
         self.control_mode = config.get('control_mode', 'joint_space')
         self.use_goal = config.get('use_goal', False)
         self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
-
+        
         self.indices = []
         for traj_idx, traj in enumerate(self.trajectories):
             num_samples = traj['state_t'].shape[0]
@@ -206,10 +210,11 @@ class TrajectoryFrameStackDataset(Dataset):
                 for frame_idx in range(self.k - 1, num_samples - 1):
                     self.indices.append((traj_idx, frame_idx))
         
-        # --- Normalization stats ---
+        # --- Normalization stats calculation (omitted for brevity, assumed correct) ---
         if norm_stats:
             self.X_mean, self.X_std, self.y_mean, self.y_std = norm_stats
         else:
+             # Full stats calculation here... (kept for completeness if needed)
             if self.use_goal:
                 X_unstacked = np.concatenate([
                     np.concatenate([t['state_t'], t['goal_t']], axis=1)
@@ -231,14 +236,12 @@ class TrajectoryFrameStackDataset(Dataset):
 
         self.current_state_dim = trajectories[0]['state_t'].shape[1]
         
-        # --- FIX: Get the mean/std for ONLY the proprioceptive state ---
-        # This is needed to normalize q_t_noisy
+        # --- Proprioceptive state indexing ---
         TACTILE_DIM = 24
-        ARM_PROP_DIM = 7 # 7D for pose or 7D for joints
+        ARM_PROP_DIM = 7 
         self.proprio_start_idx = TACTILE_DIM
         self.proprio_end_idx = self.proprio_start_idx + ARM_PROP_DIM
 
-        # --- Extract the mean/std for ONLY the arm proprioceptive state ---
         self.proprio_mean = self.X_mean[self.proprio_start_idx:self.proprio_end_idx]
         self.proprio_std = self.X_std[self.proprio_start_idx:self.proprio_end_idx]
 
@@ -250,7 +253,7 @@ class TrajectoryFrameStackDataset(Dataset):
         traj = self.trajectories[traj_idx]
         start_idx, end_idx = frame_idx - self.k + 1, frame_idx + 1
 
-        # --- Build stacked states ---
+        # --- Build stacked states (full_state_sequence, full_state_norm, etc.) ---
         if self.use_goal:
             full_state_sequence = np.concatenate([
                 traj['state_t'][start_idx:end_idx],
@@ -267,6 +270,11 @@ class TrajectoryFrameStackDataset(Dataset):
         current_state_obs_noise = current_state_norm.copy()
         if self.is_train and self.obs_noise_std > 0:
             current_state_obs_noise += np.random.normal(0, self.obs_noise_std, current_state_norm.shape)
+        
+            if self.return_drift_data:
+                current_state_obs_noise[:, self.proprio_start_idx:self.proprio_end_idx] = \
+                    current_state_norm[:, self.proprio_start_idx:self.proprio_end_idx]
+
 
         if self.use_goal:
             final_state_obs_noise = np.concatenate([current_state_obs_noise, goal_state_norm], axis=1)
@@ -279,40 +287,60 @@ class TrajectoryFrameStackDataset(Dataset):
         action = traj['action_t'][frame_idx]
         if self.arm_only:
             action = action[:self.num_arm_actions]
-        action_norm = (action - self.y_mean) / self.y_std
+        action_norm = (action - self.y_mean) / self.y_std # action_bc_norm
 
-        if not self.return_joints:
+        if not self.return_drift_data:
             return torch.from_numpy(state_output_bc).float(), torch.from_numpy(action_norm).float()
 
-        # --- 3. Create the state for DRIFT loss ---
+        # --- 3. Prepare data for DRIFT loss ---
         q_t_clean = traj['state_t'][frame_idx, self.proprio_start_idx:self.proprio_end_idx].astype(np.float32)
         q_next_gt = traj['state_t'][frame_idx + 1, self.proprio_start_idx:self.proprio_end_idx].astype(np.float32)
 
+        q_t_noisy = q_t_clean
         if self.is_train and self.drift_noise_std > 0:
-            q_t_noisy = q_t_clean + np.random.normal(0, self.drift_noise_std, q_t_clean.shape).astype(np.float32)
-        else:
-            q_t_noisy = q_t_clean # Use clean state for validation drift loss
+            if self.control_mode == 'joint_space':
+                # Add noise in joint space
+                joint_noise = np.random.normal(0, self.drift_noise_std, q_t_clean.shape).astype(np.float32)
+                q_t_noisy = q_t_clean + joint_noise
+            elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
+                # Add a 6D twist noise in task space
+                twist_noise = np.random.normal(0, self.drift_noise_std, 6).astype(np.float32)
+                T_clean = pin.XYZQUATToSE3(q_t_clean)
+                T_noise = pin.exp(twist_noise)
+                T_noisy = T_clean * T_noise
+                q_t_noisy = pin.SE3ToXYZQUAT(T_noisy)
+            else:
+                q_t_noisy = q_t_clean
 
-        # Normalize the noisy state
+        # Calculate the GROUND TRUTH corrective action required (un-normalized)
+        if self.control_mode == 'joint_space':
+            delta_action_gt_drift = q_next_gt - q_t_noisy
+        elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
+            T_noisy = pin.XYZQUATToSE3(q_t_noisy)
+            T_next_gt = pin.XYZQUATToSE3(q_next_gt)
+            T_corrective = T_noisy.inverse() * T_next_gt
+            delta_action_gt_drift = pin.log(T_corrective).vector
+        else:
+            delta_action_gt_drift = q_next_gt - q_t_noisy
+
+        # Normalize the corrective action to create the drift_action_norm target
+        delta_action_gt_drift_norm = (delta_action_gt_drift - self.y_mean) / self.y_std # action_drift_norm
+
+        # Create the drifted state vector for the model input (state_drift_norm)
         q_t_noisy_norm = (q_t_noisy - self.proprio_mean) / self.proprio_std
-        
-        # Create the drifted state vector (uses obs_noise on all features)
         final_state_norm_drifted = final_state_obs_noise.copy()
-        
-        # --- Inject the large drift noise ---
-        # We replace the arm proprio features in the *last* frame of the stack
         final_state_norm_drifted[-1, self.proprio_start_idx:self.proprio_end_idx] = q_t_noisy_norm
-        
         state_output_drift = final_state_norm_drifted.flatten() if self.flatten else final_state_norm_drifted
 
         return (
-            torch.from_numpy(state_output_bc).float(),    # State for BC loss
-            torch.from_numpy(state_output_drift).float(), # State for Drift loss
-            torch.from_numpy(action_norm).float(),       # Target for BC loss
-            torch.from_numpy(q_t_noisy).float(),         # Un-normalized q_t
-            torch.from_numpy(q_next_gt).float()          # Target for Drift loss
+            torch.from_numpy(state_output_bc).float(),    # 1. State for BC loss
+            torch.from_numpy(state_output_drift).float(), # 2. State for Drift loss
+            torch.from_numpy(action_norm).float(),        # 3. Target for BC loss (action_bc_norm)
+            torch.from_numpy(delta_action_gt_drift_norm).float(), # 4. Target for Drift loss (action_drift_norm)
+            torch.from_numpy(q_t_noisy).float(),          # 5. Un-normalized q_t (Noisy)
+            torch.from_numpy(q_next_gt).float()           # 6. Un-normalized q_next (GT)
         )
-        
+    
 # ===================================================================
 # === UTILITY FUNCTIONS ===
 # ===================================================================
@@ -452,17 +480,19 @@ def main():
         use_drift_regularizer = config.get("use_drift_regularizer", False)
         logging.info(f"Use drift regularizer: {use_drift_regularizer}")
         drift_loss_weight = config.get("drift_loss_weight", 0.1)
+        drift_noise_std = config.get("drift_noise_std", 0.05)
+
         if use_drift_regularizer:
             logging.info(f"     Drift loss weight: {drift_loss_weight}")
+            logging.info(f"     Drift noise std: {drift_noise_std}")
+
         joint_indices = config.get("joint_indices", [24, 31])
         obs_noise_std_train = config.get("obs_noise_std_train", 0.01)
         obs_noise_std_val = config.get("obs_noise_std_val", 0.0)
-        drift_noise_std = config.get("drift_noise_std", 0.05)
 
         logging.info(f"Observation noise std (train): {obs_noise_std_train}")
         if final_args.validation:
             logging.info(f"Observation noise std (val): {obs_noise_std_val}")
-        logging.info(f"Drift noise std: {drift_noise_std}")
 
         if not final_args.dataset_pkl: logging.info("No dataset selected. Exiting."); return
         logging.info(f"Final training configuration: {final_args}")
@@ -524,7 +554,7 @@ def main():
                 is_train=True,
                 obs_noise_std=obs_noise_std_train,
                 drift_noise_std=drift_noise_std,
-                return_joints=use_drift_regularizer
+                return_drift_data=use_drift_regularizer
             )
 
             val_dataset = TrajectoryFrameStackDataset(
@@ -536,7 +566,7 @@ def main():
                 flatten=(not is_sequence_model),
                 is_train=False,
                 obs_noise_std=obs_noise_std_val,
-                return_joints=use_drift_regularizer
+                return_drift_data=use_drift_regularizer
             )
 
             if len(train_dataset) == 0:
@@ -558,7 +588,7 @@ def main():
                 is_train=True,
                 obs_noise_std=obs_noise_std_train,
                 drift_noise_std=drift_noise_std,
-                return_joints=use_drift_regularizer
+                return_drift_data=use_drift_regularizer
             )
 
             if len(train_dataset) == 0:
@@ -597,40 +627,29 @@ def main():
         try:
             for epoch in range(final_args.epochs):
                 model.train()
-                total_train_loss = 0.0
-                total_imitation_loss = 0.0
-                total_drift_loss = 0.0
+                total_train_loss, total_imitation_loss, total_drift_loss = 0.0, 0.0, 0.0
 
                 for batch in train_loader:
-                    if use_drift_regularizer and control_mode == 'joint_space':
-                        state_bc_norm, state_drift_norm, action_norm, q_t_noisy, q_next_gt = batch
+                    # NOTE: Dataset now returns 5 items when using drift regularizer
+                    if use_drift_regularizer:
+                        # action_drift_norm is the normalized corrective action target
+                        state_bc_norm, state_drift_norm, action_bc_norm, action_drift_norm, _, _ = batch 
                         state_drift_norm = state_drift_norm.to(device)
-                        q_t_noisy, q_next_gt = q_t_noisy.to(device), q_next_gt.to(device)
+                        action_drift_norm = action_drift_norm.to(device)
                     else:
-                        state_bc_norm, action_norm = batch
-                        use_drift_regularizer = False
+                        state_bc_norm, action_bc_norm = batch
 
-                    state_bc_norm, action_norm = state_bc_norm.to(device), action_norm.to(device)
+                    state_bc_norm, action_bc_norm = state_bc_norm.to(device), action_bc_norm.to(device)
                     optimizer.zero_grad()
 
                     # --- 1. Imitation Loss (BC Loss) ---
-                    # Use the state with only observation noise
                     pred_norm_bc = model(state_bc_norm)
-                    imitation_loss = loss_fn(pred_norm_bc, action_norm)
+                    imitation_loss = loss_fn(pred_norm_bc, action_bc_norm)
 
                     if use_drift_regularizer:
-                        # --- 2. Drift Loss ---
-                        # Use the state with the large drift noise
+                        # --- 2. Drift Loss (Normalized Action-Space Loss) ---
                         pred_norm_drift = model(state_drift_norm)
-                        
-                        # Denormalize using the Tensors
-                        delta_q_pred = (pred_norm_drift * y_std_t) + y_mean_t
-                        
-                        # Predict the next state in UN-NORMALIZED space
-                        q_pred_next = q_t_noisy + delta_q_pred
-                        
-                        # Compare two UN-NORMALIZED states
-                        drift_loss = loss_fn(q_pred_next, q_next_gt)
+                        drift_loss = loss_fn(pred_norm_drift, action_drift_norm)
                         
                         # --- 3. Combine the losses ---
                         loss = (1 - drift_loss_weight) * imitation_loss + (drift_loss_weight * drift_loss)
@@ -642,8 +661,10 @@ def main():
 
                     loss.backward()
                     optimizer.step()
-                    total_train_loss += loss.item()
+                    # CRITICAL FIX: Accumulate loss for all batches
+                    total_train_loss += loss.item() 
 
+                # Averaging must happen AFTER the loop is complete
                 avg_train_loss = total_train_loss / len(train_loader)
                 avg_imitation_loss = total_imitation_loss / len(train_loader) if use_drift_regularizer else avg_train_loss
                 avg_drift_loss = total_drift_loss / len(train_loader)
@@ -659,23 +680,24 @@ def main():
                     with torch.no_grad():
                         for batch in val_loader:
                             if use_drift_regularizer:
-                                state_bc_norm, state_drift_norm, action_norm, q_t_noisy, q_next_gt = batch
+                                # Get 5 items from the validation loader
+                                state_bc_norm, state_drift_norm, action_bc_norm, action_drift_norm, _, _ = batch
                                 state_drift_norm = state_drift_norm.to(device)
-                                q_t_noisy, q_next_gt = q_t_noisy.to(device), q_next_gt.to(device)
+                                action_drift_norm = action_drift_norm.to(device) # Target for consistent drift loss
                             else:
-                                state_bc_norm, action_norm = batch
-                                use_drift_regularizer = False
+                                state_bc_norm, action_bc_norm = batch
+                                # NOTE: No need to set use_drift_regularizer=False here as it's a global setting
+
+                            state_bc_norm, action_bc_norm = state_bc_norm.to(device), action_bc_norm.to(device)
 
                             # --- 1. Imitation Loss ---
                             pred_norm_bc = model(state_bc_norm)
-                            imitation_loss = loss_fn(pred_norm_bc, action_norm)
+                            imitation_loss = loss_fn(pred_norm_bc, action_bc_norm)
 
                             if use_drift_regularizer:
-                                # --- 2. Drift Loss ---
+                                # --- 2. Drift Loss (Normalized Action-Space Loss - Consistent with Training) ---
                                 pred_norm_drift = model(state_drift_norm)
-                                delta_q_pred = (pred_norm_drift * y_std_t) + y_mean_t
-                                q_pred_next = q_t_noisy + delta_q_pred # q_t_noisy is clean in validation
-                                drift_loss = loss_fn(q_pred_next, q_next_gt)
+                                drift_loss = loss_fn(pred_norm_drift, action_drift_norm)
                                 
                                 loss = (1 - drift_loss_weight) * imitation_loss + (drift_loss_weight * drift_loss)
                                 
@@ -691,7 +713,7 @@ def main():
                     avg_val_drift = total_val_drift_loss / len(val_loader)
                     history["val_loss"].append(avg_val_loss)
                     
-                    # --- NEW: Updated logging ---
+                    # --- Logging ---
                     log_msg = f"Epoch {epoch+1:03d}/{final_args.epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}"
                     if use_drift_regularizer:
                         log_msg += f" | (Train BC: {avg_imitation_loss:.6f}, Drift: {avg_drift_loss:.6f})"

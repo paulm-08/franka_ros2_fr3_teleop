@@ -24,7 +24,8 @@ from model_pipeline.evaluate_policy import find_policy_models
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 def find_goal_files(search_path):
-    return sorted([p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*_goal.pkl")])
+    goal_files = sorted([p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*goal*.pkl")])
+    return goal_files
 
 class StagingController(Node):
     """A single node to handle both arm and hand staging commands."""

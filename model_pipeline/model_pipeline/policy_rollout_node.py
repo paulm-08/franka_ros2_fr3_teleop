@@ -185,7 +185,7 @@ class PolicyRolloutNode(Node):
         self.timestamp_history = []
 
         self.control_rate = self.get_parameter('control_rate_hz').get_parameter_value().double_value
-        self.control_rate = self.control_rate  # Slower rollout for testing
+        self.control_rate = self.control_rate /2  # Slower rollout for testing
         self.sample_period = 1.0 / self.control_rate
 
         logging.info("Commanding a slow, interpolated grasp...")
@@ -685,7 +685,7 @@ class PolicyRolloutNode(Node):
                     point.positions = target_q_arm.tolist()
                     
                     # Use a safer duration (e.g., 0.5s)
-                    duration_ns = int(1e9/self.control_rate)
+                    duration_ns = int(1e9/2/self.control_rate)
                     point.time_from_start = Duration(sec=0, nanosec=duration_ns)
                     
                     traj_msg.points.append(point)

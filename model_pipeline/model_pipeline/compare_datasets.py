@@ -1,8 +1,8 @@
 import hashlib, numpy as np
 import pickle, numpy as np
 
-full = pickle.load(open("/home/user/franka_ros2_ws/data/processed_datasets/processed_dataset_joint_test1.pkl", "rb"))
-small = pickle.load(open("/home/user/franka_ros2_ws/data/processed_datasets/processed_dataset_joint_test2.pkl", "rb"))
+full = pickle.load(open("/home/user/franka_ros2_ws/data/processed_datasets/dataset_joint_kpt_Lemb_hmL.pkl", "rb"))
+small = pickle.load(open("/home/user/franka_ros2_ws/data/processed_datasets/dataset_joint_kpt_Lemb_hm.pkl", "rb"))
 
 def agg_stats(trajs):
     S = np.concatenate([t['state_t'] for t in trajs], axis=0)
