@@ -10,6 +10,7 @@ import inquirer
 import logging
 
 from model_pipeline import paths
+from model_pipeline.utils import find_demo_dirs
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -119,7 +120,7 @@ def main():
         img1_path = os.path.join(current_frame_dir, 'color_image1.jpg')
         img2_path = os.path.join(current_frame_dir, 'color_image2.jpg')
 
-        results = model([img1_path, img2_path], verbose=False, conf=0.1)
+        results = model([img1_path, img2_path], verbose=False, conf=0.01)
         results1, results2 = results[0], results[1]
 
         img1 = cv2.imread(img1_path) if os.path.exists(img1_path) else np.zeros((480, 640, 3), dtype=np.uint8)

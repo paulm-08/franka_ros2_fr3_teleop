@@ -40,7 +40,6 @@ from model_pipeline.keypoint_extractor import KeypointExtractor
 from model_pipeline.tactile_features import process_tactile_image, TACTILE_FEATURE_DIM
 from model_pipeline.utils import load_frame_paths, load_actions, get_cfg_path, init_sensor, find_demo_dirs, find_config_files
 from model_pipeline import paths
-from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
 
 
 # It's good practice to define sensor names for consistent ordering
@@ -87,12 +86,12 @@ class VisionProcessor:
 
         if self.use_keypoint_extractor:
             logging.info("Initializing VisionProcessor with YOLO Keypoint Extractor...")
-        
+            
             # 1. Initialize the KeypointExtractor (for 2D or 3D features)
             self.extractor1 = KeypointExtractor(
                 model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
                 use_3d=self.use_3d_keypoints,
-                confidence_threshold=vision_config.get("confidence_threshold", 0.1),
+                confidence_threshold=vision_config.get("confidence_threshold", 0.01),
                 intrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("intrinsics_path_cam1")),
                 extrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("extrinsics_path_cam1")),
                 device=device
@@ -431,16 +430,21 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
         arm_joints = actions[i, :7]
         hand_joints = actions[i, 7:23]
         
-        _, kinematic_poses = solver.get_all_poses(arm_joints, hand_joints)
 
-        # Canonicalize all poses to prevent sign flipping
-        for frame_name in kinematic_poses:
-            pose_7d = kinematic_poses[frame_name]
-            if pose_7d[6] < 0: # if qw is negative
-                pose_7d[3:] *= -1 # Flip the entire quaternion [qx, qy, qz, qw]
-            kinematic_poses[frame_name] = pose_7d
+        if config['state']['use_3d_tactile'] or config['control_mode'] == "task_space":
+            if solver is None:
+                raise ValueError("[ERROR] A kinematic solver is required for 3D tactile poses or task space Forward Kinematics, but it was not provided.")
+            _, kinematic_poses = solver.get_all_poses(arm_joints, hand_joints)
+            
+            # Canonicalize all poses to prevent sign flipping
+            for frame_name in kinematic_poses:
+                pose_7d = kinematic_poses[frame_name]
+                if pose_7d[6] < 0: # if qw is negative
+                    pose_7d[3:] *= -1 # Flip the entire quaternion [qx, qy, qz, qw]
+                kinematic_poses[frame_name] = pose_7d
 
-        kinematic_pose_list.append(kinematic_poses)
+            kinematic_pose_list.append(kinematic_poses)
+
         hand_joint_list.append(hand_joints)
 
     # --- Convert lists to numpy arrays ---
@@ -676,39 +680,44 @@ def build_dataset(data_dirs, out_file, config):
         out_file (str): Path to save the output .pkl file.
         config (dict): A configuration dictionary.
     """
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Using device: {device}")
 
-    # --- Initialize Kinematics Solver ---
-    urdf_content = get_urdf_string_from_xacro()
-    if not urdf_content: 
-        logging.error("Failed to generate URDF, cannot proceed."); return
+    kinematics_config = config.get("kinematics", {})
+    if kinematics_config:
+        from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
 
-    urdf_temp_file = None
-    try:
-        # 2b. Save to a temporary file for Pinocchio to load
-        # This creates a file with a unique name in the system's temp directory
-        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.urdf', encoding='utf-8') as f:
-            f.write(urdf_content)
-            urdf_temp_file = Path(f.name)
-    
-        kinematics_config = config.get("kinematics", {})
-        solver = KinematicsSolver(
-            urdf_content=urdf_temp_file,
-            end_effector_frame_name=kinematics_config.get("ee_frame", "fr3_hand_tcp"),
-            tactile_frame_names=kinematics_config.get("tactile_frames", []),
-            visualize=False,
-        )
-    except Exception as e:
-        logging.error(f"Error initializing KinematicsSolver: {e}")
-        return
-    finally:
-        # Clean up the temporary URDF file
-        if urdf_temp_file and urdf_temp_file.exists():
-            urdf_temp_file.unlink()
+        # --- Initialize Kinematics Solver ---
+        urdf_content = get_urdf_string_from_xacro()
+        if not urdf_content: 
+            logging.error("Failed to generate URDF, cannot proceed."); return
 
-    logging.info("Kinematics solver initialized.")
+        urdf_temp_file = None
+        try:
+            # 2b. Save to a temporary file for Pinocchio to load
+            # This creates a file with a unique name in the system's temp directory
+            with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.urdf', encoding='utf-8') as f:
+                f.write(urdf_content)
+                urdf_temp_file = Path(f.name)
+        
+            solver = KinematicsSolver(
+                urdf_content=urdf_temp_file,
+                end_effector_frame_name=kinematics_config.get("ee_frame", "fr3_hand_tcp"),
+                tactile_frame_names=kinematics_config.get("tactile_frames", []),
+                visualize=False,
+            )
+        except Exception as e:
+            logging.error(f"Error initializing KinematicsSolver: {e}")
+            return
+        finally:
+            # Clean up the temporary URDF file
+            if urdf_temp_file and urdf_temp_file.exists():
+                urdf_temp_file.unlink()
+
+        logging.info("Kinematics solver initialized.")
+    else:
+        solver = None
 
     # --- Initialize Vision Processor ---
     vision_processor = VisionProcessor(config, device, data_dirs)

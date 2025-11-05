@@ -289,9 +289,6 @@ def main():
         interactive_browse(str(data_dir), use_height_map=args.height_map)
 
 if __name__ == "__main__":
-    main()
-
-if __name__ == "__main__":
     # Example Usage from your terminal:
     # python tactile_features.py --data_dirs /path/to/your/dataset
     main()
