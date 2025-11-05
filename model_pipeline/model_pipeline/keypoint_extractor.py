@@ -11,7 +11,7 @@ class KeypointExtractor:
     - In 2D mode, returns (u, v, confidence, detection_flag).
     - In 3D mode, returns (x, y, z, confidence, detection_flag).
     """
-    def __init__(self, model_path, confidence_threshold=0.1, use_3d=False, intrinsics_path=None, extrinsics_path=None, device=None):
+    def __init__(self, model_path, confidence_threshold=0.01, use_3d=False, intrinsics_path=None, extrinsics_path=None, device=None):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)

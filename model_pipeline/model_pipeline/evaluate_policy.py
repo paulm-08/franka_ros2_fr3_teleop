@@ -14,7 +14,6 @@ from scipy.spatial.transform import Rotation as R
 
 from model_pipeline.train import build_model, MLPPolicy
 from model_pipeline import paths
-from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
 from model_pipeline.utils import find_policy_models, find_pkl_files
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -361,6 +360,7 @@ def main():
 
         solver=None
         if control_mode=='task_space':
+            from model_pipeline.kinematics import KinematicsSolver, get_urdf_string_from_xacro
             # --- Initialize KinematicsSolver for task-space rollouts ---
             urdf_content = get_urdf_string_from_xacro()
             if not urdf_content: 

@@ -51,7 +51,7 @@ def plot_tactile_distributions(X_train, X_val, output_dir):
         ax.set_xlabel('Feature Value'); ax.set_ylabel('Density')
         ax.legend(); ax.grid(True, linestyle='--')
 
-    plt.tight_layout(rect=[0, 0, 1, 1])
+    plt.tight_layout(rect=(0, 0, 1, 1))
     save_path = output_dir / "tactile_feature_distributions.png"
     plt.savefig(save_path)
     plt.close(fig)
@@ -321,7 +321,7 @@ def plot_visual_distributions(X_train, X_val, tactile_total_dim, visual_dim, out
         elif 'Embedding' in t or 'Embedding Dists' in t:
             ax.grid(True, linestyle='--'); ax.set_xlabel('Feature Value'); ax.set_ylabel('Density')
 
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.tight_layout(rect=(0, 0, 1, 0.98))
     save_path = output_dir / "visual_feature_analysis.png"
     plt.savefig(save_path)
     plt.close(fig)
@@ -372,7 +372,7 @@ def plot_proprio_action_distributions(X_train, y_train, X_val, y_val, joint_star
         ax.hist(y_val[:, idx], bins=50, density=True, alpha=0.7, label='Validation Set')
         ax.set_title(f'Action: {name}'); ax.legend(); ax.grid(True, linestyle='--')
         
-    plt.tight_layout(rect=[0, 0, 1, 1])
+    plt.tight_layout(rect=(0, 0, 1, 1))
     save_path = output_dir / "proprio_action_distributions.png"
     plt.savefig(save_path)
     plt.close(fig)
@@ -501,7 +501,7 @@ def plot_trajectory_analysis(all_trajectories, config, output_dir, num_trajector
         if i == num_to_plot - 1: # Only label last row
             ax1.set_xlabel('X (m)'); ax1.set_ylabel('Y (m)'); ax1.set_zlabel('Z (m)')
         else:
-            ax1.set_xticklabels([]); ax1.set_yticklabels([]); ax1.set_zticklabels([])
+            ax1.set_xticklabels([]); ax1.set_yticklabels([]); #ax1.set_zticklabels([])
         ax1.legend(loc='lower left', fontsize='small')
         ax1.view_init(elev=20, azim=-60)
         ax1.set_box_aspect([np.ptp(x), np.ptp(y), np.ptp(z)]) # Equal aspect ratio for dynamic ranges
@@ -532,7 +532,7 @@ def plot_trajectory_analysis(all_trajectories, config, output_dir, num_trajector
         ax3.grid(True, linestyle='--')
         ax3.set_ylim(min_angular * 1.1, max_angular * 1.1) # Consistent Y-limits
     
-    plt.tight_layout(rect=[0.02, 0.03, 1, 0.98]) # Adjust rect for left-side labels
+    plt.tight_layout(rect=(0.02, 0.03, 1, 0.98)) # Adjust rect for left-side labels
     save_path = output_dir / f"trajectory_sanity_check_{num_to_plot}_trajectories.png"
     plt.savefig(save_path)
     plt.close(fig)
@@ -545,6 +545,9 @@ def plot_trajectory_analysis(all_trajectories, config, output_dir, num_trajector
 def visualize_and_split_dataset(input_path, output_path, split_ratio=0.8, seed=42, config=None):
     if not input_path.exists():
         logging.error(f"❌ Input dataset file not found: {input_path}")
+        return
+    if config is None:
+        logging.error(f"❌ Config file not provided.")
         return
     
     # --- 1. Load and Split Trajectories ---

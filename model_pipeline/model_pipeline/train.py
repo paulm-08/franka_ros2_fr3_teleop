@@ -13,10 +13,14 @@ import random
 import matplotlib.pyplot as plt
 import yaml
 import math
+import os
 
 from model_pipeline.utils import find_config_files
 from model_pipeline import paths
 from model_pipeline.utils import find_pkl_files
+
+num_cpus = os.cpu_count() # Get the number of available cores
+TARGET_WORKERS = min(4, num_cpus // 2) 
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -529,8 +533,8 @@ def main():
             if len(train_dataset) == 0:
                 logging.error("Training dataset is empty!"); return
 
-            train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=4)
-            val_loader = DataLoader(val_dataset, batch_size=final_args.batch_size * 2, num_workers=4)
+            train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=TARGET_WORKERS,  pin_memory=True)
+            val_loader = DataLoader(val_dataset, batch_size=final_args.batch_size * 2, num_workers=TARGET_WORKERS,  pin_memory=True)
 
         else:
             logging.info(f"Train dataset action shape example: {all_trajectories[0]['action_t'].shape}")
@@ -551,7 +555,7 @@ def main():
             if len(train_dataset) == 0:
                 logging.error("Training dataset is empty!"); return
 
-            train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=4)
+            train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=TARGET_WORKERS,  pin_memory=True)
 
         # --- Model setup ---
         single_frame_dim = train_dataset.X_mean.shape[0]
