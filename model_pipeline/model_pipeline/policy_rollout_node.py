@@ -13,7 +13,6 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.executors import MultiThreadedExecutor
 import asyncio
 import threading
-from std_msgs.msg import Float64MultiArray
 import pinocchio as pin
 import tempfile
 import random
@@ -21,7 +20,8 @@ import random
 # ROS 2 message types
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from std_msgs.msg import Float64MultiArray
+from control_msgs.msg import JointJog
+from std_msgs.msg import Float64MultiArray, Header
 from geometry_msgs.msg import PoseStamped # For task-space control
 from builtin_interfaces.msg import Duration
 
@@ -67,7 +67,7 @@ class PolicyRolloutNode(Node):
         # --- Declare ROS Parameters (for non-interactive use) ---
         self.declare_parameter('model_path', '')
         self.declare_parameter('goal_state_path', '')
-        self.declare_parameter('control_rate_hz', 20.0)
+        self.declare_parameter('control_rate_hz', 10.0)
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.get_logger().info(f"Using device: {self.device}")
@@ -94,6 +94,7 @@ class PolicyRolloutNode(Node):
         self.is_arm_only = checkpoint.get("arm_only", False)
         self.num_arm_joints = checkpoint.get("num_arm_joints", 7)
         self.model_type = checkpoint["model_type"]
+        self.use_goal = checkpoint["training_config"].get("use_goal", False)
 
         # --- THE CRITICAL FIX: Read hyperparameters from the checkpoint ---
         model_hyperparams = checkpoint.get("model_hyperparams", {})
@@ -123,7 +124,10 @@ class PolicyRolloutNode(Node):
             self.goal_state = torch.from_numpy(pickle.load(f)).float().to(self.device)
 
         self.get_logger().info(f"Loaded model from {model_path_str} (K={self.frame_stack_k}, arm_only={self.is_arm_only})")
-        self.get_logger().info(f"Loaded goal state from {goal_path_str} (Shape: {self.goal_state.shape})")
+        if self.use_goal:
+            self.get_logger().info(f"Loaded goal state from {goal_path_str} (Shape: {self.goal_state.shape})")
+        else:
+            self.get_logger().info(f"Loaded goal state, not using.")
 
         # --- Initialize Hardware APIs (Mirrors fr3_leap_recorder.py) ---
         self.vision_processor = self.initialize_vision_processor()
@@ -141,7 +145,8 @@ class PolicyRolloutNode(Node):
         
         self.joint_state_sub = self.create_subscription(JointState, '/franka/joint_states', self.joint_state_callback, 10)
         if self.control_mode == "joint_space":
-            self.arm_command_pub = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
+            self.arm_command_pub = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10) # JointTrajectoryController
+            # self.arm_command_pub = self.create_publisher(JointJog, '/servo_node/delta_joint_cmds', 10) # MoveIt Servo
         else:
             self.arm_command_pub = self.create_publisher(PoseStamped, '/target_pose', 10)
 
@@ -184,8 +189,13 @@ class PolicyRolloutNode(Node):
         self.prediction_history = []
         self.timestamp_history = []
 
+        # P-Control
+        self.KP_JOINT_GAIN = 15.0  # Proportional gain for position correction (Tune this!)
+        self.target_q_arm = None   # Stores the desired accumulated position.
+
+        # Control rate
         self.control_rate = self.get_parameter('control_rate_hz').get_parameter_value().double_value
-        self.control_rate = self.control_rate /2  # Slower rollout for testing
+        self.control_rate = self.control_rate  # Slower rollout for testing
         self.sample_period = 1.0 / self.control_rate
 
         logging.info("Commanding a slow, interpolated grasp...")
@@ -199,7 +209,7 @@ class PolicyRolloutNode(Node):
         hand_grasp_pose = np.array(hand_grasp_pose)
 
         # Loop to send intermediate poses
-        for i in range(num_steps + 1):
+        for i in range(num_steps +1):
             # Calculate the interpolation factor (alpha) from 0.0 to 1.0
             alpha = i / num_steps
             
@@ -279,7 +289,7 @@ class PolicyRolloutNode(Node):
 
     def initialize_realsense(self):
         """
-        FIXED: Initializes cameras using specific serial numbers for deterministic order,
+        Initializes cameras using specific serial numbers for deterministic order,
         and stores pipelines/aligners with consistent keys ('camera1', 'camera2').
         """
         self.get_logger().info("Initializing RealSense cameras...")
@@ -337,7 +347,7 @@ class PolicyRolloutNode(Node):
             obs['tactile_images'] = {}
             for name, sensor in self.tactile_sensors.items():
                 raw_img = sensor.get_rectify_crop_image()
-                # --- CRITICAL FIX ---
+
                 if raw_img is None:
                     self.get_logger().warn(f"Tactile sensor '{name}' returned a None image. Skipping observation.")
                     return None # Return None for the whole observation if any sensor fails
@@ -448,13 +458,15 @@ class PolicyRolloutNode(Node):
             self.previous_hand_command = np.zeros(16) 
 
         # --- SAFETY PARAMETERS (Tune these for your hardware!) ---
-        self.MAX_ARM_DELTA = 0.05   # Absolute max delta (rad or m)
-        self.ARM_RATE_LIMIT = 0.02  # Max change from the last command
-        self.MAX_HAND_DELTA = 0.1   # Absolute max delta for hand joints
-        self.HAND_RATE_LIMIT = 0.05 # Max change for hand commands
+        self.MAX_ARM_DELTA = 0.1   # Absolute max delta (rad or m)
+        self.ARM_RATE_LIMIT = 0.05  # Max change from the last command
+        self.MAX_HAND_DELTA = 0.5   # Absolute max delta for hand joints
+        self.HAND_RATE_LIMIT = 0.2 # Max change for hand commands
         # ---`--------------------------------------------------------
         
         self.get_logger().info("✅ All dependencies ready. Starting autonomous control loop.")
+
+        step = 0
 
         try:
             while rclpy.ok():
@@ -465,13 +477,15 @@ class PolicyRolloutNode(Node):
                 if obs is None: 
                     time.sleep(self.sample_period)
                     continue
-
+                
                 leap_positions = self.get_current_leap_position()
                 if leap_positions is None: 
                     time.sleep(self.sample_period)
                     continue
                 
                 self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])
+
+                time_sense = time.perf_counter()
 
                 # --- 2. PREPARE STATE (Mirrors dataset_builder.py) ---
                 state_vector_list = []
@@ -569,7 +583,10 @@ class PolicyRolloutNode(Node):
 
                 # --- Final State Assembly ---
                 current_state_np = np.concatenate(state_vector_list)
-                full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
+                if self.use_goal:
+                    full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
+                else:
+                    full_state_np = current_state_np
 
                 # --- DIAGNOSTIC PRINTS ---
                 # self.get_logger().info(f"--- Shape Analysis ---")
@@ -593,8 +610,9 @@ class PolicyRolloutNode(Node):
                 # self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
                 # self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
                 # self.get_logger().info(f"Goal State Vector Shape:    {self.goal_state.shape}")
-                full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
                 
+                time_state = time.perf_counter()
+
                 # 3. HANDLE HISTORY (Frame Stacking)
                 self.history_buffer.append(full_state_np)
                 if len(self.history_buffer) > self.frame_stack_k:
@@ -606,6 +624,8 @@ class PolicyRolloutNode(Node):
 
                 state_sequence = torch.from_numpy(np.array(self.history_buffer)).float().to(self.device)
                 
+                time_history = time.perf_counter()
+
                 # 4. INFER ACTION
                 with torch.no_grad():
                     is_sequence_model = not isinstance(self.model, MLPPolicy)
@@ -623,6 +643,8 @@ class PolicyRolloutNode(Node):
                     self.timestamp_history.append(time_start)
                     self.proprio_history.append(current_proprio)
                     self.prediction_history.append(action_pred.cpu().numpy())
+
+                time_inference = time.perf_counter()
 
                 # 5. PUBLISH COMMAND
                 action_pred_np = to_np(action_pred)
@@ -674,18 +696,74 @@ class PolicyRolloutNode(Node):
                     self.arm_command_pub.publish(pose_msg)
 
                 else: # joint_space
-                    # target_q_arm is in the CANONICAL (J1-J7) order. NO REORDERING NEEDED.
+                    
+                    # dt = 1.0 / self.control_rate # Time step (Delta t)
+
+                    # # 1. Initialize Target Position
+                    # # This must be done on the very first loop.
+                    # if self.target_q_arm is None:
+                    #     self.target_q_arm = self.current_arm_states.copy()
+                    
+                    # # 2. Update Target Position (ACCUMULATION)
+                    # # The target position is the previous target plus the model's desired displacement.
+                    # # This is the correct way to accumulate the target position.
+                    # delta_q_model = safe_delta_arm # Model output is already displacement (rad)
+                    # self.target_q_arm += delta_q_model
+                    
+                    # # 3. Calculate Position Error (e)
+                    # # Error = Target Position (Accumulated) - Current Position (Feedback)
+                    # position_error = self.target_q_arm - self.current_arm_states 
+                    
+                    # # 4. Calculate P-Correction Velocity (v_correction)
+                    # # Corrective velocity = Kp * Error
+                    # p_correction_velocities = position_error * self.KP_JOINT_GAIN 
+                    
+                    # # 5. Calculate Model's Base Velocity (v_model)
+                    # # Convert model's desired displacement into velocity for this cycle: v_model = Delta_q_model / dt
+                    # base_model_velocity = delta_q_model / dt 
+                    
+                    # # 6. Calculate Final Command Velocity (Closed-Loop)
+                    # # Final Velocity = Model Velocity (Intent) + P-Correction (Error Correction)
+                    # desired_joint_velocities = base_model_velocity + p_correction_velocities
+                    
+                    # # 7. Publish to MoveIt Servo using the velocities field
+                    # jog_msg = JointJog()
+                    
+                    # jog_msg.header = Header()
+                    # jog_msg.header.stamp = self.get_clock().now().to_msg()
+                    # jog_msg.header.frame_id = 'base'
+                    
+                    # jog_msg.joint_names = self.policy_arm_joint_names
+
+                    # # CRITICAL CHANGE: Populate the velocities field
+                    # jog_msg.velocities = desired_joint_velocities.tolist()
+                    
+                    # # Ensure the displacements field is empty
+                    # jog_msg.displacements = [] 
+                    
+                    # self.arm_command_pub.publish(jog_msg)
+
+                    # --- 1. Get the Safe Delta Command ---
+                    # We already have safe_delta_arm from the safety layer.
+                    # This is the desired DISPLACEMENT, not velocity.
+                    
+                    # --- 2. Calculate the Target Position ---
+                    # The target is simply our current measured state + the desired displacement.
+                    # This perfectly matches the dataset's logic.
                     target_q_arm = self.current_arm_states + safe_delta_arm
                     
+                    # --- 3. Publish as a Position Command ---
                     traj_msg = JointTrajectory()
-                    
-                    traj_msg.joint_names = self.policy_arm_joint_names # Use the known canonical order
+                    traj_msg.joint_names = self.policy_arm_joint_names
                     
                     point = JointTrajectoryPoint()
                     point.positions = target_q_arm.tolist()
                     
-                    # Use a safer duration (e.g., 0.5s)
-                    duration_ns = int(1e9/2/self.control_rate)
+                    # --- CRITICAL ---
+                    # Tell the controller to get to this point *by the next control cycle*.
+                    # This makes it behave like a sampled-time integrator.
+                    # Set duration to be slightly less than the sample period.
+                    duration_ns = int(self.sample_period * 1e9 * 0.95) 
                     point.time_from_start = Duration(sec=0, nanosec=duration_ns)
                     
                     traj_msg.points.append(point)
@@ -717,9 +795,22 @@ class PolicyRolloutNode(Node):
                     hand_msg = Float64MultiArray()
                     hand_msg.data = [float(p) for p in target_q_hand_allegro]
                     self.hand_command_pub.publish(hand_msg)
-
-                time_end = time.perf_counter()
-                time_sleep = max(0, self.sample_period - (time_end - time_start))
+                
+                step +=1
+                time_publish = time.perf_counter()
+                
+                # --- Logging ---
+                total_time = time_publish - time_start
+                if total_time > self.sample_period:
+                    self.get_logger().warning(f"Loop Overrun: {total_time*1000:.1f}ms")
+                    self.get_logger().info(
+                        f"  Sense: {(time_sense - time_start)*1000:.1f}ms | "
+                        f"Features: {(time_state - time_sense)*1000:.1f}ms | "
+                        f"History: {(time_history - time_state)*1000:.1f}ms | "
+                        f"Inference: {(time_inference - time_history)*1000:.1f}ms | "
+                        f"Publish: {(time_publish - time_inference)*1000:.1f}ms"
+                    )
+                time_sleep = max(0, self.sample_period - (time_publish - time_start))
                 time.sleep(time_sleep)
 
         except KeyboardInterrupt:

@@ -238,9 +238,12 @@ class TrajectoryFrameStackDataset(Dataset):
         
         # --- Proprioceptive state indexing ---
         TACTILE_DIM = 24
-        ARM_PROP_DIM = 7 
+        ARM_PROP_DIM = 7
+        HAND_PROP_DIM = 16
         self.proprio_start_idx = TACTILE_DIM
         self.proprio_end_idx = self.proprio_start_idx + ARM_PROP_DIM
+        if not self.arm_only:
+            self.proprio_end_idx += HAND_PROP_DIM
 
         self.proprio_mean = self.X_mean[self.proprio_start_idx:self.proprio_end_idx]
         self.proprio_std = self.X_std[self.proprio_start_idx:self.proprio_end_idx]
@@ -621,7 +624,11 @@ def main():
         best_val_loss = float('inf')
         best_train_loss = float('inf')
         patience_counter = 0
-        model_save_path = output_dir / f"policy_{final_args.model_type}_{control_mode}.pt"
+        model_save_path = output_dir / f"policy_{final_args.model_type}_{control_mode}_{'arm' if final_args.arm_only else 'hand'}.pt"
+        i = 1
+        while os.path.exists(model_save_path):
+            i+=1
+            model_save_path = output_dir / f"policy_{final_args.model_type}_{control_mode}_{'arm' if final_args.arm_only else 'hand'}{i}.pt"
 
         # --- Training loop ---
         try:

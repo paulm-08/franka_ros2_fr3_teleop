@@ -63,6 +63,7 @@ def main():
     data = np.load(selected_filepath)
     proprio = data['proprioception']  # Shape: (num_steps, 23)
     timestamps = data['timestamps']
+    steps = list(range(len(timestamps)))
     print(f"Loaded {proprio.shape[0]} timesteps.")
 
     # --- 2. Parse Filename for Plotting Info ---
@@ -105,9 +106,9 @@ def main():
     time_axis = timestamps - timestamps[0]  # Time in seconds from start
 
     for i in range(plot_data.shape[1]):
-        ax.plot(time_axis, plot_data[:, i], label=labels[i])
+        ax.plot(steps, plot_data[:, i], label=labels[i])
 
-    ax.set(title=title, xlabel="Time (s)", ylabel=ylabel)
+    ax.set(title=title, xlabel="Steps", ylabel=ylabel)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
     ax.grid(True, linestyle='--')
     plt.tight_layout(rect=[0, 0, 0.9, 1]) # Adjust layout to make space for legend

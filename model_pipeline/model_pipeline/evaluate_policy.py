@@ -69,11 +69,28 @@ def quaternion_multiply(q1, q2):
     norm = np.sqrt(x*x + y*y + z*z + w*w)
     return np.array([x/norm, y/norm, z/norm, w/norm], dtype=np.float32)
 
+def quaternion_normalize(q):
+    norm = np.linalg.norm(q)
+    # Avoid division by zero, though unlikely if propagation is working
+    return q / norm if norm > 1e-8 else np.array([0, 0, 0, 1.0])
+
+
 def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_stack_k,
-                    is_arm_only, num_arm_joints, device, control_mode='joint_space', use_goal=False):
+                    is_arm_only, num_arm_joints, device, control_mode='joint_space', 
+                    use_goal=False, solver=None,
+                    start_time_idx=None,
+                    mimic_rollout_start=False, use_average_policy=False):
     """
-    Closed-loop rollout with corrected T|P|V feature alignment and task-space pose propagation.
-    The Proprioception (P) dimension now represents 7D EE Pose + 16D Hand Joints.
+    Closed-loop rollout with added controls for start time and history initialization
+    to diagnose state-mismatch problems.
+    
+    Args:
+        start_time_idx (int, optional): The frame index to start the rollout from.
+                                     If None, defaults to frame_stack_k - 1.
+        mimic_rollout_start (bool, optional): If True, initializes the history
+                                     by repeating the state at start_time_idx k times
+                                     (simulating a "zero-velocity" start).
+                                     If False, uses the ground-truth history.
     """
     model.eval()
     
@@ -92,34 +109,75 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
 
     # --- DEFINE STATE DIMENSIONS (Structure in GT data is T | P | V) ---
     TACTILE_DIM = 24
-    EE_POSE_DIM = 7  # [x, y, z, qx, qy, qz, qw]
+    ARM_PROP_DIM = 7  # [x, y, z, qx, qy, qz, qw]
     HAND_JOINT_DIM = 16
-    FULL_PROP_DIM = EE_POSE_DIM + HAND_JOINT_DIM # 23 Total
+    FULL_PROP_DIM = ARM_PROP_DIM + HAND_JOINT_DIM # 23 Total
 
-    # P start/end indices are constant regardless of control mode
     PROP_START_IDX = TACTILE_DIM 
     PROP_END_IDX = PROP_START_IDX + FULL_PROP_DIM # 24 + 23 = 47
     VISUAL_START_IDX = PROP_END_IDX
     
-    rollout_steps = min(horizon or total_steps, total_steps - frame_stack_k)
+    # --- NEW: Set up start time and history ---
+    if start_time_idx is None:
+        start_frame = frame_stack_k - 1 # Default: start at the earliest possible frame
+    else:
+        start_frame = start_time_idx
     
-    # Initialize proprioception history (q_pred_history) with ground-truth data
-    # q_pred_history now contains EE_POSE + HAND_JOINTS
-    q_pred_history = state_t[:frame_stack_k, PROP_START_IDX:PROP_END_IDX].clone()
+    # Sanity checks for start_frame
+    if start_frame < frame_stack_k - 1:
+        logging.warning(f"start_time_idx ({start_frame}) is less than frame_stack_k - 1. Clamping to {frame_stack_k - 1}.")
+        start_frame = frame_stack_k - 1
+    if start_frame >= total_steps:
+        logging.error(f"start_time_idx ({start_frame}) is beyond trajectory length ({total_steps}). Cannot run rollout.")
+        return np.array([]), np.array([]), {}
+
+    # Calculate number of steps to run
+    max_possible_steps = total_steps - start_frame - 1 # -1 because we predict one step into the future
+    if horizon is None:
+        rollout_steps = max_possible_steps
+    else:
+        rollout_steps = min(horizon, max_possible_steps)
+    
+    if rollout_steps <= 0:
+        logging.warning(f"Rollout has 0 steps to run (start_frame={start_frame}, total_steps={total_steps}, horizon={horizon}).")
+        return np.array([]), np.array([]), {}
+        
+    # --- NEW: Initialize proprioception history (q_pred_history) ---
+    if mimic_rollout_start:
+        # Mimic a "static" start by repeating the state at start_frame
+        start_state_proprio = state_t[start_frame, PROP_START_IDX:PROP_END_IDX]
+        q_pred_history = start_state_proprio.unsqueeze(0).repeat(frame_stack_k, 1)
+        logging.info(f"Rollout starting at frame {start_frame} for {rollout_steps} steps (Mimicking static start).")
+    else:
+        # Use ground-truth history leading up to start_frame
+        history_start_idx = start_frame - frame_stack_k + 1
+        history_end_idx = start_frame + 1
+        q_pred_history = state_t[history_start_idx:history_end_idx, PROP_START_IDX:PROP_END_IDX].clone()
+        logging.info(f"Rollout starting at frame {start_frame} for {rollout_steps} steps (Using ground-truth history).")
     
     predicted_q_trajectory = []
     is_sequence_model = any(k in model.__class__.__name__.lower() for k in ['lstm', 'gru', 'transformer', 'rnn'])
 
-    # logging.info(f"[LOG_MAG] Y_MEAN (Action Delta): {y_mean.shape}")
+    # Define a simple workspace boundary (adjust as needed)
+    WORKSPACE_MIN = torch.tensor([0.0, -2.0, 0.0], device=device)
+    WORKSPACE_MAX = torch.tensor([2.0, 2.0, 2.0], device=device)
+
+    # Define action dimensions
+    arm_action_dim = 6 if control_mode == 'task_space' else 7
     
     for i in range(rollout_steps):
-        t = i + frame_stack_k - 1
+        # t is the current ground-truth time index
+        t = start_frame + i
 
-        # 1. Extract Ground Truth Sensory data
-        tactile_gt_stack = state_t[t - frame_stack_k + 1 : t + 1, 0:TACTILE_DIM]
-        visual_gt_stack = state_t[t - frame_stack_k + 1 : t + 1, VISUAL_START_IDX:state_dim]
+        # 1. Extract Ground Truth Sensory data for time t
+        # The history window is [t - k + 1, t + 1]
+        current_history_start_idx = t - frame_stack_k + 1
+        current_history_end_idx = t + 1
         
-        # --- CRITICAL FIX: RECONSTRUCT STATE AS [T | P_pred | V] ---
+        tactile_gt_stack = state_t[current_history_start_idx : current_history_end_idx, 0:TACTILE_DIM]
+        visual_gt_stack = state_t[current_history_start_idx : current_history_end_idx, VISUAL_START_IDX:state_dim]
+        
+        # 2. RECONSTRUCT STATE AS [T_gt | P_pred | V_gt] ---
         # P_pred is [EE_POSE (7D), HAND_JOINTS (16D)]
         state_window = torch.cat([
             tactile_gt_stack,
@@ -127,120 +185,116 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
             visual_gt_stack 
         ], dim=1) 
         
-        # Add goal
+        # 3. Add goal
         goal_window = goal_t.unsqueeze(0).repeat(frame_stack_k, 1)
         if use_goal:
             full_state_sequence = torch.cat([state_window, goal_window], dim=1)
         else:
             full_state_sequence = state_window
 
-        # Apply normalization (X_mean/X_std)
+        # 4. Apply normalization (X_mean/X_std)
         if is_sequence_model:
             x_tensor = ((full_state_sequence - X_mean) / (X_std + 1e-8)).unsqueeze(0)
         else:
-            flat = full_state_sequence.flatten()
-            norm_flat = (flat - X_mean.repeat(frame_stack_k)) / (X_std.repeat(frame_stack_k) + 1e-8)
+            # For MLP, flatten the k frames
+            flat_state = full_state_sequence.flatten()
+            norm_flat = (flat_state - X_mean.repeat(frame_stack_k)) / (X_std.repeat(frame_stack_k) + 1e-8)
             x_tensor = norm_flat.unsqueeze(0)
 
-        # --- Model forward and De-normalize (Y_mean/Y_std) ---
+        # 5. Model forward and De-normalize (Y_mean/Y_std) ---
         with torch.no_grad():
-            y_pred_norm = model(x_tensor).squeeze(0)
+            if use_average_policy:
+                # DUMMY POLICY: Sets normalized prediction to 0, which results in delta_action_pred = y_mean
+                y_pred_norm = torch.zeros_like(y_std) 
+                # Note: We skip the model(x_tensor) call entirely.
+            else:
+                # Standard model inference
+                y_pred_norm = model(x_tensor).squeeze(0)
+
             delta_action_pred = (y_pred_norm * y_std) + y_mean
             
-        # --- Propagate next proprio ---
-        # last_q_full = [EE_POSE(7), HAND_JOINTS(16)]
-        last_q_full = q_pred_history[-1]
+        # 6. Propagate next proprio ---
+        # last_q_full_proprio is the predicted state at time t
+        last_q_full_proprio = q_pred_history[-1] # [EE_POSE(7), HAND_JOINTS(16)]
         
+        # Deconstruct predicted action (delta for time t)
+        delta_arm_pred = delta_action_pred[:arm_action_dim]
+        if is_arm_only:
+            delta_hand_pred = torch.zeros(HAND_JOINT_DIM, device=device)
+        else:
+            delta_hand_pred = delta_action_pred[arm_action_dim:]
+            
+        # Deconstruct last proprio state (at time t)
+        last_q_arm = last_q_full_proprio[:ARM_PROP_DIM]
+        last_q_hand = last_q_full_proprio[ARM_PROP_DIM:]
+        
+        # 7. Propagate Hand (simple addition) -> state for t+1
+        next_q_hand = last_q_hand + delta_hand_pred
+
+        # 8. Propagate Arm (mode-dependent) -> state for t+1
         if control_mode == 'joint_space':
-            
-            # Calculate next full state
-            if is_arm_only:
-                delta_q_pred_arm = delta_action_pred
-                hand_zeros = torch.zeros(FULL_PROP_DIM - num_arm_joints, device=device)
-                full_delta_q = torch.cat([delta_q_pred_arm, hand_zeros])
-                # logging.info(f"[STEP {i:03d}] ΔQ_ARM | Min:{delta_q_pred_arm.min().item():.6f}, Max:{delta_q_pred_arm.max().item():.6f}, Norm:{delta_q_pred_arm.norm().item():.6f}")
-
-            else:
-                full_delta_q = delta_action_pred
-            
-            # --- Joint Limit Clamping (Only applies to Hand Joints) ---
-            q_pred_next = last_q_full + full_delta_q
-            q_pred_next[:EE_POSE_DIM] = torch.clamp(
-                q_pred_next[:EE_POSE_DIM], 
-                joint_min[:EE_POSE_DIM], 
-                joint_max[:EE_POSE_DIM]
-            )
-
-
+            next_q_arm = last_q_arm + delta_arm_pred
+            next_q_arm = torch.clamp(next_q_arm, joint_min[:num_arm_joints], joint_max[:num_arm_joints])
+        
         elif control_mode == 'task_space':
-            # ACTION: 6D EE Pose Delta (Linear+Angular) + 16D Hand Joint Delta
-
-            # 1. Calculate the action
-            if is_arm_only:
-                delta_x_ee = to_np(delta_action_pred) # 6D
-                delta_q_hand = torch.zeros(FULL_PROP_DIM - num_arm_joints, device=device)
-                # full_delta_q = torch.cat([delta_q_pred_arm, hand_zeros])
-
-            else:
-                # Split the action into EE Delta (6D) and Hand Delta (16D)
-                delta_x_ee = to_np(delta_action_pred[:6]) # 6D
-                delta_q_hand = delta_action_pred[6:]      # 16D (assuming model predicts hand delta)
-
-            # 2. Get last pose components
-            last_pose_np = to_np(last_q_full[:EE_POSE_DIM])
-            last_x_pos, last_q_quat = last_pose_np[:3], last_pose_np[3:]
-
-            # 3. Propagate Position (Linear Delta)
-            next_x_pos = last_x_pos + delta_x_ee[:3]
+            if solver is None:
+                raise ValueError("KinematicsSolver 'solver' is None, but control_mode is 'task_space'.")
+                
+            T_current = pin.XYZQUATToSE3(to_np(last_q_arm))
+            T_delta = pin.exp(to_np(delta_arm_pred))
+            T_next = T_current * T_delta
+            next_pose_np = pin.SE3ToXYZQUAT(T_next)
             
-            # 4. Propagate Orientation (Angular Delta)
-            delta_rpy = delta_x_ee[3:]
-            q_delta = quaternion_from_rpy_delta(delta_rpy)
-            next_q_quat = quaternion_multiply(last_q_quat, q_delta)
+            if next_pose_np[6] < 0: # Canonicalize quaternion
+                next_pose_np[3:] *= -1
             
-            # 5. Combine next EE Pose (7D)
-            next_pose_np = np.concatenate([next_x_pos, next_q_quat])
-            next_pose = torch.as_tensor(next_pose_np, dtype=torch.float32, device=device)
-            
-            # 6. Propagate Hand Joints (Simple addition)
-            next_hand_q = last_q_full[EE_POSE_DIM:] + delta_q_hand
-            
-            # 7. Combine next full proprioceptive state (7D EE Pose + 16D Hand Joints)
-            q_pred_next = torch.cat([next_pose, next_hand_q])
+            next_q_arm = torch.as_tensor(next_pose_np, dtype=torch.float32, device=device)
             
         else:
             raise ValueError(f"Unknown control_mode: {control_mode}")
 
-        # --- Joint Limit Clamping (Only applies to Hand Joints) ---
-        # NOTE: Arm-joint limits are irrelevant as we track EE pose, but hand joint
-        # limits must still be applied to the 16D hand part of q_pred_next.
-        # Assuming joint_limits is FULL_PROP_DIM long, we only clamp the 16 hand joints.
-        HAND_LIMIT_START = EE_POSE_DIM
-        q_pred_next[HAND_LIMIT_START:] = torch.clamp(
-            q_pred_next[HAND_LIMIT_START:], 
-            joint_min[HAND_LIMIT_START:], 
-            joint_max[HAND_LIMIT_START:]
+        # 9. Clamp Hand Joints (Arm is already clamped or is a pose)
+        next_q_hand = torch.clamp(
+            next_q_hand, 
+            joint_min[num_arm_joints:], 
+            joint_max[num_arm_joints:]
         )
         
-        # logging.info(f"[STEP {i:03d}] P_NEXT | EE Pos Avg:{q_pred_next[:3].mean().item():.3f}, Hand Jts Min:{q_pred_next[HAND_LIMIT_START:].min().item():.3f}")
-
-        # Update history
+        # 10. Recombine into full 23-DOF proprio vector for t+1
+        q_pred_next = torch.cat([next_q_arm, next_q_hand])
+        
+        # 11. Update history for next iteration
         predicted_q_trajectory.append(to_np(q_pred_next))
         q_pred_history = torch.roll(q_pred_history, shifts=-1, dims=0)
-        q_pred_history[-1] = q_pred_next
+        q_pred_history[-1] = q_pred_next # Insert new predicted state for t+1
 
     # --- Metrics Calculation ---
     pred_np = np.array(predicted_q_trajectory)
-    gt_np = to_np(state_t[frame_stack_k : rollout_steps + frame_stack_k, PROP_START_IDX:PROP_END_IDX])
+    
+    # Ground truth states must align with predicted states
+    # We predicted states from (start_frame + 1) to (start_frame + rollout_steps)
+    gt_start_idx = start_frame + 1
+    gt_end_idx = start_frame + 1 + rollout_steps
+    
+    gt_np = to_np(state_t[gt_start_idx : gt_end_idx, PROP_START_IDX:PROP_END_IDX])
+
+    # Safety check
+    if len(pred_np) == 0 or len(gt_np) == 0:
+        logging.warning("Rollout or GT has length 0. Returning empty metrics.")
+        return np.array([]), np.array([]), {'mse': np.nan, 'mae': np.nan, 'r2': np.nan}
+    
+    if len(pred_np) != len(gt_np):
+        logging.warning(f"Mismatch in pred ({len(pred_np)}) and gt ({len(gt_np)}) lengths. Truncating.")
+        min_len = min(len(pred_np), len(gt_np))
+        pred_np = pred_np[:min_len]
+        gt_np = gt_np[:min_len]
 
     # If is_arm_only=True, metrics are calculated on the 7D EE pose only
     if is_arm_only:
-        # EE Pose is the first 7 elements of the proprioception vector
-        gt_for_metrics = gt_np[:, :EE_POSE_DIM]
-        pred_for_metrics = pred_np[:, :EE_POSE_DIM]
-        logging.info(f"  (Metrics on 7D EE Pose only)")
+        gt_for_metrics = gt_np[:, :ARM_PROP_DIM]
+        pred_for_metrics = pred_np[:, :ARM_PROP_DIM]
+        # logging.info(f"  (Metrics on 7D EE Pose only)")
     else:
-        # Metrics on the full 23D vector (EE Pose + Hand Joints)
         gt_for_metrics = gt_np
         pred_for_metrics = pred_np
 
@@ -249,8 +303,6 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
         'mae': mean_absolute_error(gt_for_metrics, pred_for_metrics),
         'r2': r2_score(gt_for_metrics, pred_for_metrics)
     }
-
-    # logging.info(f"[DEBUG] Final rollout metrics: {metrics}")
     
     return pred_np, gt_np, metrics
 
@@ -263,6 +315,9 @@ def main():
     parser.add_argument("--horizon", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split_ratio", type=float, default=0.85)
+    parser.add_argument("--start_step", type=int, default=None)
+    parser.add_argument("--mimic_rollout_start", action="store_true")
+    parser.add_argument("--dummy", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -381,6 +436,7 @@ def main():
                     tactile_frame_names=kinematics_config.get("tactile_frames", []),
                     visualize=False,
                 )
+
             except Exception as e:
                 logging.error(f"Error initializing KinematicsSolver: {e}")
                 return
@@ -400,7 +456,7 @@ def main():
             # Random or all trajectories
             val_trajectories = all_trajectories
 
-        # --- NEW: Slice the validation data if it's an arm-only model ---
+        # --- Slice the validation data if it's an arm-only model ---
         if is_arm_only:
             for traj in val_trajectories:
                 # traj['joints_t'] = traj['joints_t'][:, :num_arm_joints]
@@ -449,7 +505,12 @@ def main():
                 X_val_norm = (X_val_raw - X_mean.repeat(frame_stack_k)) / X_std.repeat(frame_stack_k)
             else: # Sequence models
                 X_val_norm = (X_val_raw - X_mean) / X_std
-            pred_norm = model(X_val_norm)
+
+            if final_args.dummy:
+                pred_norm = torch.zeros(X_val_norm.shape[0], joint_dim, device=device)
+            else:
+                pred_norm = model(X_val_norm)
+
             action_pred = (pred_norm * y_std) + y_mean
         
         action_pred_np = to_np(action_pred)
@@ -578,7 +639,11 @@ def main():
                     num_arm_joints=7,
                     device=device,
                     control_mode=config.get("control_mode", "joint_space"),
-                    use_goal=config.get("use_goal", False)
+                    use_goal=config.get("use_goal", False),
+                    solver = solver,
+                    mimic_rollout_start=final_args.mimic_rollout_start,
+                    start_time_idx=final_args.start_step,
+                    use_average_policy=final_args.dummy,
                 )
                 all_metrics.append(metrics)
                 all_preds.append(pred_np)
