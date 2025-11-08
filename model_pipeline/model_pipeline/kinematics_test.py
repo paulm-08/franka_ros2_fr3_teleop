@@ -119,7 +119,7 @@ def main():
         all_trajectories = pickle.load(f)
     
     traj = all_trajectories[0]
-    joint_states = traj['joints_t']
+    joint_states = traj['state_t'][:,24:24+23]
     
     logging.info(f"--- Running Forward Kinematics on first 10 steps of trajectory 0 ---")
     np.set_printoptions(precision=4, suppress=True)
@@ -143,7 +143,7 @@ def main():
 
         # --- Update the visualizer ---
         solver.update_visualizer(q_full)
-        time.sleep(0.1)  # Small delay to visualize
+        time.sleep(0.05)  # Small delay to visualize
         
     #     # --- Display the camera image ---
     #     img_path = Path(frame_path) / "color_image1.jpg"

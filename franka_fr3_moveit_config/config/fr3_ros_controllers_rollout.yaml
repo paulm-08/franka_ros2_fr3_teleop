@@ -1,0 +1,67 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # Hz
+
+    fr3_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    franka_robot_state_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+
+franka_robot_state_broadcaster:
+  ros__parameters:
+    arm_id: fr3
+
+fr3_arm_controller:
+  ros__parameters:
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - position
+      - velocity
+    joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+      
+    # --- JTC TRACKING & SMOOTHING FIXES ---
+    
+    # CRITICAL FIX: Tell the JTC to start the next interpolation from 
+    # its last commanded target (the 'desired state') instead of the 
+    # lagging actual hardware state. This eliminates tracking lag accumulation.
+    interpolate_from_desired_state: true
+
+    # KEEP INTERPOLATION ABSOLUTELY or the robot will try to reach the goal in one step
+    interpolation_method: "splines"
+    
+    # TUNE THIS: Set acceptable tracking tolerances to prevent the controller 
+    # from prematurely aborting or fighting tiny systematic errors.
+    constraints:
+      goal_time: 0.0 # Time tolerance for reaching the goal (e.g., your control period)
+      stopped_velocity_tolerance: 0.1 # Relaxed velocity tolerance when stopping
+      
+      # Per-joint trajectory tracking tolerances (adjust 0.05 if needed)
+      fr3_joint1: { trajectory: 0.025, goal: 0.001 }
+      fr3_joint2: { trajectory: 0.025, goal: 0.001 }
+      fr3_joint3: { trajectory: 0.025, goal: 0.001 }
+      fr3_joint4: { trajectory: 0.025, goal: 0.001 }
+      fr3_joint5: { trajectory: 0.025, goal: 0.001 }
+      fr3_joint6: { trajectory: 0.025, goal: 0.001 }
+      fr3_joint7: { trajectory: 0.025, goal: 0.001 }
+      
+    # --- EFFORT GAINS ---
+    gains:
+      fr3_joint1: { p: 800., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint2: { p: 800., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint3: { p: 800., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint4: { p: 800., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint5: { p: 500., d: 10., i: 0., i_clamp: 1. }
+      fr3_joint6: { p: 200., d: 10., i: 0., i_clamp: 1. }
+      fr3_joint7: { p: 100., d: 5., i: 0., i_clamp: 1. }

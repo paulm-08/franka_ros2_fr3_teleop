@@ -67,7 +67,14 @@ class PolicyRolloutNode(Node):
         # --- Declare ROS Parameters (for non-interactive use) ---
         self.declare_parameter('model_path', '')
         self.declare_parameter('goal_state_path', '')
-        self.declare_parameter('control_rate_hz', 10.0)
+        self.declare_parameter('control_rate_hz', 20.0)
+
+        # --- REPLAY_MODE Parameters ---
+        self.declare_parameter('replay_gt', True)
+        self.declare_parameter('dataset_pkl', 'data/processed_datasets/dataset_single_test_noemb.pkl')
+        self.declare_parameter('replay_traj_idx', 0)
+        self.declare_parameter('start_step', 49)
+
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.get_logger().info(f"Using device: {self.device}")
@@ -78,6 +85,11 @@ class PolicyRolloutNode(Node):
 
         self.control_mode = self.config.get('control_mode', {})
         self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
+
+        # --- REPLAY_MODE Flag ---
+        self.is_replay_mode = self.get_parameter('replay_gt').get_parameter_value().bool_value
+        self.replay_actions = None
+        self.start_step = self.get_parameter('start_step').get_parameter_value().integer_value
 
         model_path_str = self.get_parameter('model_path').get_parameter_value().string_value
         goal_path_str = self.get_parameter('goal_state_path').get_parameter_value().string_value
@@ -96,7 +108,7 @@ class PolicyRolloutNode(Node):
         self.model_type = checkpoint["model_type"]
         self.use_goal = checkpoint["training_config"].get("use_goal", False)
 
-        # --- THE CRITICAL FIX: Read hyperparameters from the checkpoint ---
+        # --- Read hyperparameters from the checkpoint ---
         model_hyperparams = checkpoint.get("model_hyperparams", {})
         logging.info(f"Loaded model hyperparameters: {model_hyperparams}")
         logging.info(f"Model was trained with K={self.frame_stack_k}, type='{self.model_type}'. Evaluating accordingly.")
@@ -134,6 +146,35 @@ class PolicyRolloutNode(Node):
         self.tactile_sensors = self.initialize_tactile_sensors()
         self.realsense = self.initialize_realsense()
         self.solver = self.initialize_kinematics_solver()
+
+        if self.is_replay_mode:
+            # --- REPLAY MODE: Load Dataset Actions ---
+            self.get_logger().warn("--- ⚠️ REPLAY MODE ENABLED ⚠️ ---")
+            dataset_pkl_path = self.get_parameter('dataset_pkl').get_parameter_value().string_value
+            traj_idx = self.get_parameter('replay_traj_idx').get_parameter_value().integer_value
+            
+            if not dataset_pkl_path:
+                self.get_logger().fatal("CRITICAL: 'replay_gt=True' but 'dataset_pkl' not provided.")
+                raise ValueError("Missing required 'dataset_pkl' parameter.")
+
+            try:
+                with open(paths.WORKSPACE_ROOT / dataset_pkl_path, 'rb') as f:
+                    all_trajectories = pickle.load(f)
+                
+                self.replay_actions = all_trajectories[traj_idx]['action_t']
+                self.get_logger().info(f"Loaded GT actions from trajectory {traj_idx} in {dataset_pkl_path}")
+                self.get_logger().info(f"Total actions loaded: {len(self.replay_actions)}. Starting from step: {self.start_step}")
+                
+                # Check for arm_only mismatch
+                gt_action_dim = self.replay_actions.shape[1]
+                model_action_dim = checkpoint["output_dim"]
+                if self.is_arm_only and gt_action_dim != model_action_dim:
+                    self.get_logger().warn(f"Model is arm_only ({model_action_dim} joints) but GT actions have {gt_action_dim} joints. Slicing GT actions.")
+                    self.replay_actions = self.replay_actions[:, :model_action_dim]
+                
+            except Exception as e:
+                self.get_logger().fatal(f"Failed to load replay trajectory: {e}")
+                raise e
         
         # --- ROS 2 Interfaces ---
         self.policy_arm_joint_names = [
@@ -190,8 +231,10 @@ class PolicyRolloutNode(Node):
         self.timestamp_history = []
 
         # P-Control
-        self.KP_JOINT_GAIN = 15.0  # Proportional gain for position correction (Tune this!)
         self.target_q_arm = None   # Stores the desired accumulated position.
+        self.smoothed_delta_arm = None
+        self.smoothing_alpha = 0.4 # TUNE THIS: 0.0 (max smoothing) to 1.0 (no smoothing)
+        self.control_rate_scaling = 1.0 # TUNE THIS: Use > 1.0 (e.g., 1.05) to compensate for JTC tracking lag
 
         # Control rate
         self.control_rate = self.get_parameter('control_rate_hz').get_parameter_value().double_value
@@ -472,184 +515,233 @@ class PolicyRolloutNode(Node):
             while rclpy.ok():
                 time_start = time.perf_counter()
                 
-                # --- 1. SENSE ---
-                obs = self.get_live_observations()
-                if obs is None: 
-                    time.sleep(self.sample_period)
-                    continue
-                
-                leap_positions = self.get_current_leap_position()
-                if leap_positions is None: 
-                    time.sleep(self.sample_period)
-                    continue
-                
-                self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])
-
-                time_sense = time.perf_counter()
-
-                # --- 2. PREPARE STATE (Mirrors dataset_builder.py) ---
-                state_vector_list = []
-                current_proprio = None
-
-                # 2.1 Tactile Features
-                tactile_feats = np.concatenate([
-                    process_tactile_image(
-                        img=obs['tactile_images'][name],
-                        use_height_map=True,
-                        sensor=self.tactile_sensors[name],
-                        ref_img=self.tactile_sensors[name].ref
-                    )[0] for name in SENSOR_ORDER
-                ])            
-                state_vector_list.append(tactile_feats)
-
-                # 2.2 Proprioceptive Features
-                if self.control_mode == 'task_space':
-                    kinematic_poses = self.solver.get_all_poses(self.current_arm_states, leap_positions)
-                    arm_proprio = kinematic_poses['ee'] # 7D EE Pose
-                    state_vector_list.append(arm_proprio)
-                else: # joint_space
-                    arm_proprio = self.current_arm_states # 7D Arm Joints
-                    state_vector_list.append(arm_proprio)            
-
-                hand_proprio = leap_positions # 16D Hand Joints
-                state_vector_list.append(hand_proprio)
-                current_proprio = np.concatenate([arm_proprio, hand_proprio])
-
-                # 2.3 3D Tactile Poses
-                if self.config.get('state', {}).get('use_3d_tactile'):
-                    for frame_name in self.config['kinematics']['tactile_frames']:
-                        state_vector_list.append(kinematic_poses[frame_name])
-
-                # 2.4 Visual Features (with Carry-Forward Logic)
-                features_per_cam = self.vision_processor.process_cameras(obs['color1'], obs['depth1'], obs['color2'], obs['depth2'])
-                
-                # --- "Carry Forward" Logic with Staleness Flag ---
-                def update_features(raw_feats, cam_id):
-                    """
-                    Parses a 'kitchen sink' vector, applies staleness logic to the
-                    keypoint part, and preserves the embedding part.
-                    """
-                    if raw_feats is None: # Handle case where a camera failed
-                        return np.zeros(self.single_cam_dim, dtype=np.float32)
-
-                    # --- 1. Split the "kitchen sink" vector ---
-                    kps_vec = raw_feats[:self.kp_total_dim]
-                    embs_vec = raw_feats[self.kp_total_dim:]
+                if self.is_replay_mode:
+                    # --- REPLAY MODE ---
                     
-                    # Deconstruct the keypoint vector
-                    # [tube(5), peg(5), rel(3)]
-                    tube_feats = kps_vec[0:self.coord_dim+2]
-                    peg_feats = kps_vec[self.coord_dim+2:2*self.coord_dim+4]
+                    # 1. Get the current replay step index
+                    current_replay_step = self.start_step + step
                     
-                    tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
-
-                    # --- 2. Apply Staleness Logic ---
-                    # Check TUBE detection (flag is at index 4)
-                    if tube_feats[self.coord_dim+1] > 0: # if flag is 1
-                        self.last_known_coords[tube_key] = tube_feats[0:self.coord_dim] # Store new 3D pos
-                    else:
-                        tube_feats[0:self.coord_dim] = self.last_known_coords[tube_key] # Use stale position
-                        tube_feats[self.coord_dim:self.coord_dim+2] = 0.0 # Set conf and flag to 0
-
-                    # Check PEG detection (flag is at index 4 of its vector)
-                    if peg_feats[self.coord_dim+1] > 0: # if flag is 1
-                        self.last_known_coords[peg_key] = peg_feats[0:self.coord_dim]
-                    else:
-                        peg_feats[0:self.coord_dim] = self.last_known_coords[peg_key]
-                        peg_feats[self.coord_dim:self.coord_dim+2] = 0.0
+                    # 2. Check for end of trajectory
+                    if current_replay_step >= len(self.replay_actions):
+                        self.get_logger().info(f"--- Ground Truth Replay Complete (Reached end of actions) ---")
+                        break # Exit the loop
                     
-                    # --- 3. Re-engineer the relative vector ---
-                    # This is crucial: we recalculate the relative vector based on the
-                    # (potentially stale) coordinates we are passing to the policy.
-                    rel_vec = tube_feats[0:self.coord_dim] - peg_feats[0:self.coord_dim]
+                    # 3. Get the ground truth action (delta)
+                    action_pred_np = self.replay_actions[current_replay_step]
+                    raw_delta_arm = action_pred_np[:self.num_arm_actions]
                     
-                    # Reconstruct the final keypoint vector
-                    final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
-                    
-                    # --- 4. Recombine with embeddings ---
-                    # Return the full, corrected "kitchen sink" vector
-                    return np.concatenate([final_kps_vec, embs_vec])
+                    if not self.is_arm_only:
+                        raw_delta_hand = action_pred_np[self.num_arm_actions:]
 
-                # Get the raw "kitchen sink" vectors
-                f1_raw = features_per_cam.get('cam1', np.zeros(self.single_cam_dim, dtype=np.float32))
-                f2_raw = features_per_cam.get('cam2', np.zeros(self.single_cam_dim, dtype=np.float32))
+                    # 4. Initialize Targets on first step (crucial for replay consistency)
+                    if step == 0:
+                        self.get_logger().warn(f"--- REPLAYING TRAJECTORY (Step {step}) ---")
+                        self.get_logger().info("Initializing targets from live state for replay...")
+                        
+                        # Arm initialization (waits for first joint_state_callback outside the loop)
+                        self.target_q_arm = self.current_arm_states.copy() 
+                        
+                        # Hand initialization (must call service)
+                        if not self.is_arm_only:
+                             leap_pos = self.get_current_leap_position()
+                             if leap_pos is not None:
+                                self.target_q_hand = leap_pos.copy()
+                             else:
+                                self.get_logger().fatal("CRITICAL: Failed to get initial LEAP position for replay mode.")
+                                break # Exit the control loop on failure
+                        
+                        self.get_logger().info(f"Applying GT action from t={current_replay_step}: {np.round(raw_delta_arm, 4)}")
+                        if not self.is_arm_only:
+                            self.get_logger().info(f"Applying GT hand action from t={current_replay_step}: {np.round(raw_delta_hand[:4], 4)}...")
 
-                # Apply the staleness logic
-                f1_final = update_features(f1_raw, 'cam1')
-                f2_final = update_features(f2_raw, 'cam2')
-                
-                visual_features = np.concatenate([f1_final, f2_final])
-                state_vector_list.append(visual_features)
+                    # 5. Accumulate Targets (REMOVED: Accumulation must happen later in the publishing block)
+                    # self.target_q_arm = self.target_q_arm + raw_delta_arm  <-- BUG FIX: Removed duplicate accumulation here!
 
-                # --- Final State Assembly ---
-                current_state_np = np.concatenate(state_vector_list)
-                if self.use_goal:
-                    full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
+                    # 6. Set delta_to_apply_arm (used later in the publishing block)
+                    safe_delta_arm = raw_delta_arm # In replay, the raw delta is the "safe" delta
+
                 else:
-                    full_state_np = current_state_np
 
-                # --- DIAGNOSTIC PRINTS ---
-                # self.get_logger().info(f"--- Shape Analysis ---")
-                # self.get_logger().info(f"Tactile Features Shape: {tactile_feats.shape}")
-                tactile_log_msg = "Tactile Contact: "
-                for i, name in enumerate(SENSOR_ORDER):
-                    flag = tactile_feats[i * 8 + 7]  # Correctly checks the flag at the end of each sensor's 8 features
-                    tactile_log_msg += f"✅ {name.upper()} | " if flag > 0 else f"❌ {name.upper()} | "
-                self.get_logger().info(tactile_log_msg)
-
-                # self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
-                visual_log_msg = "Visual Detections: "
-                # 'raw_features_per_cam' now contains the engineered 10-element vectors
-                for cam_id, feats in features_per_cam.items():
-                    if feats is None: continue
-                    tube_flag = feats[3]
-                    peg_flag = feats[7]
-                    visual_log_msg += f"{cam_id} [Tube: {'✅' if tube_flag > 0 else '❌'}, Peg: {'✅' if peg_flag > 0 else '❌'}] | "
-                self.get_logger().info(visual_log_msg)
-
-                # self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
-                # self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
-                # self.get_logger().info(f"Goal State Vector Shape:    {self.goal_state.shape}")
-                
-                time_state = time.perf_counter()
-
-                # 3. HANDLE HISTORY (Frame Stacking)
-                self.history_buffer.append(full_state_np)
-                if len(self.history_buffer) > self.frame_stack_k:
-                    self.history_buffer.pop(0)
-                if len(self.history_buffer) < self.frame_stack_k:
-                    self.get_logger().info(f"Filling history buffer... {len(self.history_buffer)}/{self.frame_stack_k}")
-                    continue
-                self.get_logger().info(f"------------------------")
-
-                state_sequence = torch.from_numpy(np.array(self.history_buffer)).float().to(self.device)
-                
-                time_history = time.perf_counter()
-
-                # 4. INFER ACTION
-                with torch.no_grad():
-                    is_sequence_model = not isinstance(self.model, MLPPolicy)
-                    if is_sequence_model:
-                        state_norm = (state_sequence - self.X_mean) / self.X_std
-                        state_norm = state_norm.unsqueeze(0)
-                    else: # MLP
-                        state_norm = (state_sequence.flatten() - self.X_mean.repeat(self.frame_stack_k)) / self.X_std.repeat(self.frame_stack_k)
-                        state_norm = state_norm.unsqueeze(0)
+                    # --- 1. SENSE ---
+                    obs = self.get_live_observations()
+                    if obs is None: 
+                        time.sleep(self.sample_period)
+                        continue
                     
-                    action_norm = self.model(state_norm).squeeze(0)
-                    action_pred = (action_norm * self.y_std) + self.y_mean
+                    leap_positions = self.get_current_leap_position()
+                    if leap_positions is None: 
+                        time.sleep(self.sample_period)
+                        continue
+                    
+                    self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])
 
-                if current_proprio is not None:
-                    self.timestamp_history.append(time_start)
-                    self.proprio_history.append(current_proprio)
-                    self.prediction_history.append(action_pred.cpu().numpy())
+                    time_sense = time.perf_counter()
+
+                    # --- 2. PREPARE STATE (Mirrors dataset_builder.py) ---
+                    state_vector_list = []
+                    current_proprio = None
+
+                    # 2.1 Tactile Features
+                    tactile_feats = np.concatenate([
+                        process_tactile_image(
+                            img=obs['tactile_images'][name],
+                            use_height_map=True,
+                            sensor=self.tactile_sensors[name],
+                            ref_img=self.tactile_sensors[name].ref
+                        )[0] for name in SENSOR_ORDER
+                    ])            
+                    state_vector_list.append(tactile_feats)
+
+                    # 2.2 Proprioceptive Features
+                    if self.control_mode == 'task_space':
+                        kinematic_poses = self.solver.get_all_poses(self.current_arm_states, leap_positions)
+                        arm_proprio = kinematic_poses['ee'] # 7D EE Pose
+                        state_vector_list.append(arm_proprio)
+                    else: # joint_space
+                        arm_proprio = self.current_arm_states # 7D Arm Joints
+                        state_vector_list.append(arm_proprio)            
+
+                    hand_proprio = leap_positions # 16D Hand Joints
+                    state_vector_list.append(hand_proprio)
+                    current_proprio = np.concatenate([arm_proprio, hand_proprio])
+
+                    # 2.3 3D Tactile Poses
+                    if self.config.get('state', {}).get('use_3d_tactile'):
+                        for frame_name in self.config['kinematics']['tactile_frames']:
+                            state_vector_list.append(kinematic_poses[frame_name])
+
+                    # 2.4 Visual Features (with Carry-Forward Logic)
+                    features_per_cam = self.vision_processor.process_cameras(obs['color1'], obs['depth1'], obs['color2'], obs['depth2'])
+                    
+                    # --- "Carry Forward" Logic with Staleness Flag ---
+                    def update_features(raw_feats, cam_id):
+                        """
+                        Parses a 'kitchen sink' vector, applies staleness logic to the
+                        keypoint part, and preserves the embedding part.
+                        """
+                        if raw_feats is None: # Handle case where a camera failed
+                            return np.zeros(self.single_cam_dim, dtype=np.float32)
+
+                        # --- 1. Split the "kitchen sink" vector ---
+                        kps_vec = raw_feats[:self.kp_total_dim]
+                        embs_vec = raw_feats[self.kp_total_dim:]
+                        
+                        # Deconstruct the keypoint vector
+                        # [tube(5), peg(5), rel(3)]
+                        tube_feats = kps_vec[0:self.coord_dim+2]
+                        peg_feats = kps_vec[self.coord_dim+2:2*self.coord_dim+4]
+                        
+                        tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
+
+                        # --- 2. Apply Staleness Logic ---
+                        # Check TUBE detection (flag is at index 4)
+                        if tube_feats[self.coord_dim+1] > 0: # if flag is 1
+                            self.last_known_coords[tube_key] = tube_feats[0:self.coord_dim] # Store new 3D pos
+                        else:
+                            tube_feats[0:self.coord_dim] = self.last_known_coords[tube_key] # Use stale position
+                            tube_feats[self.coord_dim:self.coord_dim+2] = 0.0 # Set conf and flag to 0
+
+                        # Check PEG detection (flag is at index 4 of its vector)
+                        if peg_feats[self.coord_dim+1] > 0: # if flag is 1
+                            self.last_known_coords[peg_key] = peg_feats[0:self.coord_dim]
+                        else:
+                            peg_feats[0:self.coord_dim] = self.last_known_coords[peg_key]
+                            peg_feats[self.coord_dim:self.coord_dim+2] = 0.0
+                        
+                        # --- 3. Re-engineer the relative vector ---
+                        # This is crucial: we recalculate the relative vector based on the
+                        # (potentially stale) coordinates we are passing to the policy.
+                        rel_vec = tube_feats[0:self.coord_dim] - peg_feats[0:self.coord_dim]
+                        
+                        # Reconstruct the final keypoint vector
+                        final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
+                        
+                        # --- 4. Recombine with embeddings ---
+                        # Return the full, corrected "kitchen sink" vector
+                        return np.concatenate([final_kps_vec, embs_vec])
+
+                    # Get the raw "kitchen sink" vectors
+                    f1_raw = features_per_cam.get('cam1', np.zeros(self.single_cam_dim, dtype=np.float32))
+                    f2_raw = features_per_cam.get('cam2', np.zeros(self.single_cam_dim, dtype=np.float32))
+
+                    # Apply the staleness logic
+                    f1_final = update_features(f1_raw, 'cam1')
+                    f2_final = update_features(f2_raw, 'cam2')
+                    
+                    visual_features = np.concatenate([f1_final, f2_final])
+                    state_vector_list.append(visual_features)
+
+                    # --- Final State Assembly ---
+                    current_state_np = np.concatenate(state_vector_list)
+                    if self.use_goal:
+                        full_state_np = np.concatenate([current_state_np, self.goal_state.cpu().numpy()])
+                    else:
+                        full_state_np = current_state_np
+
+                    # --- DIAGNOSTIC PRINTS ---
+                    # self.get_logger().info(f"--- Shape Analysis ---")
+                    # self.get_logger().info(f"Tactile Features Shape: {tactile_feats.shape}")
+                    tactile_log_msg = "Tactile Contact: "
+                    for i, name in enumerate(SENSOR_ORDER):
+                        flag = tactile_feats[i * 8 + 7]  # Correctly checks the flag at the end of each sensor's 8 features
+                        tactile_log_msg += f"✅ {name.upper()} | " if flag > 0 else f"❌ {name.upper()} | "
+                    self.get_logger().info(tactile_log_msg)
+
+                    # self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
+                    visual_log_msg = "Visual Detections: "
+                    # 'raw_features_per_cam' now contains the engineered 10-element vectors
+                    for cam_id, feats in features_per_cam.items():
+                        if feats is None: continue
+                        tube_flag = feats[3]
+                        peg_flag = feats[7]
+                        visual_log_msg += f"{cam_id} [Tube: {'✅' if tube_flag > 0 else '❌'}, Peg: {'✅' if peg_flag > 0 else '❌'}] | "
+                    self.get_logger().info(visual_log_msg)
+
+                    # self.get_logger().info(f"Proprio Shape:          {proprio_data.shape}")
+                    # self.get_logger().info(f"Current State Vector Shape: {current_state_np.shape}")
+                    # self.get_logger().info(f"Goal State Vector Shape:    {self.goal_state.shape}")
+                    
+                    time_state = time.perf_counter()
+
+                    # 3. HANDLE HISTORY (Frame Stacking)
+                    self.history_buffer.append(full_state_np)
+                    if len(self.history_buffer) > self.frame_stack_k:
+                        self.history_buffer.pop(0)
+                    if len(self.history_buffer) < self.frame_stack_k:
+                        self.get_logger().info(f"Filling history buffer... {len(self.history_buffer)}/{self.frame_stack_k}")
+                        continue
+                    self.get_logger().info(f"------------------------")
+
+                    state_sequence = torch.from_numpy(np.array(self.history_buffer)).float().to(self.device)
+                    
+                    time_history = time.perf_counter()
+
+                    # 4. INFER ACTION
+                    with torch.no_grad():
+                        is_sequence_model = not isinstance(self.model, MLPPolicy)
+                        if is_sequence_model:
+                            state_norm = (state_sequence - self.X_mean) / self.X_std
+                            state_norm = state_norm.unsqueeze(0)
+                        else: # MLP
+                            state_norm = (state_sequence.flatten() - self.X_mean.repeat(self.frame_stack_k)) / self.X_std.repeat(self.frame_stack_k)
+                            state_norm = state_norm.unsqueeze(0)
+                        
+                        action_norm = self.model(state_norm).squeeze(0)
+                        action_pred = (action_norm * self.y_std) + self.y_mean
+
+                    action_pred_np = to_np(action_pred)
+
+                    if current_proprio is not None:
+                        self.timestamp_history.append(time_start)
+                        self.proprio_history.append(current_proprio)
+                        self.prediction_history.append(action_pred.cpu().numpy())
 
                 time_inference = time.perf_counter()
 
                 # 5. PUBLISH COMMAND
-                action_pred_np = to_np(action_pred)
 
                 # --- 5.1 Process Arm Command ---
+                # NOTE: raw_delta_arm is defined in the IF/ELSE blocks above.
                 raw_delta_arm = action_pred_np[:self.num_arm_actions]
 
                 # Step A: Clipping (Saturation)
@@ -667,12 +759,18 @@ class PolicyRolloutNode(Node):
 
                 # --- Diagnostic Logging for Arm ---
                 was_limited = not np.allclose(raw_delta_arm, safe_delta_arm, atol=1e-6)
-                limit_status = "⚠️ CLIPPED/LIMITED" if was_limited else "✅ OK"
-                self.get_logger().info(
-                    f"ARM CMD | Status: {limit_status} | "
-                    f"Raw: {np.round(raw_delta_arm, 4)} -> "
-                    f"Safe: {np.round(safe_delta_arm, 4)}"
-                )
+                if was_limited:
+                    limit_status = "⚠️ CLIPPED/LIMITED"
+                    self.get_logger().info(
+                        f"ARM CMD {limit_status} | "
+                        f"Raw: {np.round(raw_delta_arm, 4)} -> "
+                        f"Safe: {np.round(safe_delta_arm, 4)}"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"ARM CMD | "
+                        f"{np.round(raw_delta_arm, 4)}"
+                    )
 
                 # --- Publish Arm Command ---
                 if self.control_mode == 'task_space':
@@ -696,120 +794,118 @@ class PolicyRolloutNode(Node):
                     self.arm_command_pub.publish(pose_msg)
 
                 else: # joint_space
-                    
-                    # dt = 1.0 / self.control_rate # Time step (Delta t)
-
-                    # # 1. Initialize Target Position
-                    # # This must be done on the very first loop.
-                    # if self.target_q_arm is None:
-                    #     self.target_q_arm = self.current_arm_states.copy()
-                    
-                    # # 2. Update Target Position (ACCUMULATION)
-                    # # The target position is the previous target plus the model's desired displacement.
-                    # # This is the correct way to accumulate the target position.
-                    # delta_q_model = safe_delta_arm # Model output is already displacement (rad)
-                    # self.target_q_arm += delta_q_model
-                    
-                    # # 3. Calculate Position Error (e)
-                    # # Error = Target Position (Accumulated) - Current Position (Feedback)
-                    # position_error = self.target_q_arm - self.current_arm_states 
-                    
-                    # # 4. Calculate P-Correction Velocity (v_correction)
-                    # # Corrective velocity = Kp * Error
-                    # p_correction_velocities = position_error * self.KP_JOINT_GAIN 
-                    
-                    # # 5. Calculate Model's Base Velocity (v_model)
-                    # # Convert model's desired displacement into velocity for this cycle: v_model = Delta_q_model / dt
-                    # base_model_velocity = delta_q_model / dt 
-                    
-                    # # 6. Calculate Final Command Velocity (Closed-Loop)
-                    # # Final Velocity = Model Velocity (Intent) + P-Correction (Error Correction)
-                    # desired_joint_velocities = base_model_velocity + p_correction_velocities
-                    
-                    # # 7. Publish to MoveIt Servo using the velocities field
-                    # jog_msg = JointJog()
-                    
-                    # jog_msg.header = Header()
-                    # jog_msg.header.stamp = self.get_clock().now().to_msg()
-                    # jog_msg.header.frame_id = 'base'
-                    
-                    # jog_msg.joint_names = self.policy_arm_joint_names
-
-                    # # CRITICAL CHANGE: Populate the velocities field
-                    # jog_msg.velocities = desired_joint_velocities.tolist()
-                    
-                    # # Ensure the displacements field is empty
-                    # jog_msg.displacements = [] 
-                    
-                    # self.arm_command_pub.publish(jog_msg)
-
                     # --- 1. Get the Safe Delta Command ---
                     # We already have safe_delta_arm from the safety layer.
                     # This is the desired DISPLACEMENT, not velocity.
-                    
+
                     # --- 2. Calculate the Target Position ---
-                    # The target is simply our current measured state + the desired displacement.
-                    # This perfectly matches the dataset's logic.
-                    target_q_arm = self.current_arm_states + safe_delta_arm
-                    
+
+                    # 2a. Apply Time Scaling to compensate for control rate mismatch and JTC tracking lag.
+                    # If control rate == policy rate, use a factor like 1.05 to eliminate systematic lag.
+                    scaled_delta_arm = safe_delta_arm * self.control_rate_scaling # Restored the rate scaling
+
+                    # 2b. Apply Low-Pass Filter (Exponential Moving Average) for jitter reduction
+                    # This smooths the COMMAND only, preserving policy integrity.
+                    ALPHA = self.smoothing_alpha 
+
+                    if self.smoothed_delta_arm is None:
+                        self.smoothed_delta_arm = scaled_delta_arm
+                    else:
+                        # EMA: smoothed = (alpha * current_value) + ((1 - alpha) * previous_smoothed)
+                        self.smoothed_delta_arm = (ALPHA * scaled_delta_arm) + \
+                                                ((1.0 - ALPHA) * self.smoothed_delta_arm)
+
+
+                    # 2c. Handle initial state where target_q_arm is None (First Execution)
+                    if self.target_q_arm is None:
+                        # Initialize the internal target to the current measured position.
+                        self.target_q_arm = self.current_arm_states.copy() 
+
+                    # 2d. Accumulate the Smoothed Target Delta
+                    # Accumulate the delta onto our *maintained target state*.
+                    # This is the ONLY place accumulation should happen for joint_space control.
+                    self.target_q_arm = self.target_q_arm + self.smoothed_delta_arm
+
                     # --- 3. Publish as a Position Command ---
                     traj_msg = JointTrajectory()
                     traj_msg.joint_names = self.policy_arm_joint_names
-                    
+
                     point = JointTrajectoryPoint()
-                    point.positions = target_q_arm.tolist()
-                    
-                    # --- CRITICAL ---
-                    # Tell the controller to get to this point *by the next control cycle*.
-                    # This makes it behave like a sampled-time integrator.
-                    # Set duration to be slightly less than the sample period.
-                    duration_ns = int(self.sample_period * 1e9 * 0.95) 
+                    # Command the robot to go to this new, accumulated target position.
+                    point.positions = self.target_q_arm.tolist()
+
+                    duration_ns = int(self.sample_period * 1e9)
                     point.time_from_start = Duration(sec=0, nanosec=duration_ns)
-                    
+
                     traj_msg.points.append(point)
                     self.arm_command_pub.publish(traj_msg)
 
                 # --- 5.2 Process Hand Command (with same safety logic) ---
                 if not self.is_arm_only:
-                    raw_delta_hand = action_pred_np[self.num_arm_actions:]
                     
-                    # Apply clipping and rate limiting to the hand
-                    clipped_delta_hand = np.clip(raw_delta_hand, -self.MAX_HAND_DELTA, self.MAX_HAND_DELTA)
-                    change_hand = clipped_delta_hand - self.previous_hand_command
-                    limited_change_hand = np.clip(change_hand, -self.HAND_RATE_LIMIT, self.HAND_RATE_LIMIT)
-                    safe_delta_hand = self.previous_hand_command + limited_change_hand
-                    
-                    # Update for the next cycle
-                    self.previous_hand_command = safe_delta_hand
+                    if not self.is_replay_mode:
+                        # --- Policy Mode: Safety Check & Delta Selection ---
+                        raw_delta_hand = action_pred_np[self.num_arm_actions:]
+                        
+                        # Apply clipping and rate limiting
+                        clipped_delta_hand = np.clip(raw_delta_hand, -self.MAX_HAND_DELTA, self.MAX_HAND_DELTA)
+                        change_hand = clipped_delta_hand - self.previous_hand_command
+                        limited_change_hand = np.clip(change_hand, -self.HAND_RATE_LIMIT, self.HAND_RATE_LIMIT)
+                        safe_delta_hand = self.previous_hand_command + limited_change_hand
+                        
+                        # Update for the next cycle
+                        self.previous_hand_command = safe_delta_hand
+                        delta_to_apply_hand = safe_delta_hand
 
-                    # --- Diagnostic Logging for Hand ---
-                    was_limited_hand = not np.allclose(raw_delta_hand, safe_delta_hand, atol=1e-6)
-                    limit_status_hand = "⚠️ CLIPPED/LIMITED" if was_limited_hand else "✅ OK"
-                    self.get_logger().info(
-                        f"HAND CMD | Status: {limit_status_hand} | "
-                        f"Raw: {np.round(raw_delta_hand[:4], 4)}... -> " # Log first 4 joints for brevity
-                        f"Safe: {np.round(safe_delta_hand[:4], 4)}..."
-                    )
-                    # Use the SAFE hand command
-                    target_q_hand_allegro = self.current_joint_states[7:] + safe_delta_hand
+                        # --- Diagnostic Logging for Hand ---
+                        was_limited_hand = not np.allclose(raw_delta_hand, safe_delta_hand, atol=1e-6)
+                        limit_status_hand = "⚠️ CLIPPED/LIMITED" if was_limited_hand else "✅ OK"
+                        self.get_logger().info(
+                            f"HAND CMD | Status: {limit_status_hand} | "
+                            f"Raw: {np.round(raw_delta_hand[:4], 4)}... -> " # Log first 4 joints for brevity
+                            f"Safe: {np.round(safe_delta_hand[:4], 4)}..."
+                        )
+
+                        # Handle initial state where target_q_hand is None (First Execution)
+                        if self.target_q_hand is None:
+                            if leap_positions is not None:
+                                self.target_q_hand = leap_positions.copy()
+                            else:
+                                # This should have been caught in SENSE phase, but as fallback:
+                                self.get_logger().warn("Could not initialize hand target (policy mode). Skipping command.")
+                                time.sleep(self.sample_period)
+                                continue
+                    
+                    else:
+                        # --- Replay Mode: Delta was already calculated and target was initialized on step 0 ---
+                        delta_to_apply_hand = raw_delta_hand
+
+                    # --- Hand Target Accumulation & Publishing ---
+                    
+                    # Accumulate the delta onto the maintained target state
+                    self.target_q_hand = self.target_q_hand + delta_to_apply_hand
+
                     hand_msg = Float64MultiArray()
-                    hand_msg.data = [float(p) for p in target_q_hand_allegro]
+                    hand_msg.data = [float(p) for p in self.target_q_hand]
                     self.hand_command_pub.publish(hand_msg)
                 
                 step +=1
                 time_publish = time.perf_counter()
-                
-                # --- Logging ---
+
                 total_time = time_publish - time_start
+
                 if total_time > self.sample_period:
                     self.get_logger().warning(f"Loop Overrun: {total_time*1000:.1f}ms")
-                    self.get_logger().info(
-                        f"  Sense: {(time_sense - time_start)*1000:.1f}ms | "
-                        f"Features: {(time_state - time_sense)*1000:.1f}ms | "
-                        f"History: {(time_history - time_state)*1000:.1f}ms | "
-                        f"Inference: {(time_inference - time_history)*1000:.1f}ms | "
-                        f"Publish: {(time_publish - time_inference)*1000:.1f}ms"
-                    )
+                    if not self.is_replay_mode:
+
+                        self.get_logger().info(
+                            f"  Sense: {(time_sense - time_start)*1000:.1f}ms | "
+                            f"Features: {(time_state - time_sense)*1000:.1f}ms | "
+                            f"History: {(time_history - time_state)*1000:.1f}ms | "
+                            f"Inference: {(time_inference - time_history)*1000:.1f}ms | "
+                            f"Publish: {(time_publish - time_inference)*1000:.1f}ms"
+                        )
+
                 time_sleep = max(0, self.sample_period - (time_publish - time_start))
                 time.sleep(time_sleep)
 
@@ -818,6 +914,8 @@ class PolicyRolloutNode(Node):
 
         finally:
             self.save_trajectory_data()
+            self.publish_smooth_stop()
+
 
     def save_trajectory_data(self):
         """Saves the collected trajectory data to a compressed numpy file."""
@@ -835,6 +933,44 @@ class PolicyRolloutNode(Node):
             predictions=np.stack(self.prediction_history)
         )
         self.get_logger().info("✅ Trajectory data saved successfully.")
+
+    def publish_smooth_stop(self):
+        """
+        Sends a final trajectory command with a long duration (0.5s) 
+        to allow the robot to decelerate smoothly to its last target.
+        This should be called on node shutdown or loop exit.
+        """
+        if self.target_q_arm is None:
+            self.get_logger().warn("Cannot send smooth stop; target_q_arm was never initialized.")
+            return
+
+        self.get_logger().info("Sending final smooth stop command...")
+        
+        traj_msg = JointTrajectory()
+        traj_msg.joint_names = self.policy_arm_joint_names
+        num_joints = len(self.policy_arm_joint_names)
+
+        stop_point = JointTrajectoryPoint()
+        
+        # 1. Use the last known target position
+        stop_point.positions = self.target_q_arm.tolist()
+
+        # 2. Command zero velocity
+        stop_point.velocities = [0.0] * num_joints
+
+        # 3. CRITICAL: Set a LONG duration for smooth deceleration
+        stop_point.time_from_start = Duration(sec=2, nanosec=0) 
+
+        traj_msg.points.append(stop_point)
+        self.arm_command_pub.publish(traj_msg)
+        
+        # IMPORTANT: Pause here. We must keep the node alive long enough
+        # for the command to be published AND for the JTC to execute 
+        # a significant portion of the 0.5s trajectory.
+        # Sleeping for slightly longer than the command duration is safest.
+        self.get_logger().info("Waiting 0.7s for stop command to execute...")
+        time.sleep(0.7) 
+        self.get_logger().info("Smooth stop command sent. Node will now exit.")
 
 def main(args=None):
     rclpy.init(args=args)

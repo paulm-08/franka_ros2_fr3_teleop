@@ -1,8 +1,8 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, Shutdown
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, Shutdown, TimerAction
+from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution # <-- Added PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -30,6 +30,14 @@ def generate_launch_description():
     use_fake_hardware = LaunchConfiguration('use_fake_hardware')
     use_fake_hardware_arg = DeclareLaunchArgument('use_fake_hardware', default_value='false')
 
+    # NEW ARGUMENT: Allows selection of the controller config file
+    controllers_yaml_file = LaunchConfiguration('controllers_yaml_file')
+    controllers_yaml_file_arg = DeclareLaunchArgument(
+        'controllers_yaml_file', 
+        default_value='fr3_ros_controllers_rollout.yaml', # Default to the original file
+        description='Name of the ROS 2 controllers YAML file (e.g., fr3_ros_controllers_rollout_fixed.yaml)'
+    )
+    
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'fr3', 'fr3.urdf.xacro')
     robot_description_config = Command([
         FindExecutable(name='xacro'), ' ', franka_xacro_file, ' hand:=true', ' ee_id:=leap_hand',
@@ -37,7 +45,13 @@ def generate_launch_description():
     ])
     robot_description = {'robot_description': ParameterValue(robot_description_config, value_type=str)}
 
-    ros2_controllers_path = os.path.join(get_package_share_directory('franka_fr3_moveit_config'), 'config', 'fr3_ros_controllers.yaml')
+    # THE FIX IS HERE: Use PathJoinSubstitution instead of os.path.join()
+    ros2_controllers_path = PathJoinSubstitution([
+        get_package_share_directory('franka_fr3_moveit_config'), 
+        'config', 
+        controllers_yaml_file
+    ])
+    
     ros2_control_node = Node(
         package='controller_manager',
         executable='ros2_control_node',
@@ -133,6 +147,34 @@ def generate_launch_description():
         'franka_fr3_moveit_config', 'config/kinematics.yaml'
     )
 
+    # Servo node
+    # This is the main node for pose tracking, not needed if using the pose tracking executable
+    servo_node = Node(
+        package="moveit_servo",
+        executable="servo_node_main",
+        parameters=[
+            servo_params,
+            robot_description,
+            robot_description_semantic,
+            kinematics_yaml,
+        ],
+        output="screen",
+    )
+
+
+    # Trigger servo node to start servoing after 5 seconds
+    # This is not needed if using the pose tracking executable
+    servo_node_trigger = TimerAction(
+        period=5.0,  # seconds
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'service', 'call',
+                     '/servo_node/start_servo', 'std_srvs/srv/Trigger', '{}'],
+                output='screen'
+            )
+        ]
+    )
+
     # Pose tracking node
     pose_tracking_node = Node(
         package="moveit_servo",
@@ -150,7 +192,10 @@ def generate_launch_description():
         robot_ip_arg,
         use_fake_hardware_arg,
         fake_sensor_commands_arg,
+        controllers_yaml_file_arg, # Declare the new argument
         ros2_control_node,
         robot_state_publisher,
+        # servo_node,
+        # servo_node_trigger,
         # pose_tracking_node
     ] + load_controllers)
