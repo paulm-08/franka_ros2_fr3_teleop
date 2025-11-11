@@ -41,34 +41,67 @@ def get_cfg_path(sensor_name):
     """Return full path to the sensor YAML config file."""
     return TACT9D_CFG_DIR / f"shape_config_{sensor_name}.yaml"
 
-def find_policy_models(search_path):
+def find_policy_models(search_path, root=paths.WORKSPACE_ROOT):
     """Finds all policy checkpoint files in the specified directory."""
     logging.info(f"Searching for trained policy models (.pt) in: {search_path}...")
-    # Find all files ending in _best.pt
-    found_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pt")]
-    logging.info(f"Found {len(found_files)} models.")
-    return [str(p) for p in sorted(found_files)]
+    
+    # 1. Collect all paths first.
+    found_files = list(search_path.glob("*.pt"))
+    
+    # 2. Perform the relative conversion and sorting in a separate step.
+    # This separates the I/O (glob) from the path manipulation (relative_to).
+    relative_paths = [p.relative_to(root) for p in found_files]
+    
+    logging.info(f"Found {len(relative_paths)} models.")
+    return [str(p) for p in sorted(relative_paths)]
 
-def find_pkl_files(search_path):
+def find_pkl_files(search_path, root=paths.WORKSPACE_ROOT):
     """Finds all .pkl dataset files, prioritizing cleaned files."""
     logging.info(f"Searching for processed datasets (.pkl) in: {search_path}...")
-    all_files = [p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*.pkl")]
-    cleaned_files = sorted([p for p in all_files if 'cleaned' in str(p)])
-    other_files = sorted([p for p in all_files if 'cleaned' not in str(p)])
-    return [str(p) for p in cleaned_files + other_files]
+    
+    cleaned_files = []
+    other_files = []
+    
+    # 1. Iterate over the glob result once.
+    for p in search_path.glob("*.pkl"):
+        # Convert to relative path immediately
+        relative_path = p.relative_to(root)
+        
+        # 2. Separate into lists during the single pass.
+        if 'cleaned' in str(relative_path):
+            cleaned_files.append(relative_path)
+        else:
+            other_files.append(relative_path)
+            
+    # 3. Final processing: sort and convert to string.
+    cleaned_files = [str(p) for p in sorted(cleaned_files)]
+    other_files = [str(p) for p in sorted(other_files)]
+
+    return cleaned_files + other_files
 
 def find_demo_dirs(root_search_path):
     """
-    Recursively finds all valid demonstration directories.
+    Recursively finds all valid demonstration directories containing a 'frame_*' 
+    file or folder. Stops at the demonstration directory level.
     """
     logging.info(f"Searching for demonstration directories in: {root_search_path}...")
-    found_demos = []
-    for dirpath, _, _ in os.walk(root_search_path):
-        if glob.glob(os.path.join(dirpath, 'frame_*')):
-            relative_path = Path(dirpath).relative_to(paths.WORKSPACE_ROOT)
-            found_demos.append(str(relative_path))
-    logging.info(f"Found {len(found_demos)} potential demonstration directories.")
-    return sorted(found_demos)
+    
+    # 1. Use rglob to find all 'frame_*' files/folders recursively.
+    # This is often faster than a Python-level os.walk + manual check.
+    frame_files_or_dirs = root_search_path.rglob('frame_*')
+    
+    # 2. Extract the unique parent directories from the found items.
+    # The set comprehension automatically handles the "list each demo once" requirement.
+    found_demo_dirs = {p.parent for p in frame_files_or_dirs}
+    
+    # 3. Convert to relative string paths and sort.
+    # We use a tuple (p.relative_to(paths.WORKSPACE_ROOT)) as the element
+    # and then convert to string for the final output format.
+    relative_paths = [str(p.relative_to(paths.WORKSPACE_ROOT)) 
+                      for p in found_demo_dirs]
+
+    logging.info(f"Found {len(relative_paths)} potential demonstration directories.")
+    return sorted(relative_paths)
 
 def find_config_files(root_search_path):
     """
