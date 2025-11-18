@@ -58,10 +58,10 @@ fr3_arm_controller:
       
     # --- EFFORT GAINS ---
     gains:
-      fr3_joint1: { p: 800., d: 30., i: 0., i_clamp: 1. }
-      fr3_joint2: { p: 800., d: 30., i: 0., i_clamp: 1. }
-      fr3_joint3: { p: 800., d: 30., i: 0., i_clamp: 1. }
-      fr3_joint4: { p: 800., d: 30., i: 0., i_clamp: 1. }
-      fr3_joint5: { p: 500., d: 10., i: 0., i_clamp: 1. }
-      fr3_joint6: { p: 200., d: 10., i: 0., i_clamp: 1. }
-      fr3_joint7: { p: 100., d: 5., i: 0., i_clamp: 1. }
+      fr3_joint1: { p: 1000., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint2: { p: 1000., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint3: { p: 1000., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint4: { p: 1000., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint5: { p: 800., d: 10., i: 0., i_clamp: 1. }
+      fr3_joint6: { p: 250., d: 10., i: 0., i_clamp: 1. }
+      fr3_joint7: { p: 150., d: 5., i: 0., i_clamp: 1. }

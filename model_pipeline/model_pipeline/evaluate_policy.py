@@ -79,7 +79,8 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
                     is_arm_only, num_arm_joints, device, control_mode='joint_space', 
                     use_goal=False, solver=None,
                     start_time_idx=None,
-                    mimic_rollout_start=False, use_average_policy=False):
+                    mimic_rollout_start=False, use_average_policy=False,
+                    proprio_only=False):
     """
     Closed-loop rollout with added controls for start time and history initialization
     to diagnose state-mismatch problems.
@@ -117,80 +118,66 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
     PROP_END_IDX = PROP_START_IDX + FULL_PROP_DIM # 24 + 23 = 47
     VISUAL_START_IDX = PROP_END_IDX
     
-    # --- NEW: Set up start time and history ---
-    if start_time_idx is None:
-        start_frame = frame_stack_k - 1 # Default: start at the earliest possible frame
-    else:
-        start_frame = start_time_idx
-    
-    # Sanity checks for start_frame
-    if start_frame < frame_stack_k - 1:
-        logging.warning(f"start_time_idx ({start_frame}) is less than frame_stack_k - 1. Clamping to {frame_stack_k - 1}.")
-        start_frame = frame_stack_k - 1
+    # --- Set up start time and history ---
+    if start_time_idx is None: start_frame = frame_stack_k - 1
+    else: start_frame = start_time_idx
+    if start_frame < frame_stack_k - 1: start_frame = frame_stack_k - 1
     if start_frame >= total_steps:
-        logging.error(f"start_time_idx ({start_frame}) is beyond trajectory length ({total_steps}). Cannot run rollout.")
+        logging.error(f"start_time_idx ({start_frame}) is beyond trajectory length ({total_steps}).")
         return np.array([]), np.array([]), {}
 
-    # Calculate number of steps to run
-    max_possible_steps = total_steps - start_frame - 1 # -1 because we predict one step into the future
-    if horizon is None:
-        rollout_steps = max_possible_steps
-    else:
-        rollout_steps = min(horizon, max_possible_steps)
+    max_possible_steps = total_steps - start_frame - 1
+    rollout_steps = min(horizon or max_possible_steps, max_possible_steps)
     
     if rollout_steps <= 0:
-        logging.warning(f"Rollout has 0 steps to run (start_frame={start_frame}, total_steps={total_steps}, horizon={horizon}).")
+        logging.warning(f"Rollout has 0 steps to run.")
         return np.array([]), np.array([]), {}
         
-    # --- NEW: Initialize proprioception history (q_pred_history) ---
+    # Initialize proprioception history (q_pred_history)
+    history_start_idx = start_frame - frame_stack_k + 1
+    history_end_idx = start_frame + 1
+    
+    start_state_proprio = state_t[start_frame, PROP_START_IDX:PROP_END_IDX]
     if mimic_rollout_start:
-        # Mimic a "static" start by repeating the state at start_frame
-        start_state_proprio = state_t[start_frame, PROP_START_IDX:PROP_END_IDX]
         q_pred_history = start_state_proprio.unsqueeze(0).repeat(frame_stack_k, 1)
         logging.info(f"Rollout starting at frame {start_frame} for {rollout_steps} steps (Mimicking static start).")
     else:
-        # Use ground-truth history leading up to start_frame
-        history_start_idx = start_frame - frame_stack_k + 1
-        history_end_idx = start_frame + 1
         q_pred_history = state_t[history_start_idx:history_end_idx, PROP_START_IDX:PROP_END_IDX].clone()
         logging.info(f"Rollout starting at frame {start_frame} for {rollout_steps} steps (Using ground-truth history).")
     
     predicted_q_trajectory = []
     is_sequence_model = any(k in model.__class__.__name__.lower() for k in ['lstm', 'gru', 'transformer', 'rnn'])
-
-    # Define a simple workspace boundary (adjust as needed)
-    WORKSPACE_MIN = torch.tensor([0.0, -2.0, 0.0], device=device)
-    WORKSPACE_MAX = torch.tensor([2.0, 2.0, 2.0], device=device)
-
-    # Define action dimensions
     arm_action_dim = 6 if control_mode == 'task_space' else 7
     
     for i in range(rollout_steps):
-        # t is the current ground-truth time index
         t = start_frame + i
 
-        # 1. Extract Ground Truth Sensory data for time t
-        # The history window is [t - k + 1, t + 1]
+        # --- 2. BUILD CORE STATE (P_pred for Proprio-Only; T_gt|P_pred|V_gt for Full) ---
         current_history_start_idx = t - frame_stack_k + 1
         current_history_end_idx = t + 1
         
-        tactile_gt_stack = state_t[current_history_start_idx : current_history_end_idx, 0:TACTILE_DIM]
-        visual_gt_stack = state_t[current_history_start_idx : current_history_end_idx, VISUAL_START_IDX:state_dim]
-        
-        # 2. RECONSTRUCT STATE AS [T_gt | P_pred | V_gt] ---
-        # P_pred is [EE_POSE (7D), HAND_JOINTS (16D)]
-        state_window = torch.cat([
-            tactile_gt_stack,
-            q_pred_history, 
-            visual_gt_stack 
-        ], dim=1) 
-        
-        # 3. Add goal
-        goal_window = goal_t.unsqueeze(0).repeat(frame_stack_k, 1)
-        if use_goal:
-            full_state_sequence = torch.cat([state_window, goal_window], dim=1)
+        if proprio_only:
+            # Core state is just the predicted proprio history (K, 23)
+            core_state_sequence = q_pred_history
         else:
-            full_state_sequence = state_window
+            # Core state is the full state with predicted proprio injected
+            tactile_gt_stack = state_t[current_history_start_idx : current_history_end_idx, 0:TACTILE_DIM]
+            visual_gt_stack = state_t[current_history_start_idx : current_history_end_idx, VISUAL_START_IDX:state_dim]
+            
+            # RECONSTRUCT STATE AS [T_gt | P_pred | V_gt] 
+            core_state_sequence = torch.cat([
+                tactile_gt_stack,
+                q_pred_history, 
+                visual_gt_stack 
+            ], dim=1) 
+        
+        # 3. Add goal if required
+        if use_goal:
+            goal_window = goal_t.unsqueeze(0).repeat(frame_stack_k, 1)
+            # Concatenate core state (filtered or full) with the goal window
+            full_state_sequence = torch.cat([core_state_sequence, goal_window], dim=1)
+        else:
+            full_state_sequence = core_state_sequence
 
         # 4. Apply normalization (X_mean/X_std)
         if is_sequence_model:
@@ -204,34 +191,28 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
         # 5. Model forward and De-normalize (Y_mean/Y_std) ---
         with torch.no_grad():
             if use_average_policy:
-                # DUMMY POLICY: Sets normalized prediction to 0, which results in delta_action_pred = y_mean
                 y_pred_norm = torch.zeros_like(y_std) 
-                # Note: We skip the model(x_tensor) call entirely.
             else:
-                # Standard model inference
+                # Execution happens here: x_tensor must match model's input dim
                 y_pred_norm = model(x_tensor).squeeze(0)
 
             delta_action_pred = (y_pred_norm * y_std) + y_mean
             
-        # 6. Propagate next proprio ---
-        # last_q_full_proprio is the predicted state at time t
-        last_q_full_proprio = q_pred_history[-1] # [EE_POSE(7), HAND_JOINTS(16)]
+        # 6. Propagate next proprio (unchanged) ---
+        last_q_full_proprio = q_pred_history[-1] 
+        # ... (propagation logic remains the same) ...
         
-        # Deconstruct predicted action (delta for time t)
         delta_arm_pred = delta_action_pred[:arm_action_dim]
         if is_arm_only:
             delta_hand_pred = torch.zeros(HAND_JOINT_DIM, device=device)
         else:
             delta_hand_pred = delta_action_pred[arm_action_dim:]
             
-        # Deconstruct last proprio state (at time t)
         last_q_arm = last_q_full_proprio[:ARM_PROP_DIM]
         last_q_hand = last_q_full_proprio[ARM_PROP_DIM:]
         
-        # 7. Propagate Hand (simple addition) -> state for t+1
         next_q_hand = last_q_hand + delta_hand_pred
 
-        # 8. Propagate Arm (mode-dependent) -> state for t+1
         if control_mode == 'joint_space':
             next_q_arm = last_q_arm + delta_arm_pred
             next_q_arm = torch.clamp(next_q_arm, joint_min[:num_arm_joints], joint_max[:num_arm_joints])
@@ -245,55 +226,44 @@ def perform_rollout(model, trajectory, horizon, norm_stats, joint_limits, frame_
             T_next = T_current * T_delta
             next_pose_np = pin.SE3ToXYZQUAT(T_next)
             
-            if next_pose_np[6] < 0: # Canonicalize quaternion
-                next_pose_np[3:] *= -1
-            
+            if next_pose_np[6] < 0: next_pose_np[3:] *= -1
             next_q_arm = torch.as_tensor(next_pose_np, dtype=torch.float32, device=device)
             
         else:
             raise ValueError(f"Unknown control_mode: {control_mode}")
 
-        # 9. Clamp Hand Joints (Arm is already clamped or is a pose)
         next_q_hand = torch.clamp(
             next_q_hand, 
             joint_min[num_arm_joints:], 
             joint_max[num_arm_joints:]
         )
         
-        # 10. Recombine into full 23-DOF proprio vector for t+1
         q_pred_next = torch.cat([next_q_arm, next_q_hand])
         
-        # 11. Update history for next iteration
         predicted_q_trajectory.append(to_np(q_pred_next))
         q_pred_history = torch.roll(q_pred_history, shifts=-1, dims=0)
-        q_pred_history[-1] = q_pred_next # Insert new predicted state for t+1
+        q_pred_history[-1] = q_pred_next
 
-    # --- Metrics Calculation ---
+    # --- Metrics Calculation (unchanged) ---
     pred_np = np.array(predicted_q_trajectory)
     
-    # Ground truth states must align with predicted states
-    # We predicted states from (start_frame + 1) to (start_frame + rollout_steps)
     gt_start_idx = start_frame + 1
     gt_end_idx = start_frame + 1 + rollout_steps
-    
     gt_np = to_np(state_t[gt_start_idx : gt_end_idx, PROP_START_IDX:PROP_END_IDX])
 
-    # Safety check
+    # ... (safety checks) ...
     if len(pred_np) == 0 or len(gt_np) == 0:
         logging.warning("Rollout or GT has length 0. Returning empty metrics.")
         return np.array([]), np.array([]), {'mse': np.nan, 'mae': np.nan, 'r2': np.nan}
     
     if len(pred_np) != len(gt_np):
-        logging.warning(f"Mismatch in pred ({len(pred_np)}) and gt ({len(gt_np)}) lengths. Truncating.")
         min_len = min(len(pred_np), len(gt_np))
         pred_np = pred_np[:min_len]
         gt_np = gt_np[:min_len]
 
-    # If is_arm_only=True, metrics are calculated on the 7D EE pose only
     if is_arm_only:
         gt_for_metrics = gt_np[:, :ARM_PROP_DIM]
         pred_for_metrics = pred_np[:, :ARM_PROP_DIM]
-        # logging.info(f"  (Metrics on 7D EE Pose only)")
     else:
         gt_for_metrics = gt_np
         pred_for_metrics = pred_np
@@ -318,6 +288,7 @@ def main():
     parser.add_argument("--start_step", type=int, default=None)
     parser.add_argument("--mimic_rollout_start", action="store_true")
     parser.add_argument("--dummy", action="store_true")
+    parser.add_argument("--proprio_only", action="store_true", help="If set, use only proprioceptive data for evaluation.")
     args = parser.parse_args()
 
     try:
@@ -479,14 +450,34 @@ def main():
         is_sequence_model = model_type in ["lstm", "gru", "transformer"]
         flatten_data = not is_sequence_model
         
+        # --- Define state indices (needed for filtering) ---
+        TACTILE_DIM = 24
+        ARM_PROP_DIM = 7
+        HAND_JOINT_DIM = 16
+        FULL_PROP_DIM = ARM_PROP_DIM + HAND_JOINT_DIM # 23
+        PROP_START_IDX = TACTILE_DIM 
+        PROP_END_IDX = PROP_START_IDX + FULL_PROP_DIM # 24 + 23 = 47
+
         X_val_list, y_val_list = [], []
         for traj in val_trajectories:
+            state_dim_for_goal = traj['state_t'].shape[1]
             if config.get('use_goal', False):
-                X_unstacked = np.concatenate([
-                    traj['state_t'], traj['goal_t']
-                ], axis=1)
+                X_unstacked = np.concatenate([traj['state_t'], traj['goal_t']], axis=1)
+                goal_dim = traj['goal_t'].shape[1]
             else:
                 X_unstacked = traj['state_t']
+                goal_dim = 0
+
+            # --- PROPRIO-ONLY FILTER (for One-Step) ---
+            if final_args.proprio_only:
+                proprio_indices = np.arange(PROP_START_IDX, PROP_END_IDX) # 24...46
+                if config.get('use_goal', False):
+                    goal_indices = np.arange(state_dim_for_goal, state_dim_for_goal + goal_dim)
+                    final_indices = np.concatenate([proprio_indices, goal_indices])
+                else:
+                    final_indices = proprio_indices
+                X_unstacked = X_unstacked[:, final_indices]
+
             y_unstacked = traj['action_t']
             if len(X_unstacked) < frame_stack_k: continue
             
@@ -644,6 +635,7 @@ def main():
                     mimic_rollout_start=final_args.mimic_rollout_start,
                     start_time_idx=final_args.start_step,
                     use_average_policy=final_args.dummy,
+                    proprio_only=final_args.proprio_only
                 )
                 all_metrics.append(metrics)
                 all_preds.append(pred_np)

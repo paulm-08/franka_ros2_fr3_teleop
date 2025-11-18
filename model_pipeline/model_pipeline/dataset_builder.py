@@ -100,7 +100,7 @@ class VisionProcessor:
             self.extractor2 = KeypointExtractor(
                 model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
                 use_3d=self.use_3d_keypoints,
-                confidence_threshold=vision_config.get("confidence_threshold", 0.1),
+                confidence_threshold=vision_config.get("confidence_threshold", 0.01),
                 intrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("intrinsics_path_cam2")),
                 extrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("extrinsics_path_cam2")),
                 device=device
@@ -124,8 +124,10 @@ class VisionProcessor:
             self.embedder = VisualEmbedder(
                 backbone=config.get("backbone", "resnet18"), device=device,
                 out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
-                global_depth_range=global_depth_range
+                global_depth_range=global_depth_range,
+                canonical_weights_path=vision_config.get("canonical_weights_path", None)
             )
+            
             # Force deterministic inference
             self.embedder.eval()
             torch.set_grad_enabled(False)
@@ -142,7 +144,7 @@ class VisionProcessor:
         
         logging.info(f"Vision module initialized. Single-camera dim: {self.single_cam_dim}, Total visual dim: {self.output_dim}")
     
-    def process_cameras(self, color1, depth1, color2, depth2):
+    def process_cameras(self, color1, depth1, color2, depth2, frame_id=None):
         """Processes images from both cameras based on the selected vision mode."""
         keypoint_feats1 = []
         keypoint_feats2 = []
@@ -173,14 +175,14 @@ class VisionProcessor:
             keypoint_feats2 = get_engineered_features(self.extractor2, color2, depth2)
 
         if self.use_resnet_embeddings: # ResNet Embedder
-            def extract(c_img, d_img):
+            def extract(c_img, d_img, cam_id=None):
                 if c_img is None: return np.zeros(self.single_cam_dim, dtype=np.float32)
-                rgb = self.embedder.embed_rgb(c_img)
-                depth = self.embedder.embed_depth(d_img)
+                rgb = self.embedder.embed_rgb(c_img, frame_id=f"{cam_id}_{frame_id}")
+                depth = self.embedder.embed_depth(d_img, frame_id=f"{cam_id}_{frame_id}")
                 if rgb is None or depth is None: return np.zeros(self.single_cam_dim, dtype=np.float32)
                 return np.concatenate([rgb, depth])
-            embedding_feats1 = extract(color1, depth1)
-            embedding_feats2 = extract(color2, depth2)
+            embedding_feats1 = extract(color1, depth1, cam_id="cam1")
+            embedding_feats2 = extract(color2, depth2, cam_id="cam2")
 
         # --- Combine features based on enabled modules ---
         feats1 = np.concatenate([
@@ -308,9 +310,12 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
 
     # --- Get dimensions from the initialized vision_processor ---
     # These are crucial for correctly parsing the feature vector
-    kp_raw_dim = vision_processor.extractor1.output_dim  # e.g., 10 (5 per object)
-    kp_engineered_dim = coord_dim
-    kp_total_dim = kp_raw_dim + kp_engineered_dim # e.g., 13
+    kp_raw_dim = vision_processor.extractor1.output_dim  # 8 in 2d or 10 in 3d
+    kp_engineered_dim = coord_dim # 2 in 2d (u,v), 3 in 3d (x,y,z)
+    kp_total_dim = kp_raw_dim + kp_engineered_dim # 10 in 2d, 13 in 3d
+    
+    single_cam_dim = vision_processor.single_cam_dim # e.g., 61
+
     
     single_cam_dim = vision_processor.single_cam_dim # e.g., 61
 
@@ -367,7 +372,7 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
         color2 = cv2.imread(color2_path)
         depth2 = cv2.imread(depth2_path, cv2.IMREAD_UNCHANGED)
         
-        features_per_cam = vision_processor.process_cameras(color1, depth1, color2, depth2)
+        features_per_cam = vision_processor.process_cameras(color1, depth1, color2, depth2, frame_id=i)
 
         # --- "Carry Forward" Logic with Staleness Flag ---
         def update_features(raw_feats, cam_id):
@@ -420,10 +425,11 @@ def process_single_trajectory(frame_dirs, ref_frame_dir, vision_processor, solve
         f1_raw = features_per_cam.get('cam1', np.zeros(single_cam_dim, dtype=np.float32))
         f2_raw = features_per_cam.get('cam2', np.zeros(single_cam_dim, dtype=np.float32))
 
-        # Apply the staleness logic
-        f1_final = update_features(f1_raw, 'cam1')
-        f2_final = update_features(f2_raw, 'cam2')
-        
+        # # Apply the staleness logic
+        # f1_final = update_features(f1_raw, 'cam1')
+        # f2_final = update_features(f2_raw, 'cam2')
+        f1_final = f1_raw
+        f2_final = f2_raw
         visual_list.append(np.concatenate([f1_final, f2_final]))
         
         # --- Kinematics (End-Effector Pose and Hand Joints) ---

@@ -3,7 +3,7 @@ import numpy as np
 
 # --- Configuration ---
 # Update this path to your specific .pkl file
-DATASET_PATH = "/home/user/franka_ros2_ws/data/processed_datasets/dataset_single_test_noemb.pkl"
+DATASET_PATH = "/home/user/franka_ros2_ws/data/processed_datasets/dataset_single_test.pkl"
 
 # Index for the arm joint positions within the state vector (Q_t)
 # (Your configuration: indices 24 up to, but not including, 31)

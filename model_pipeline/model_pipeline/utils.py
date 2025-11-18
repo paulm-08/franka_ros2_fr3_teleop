@@ -9,6 +9,7 @@ import platform
 from pathlib import Path
 import json
 import torch
+import random
 
 from model_pipeline.visual_embedder import VisualEmbedder
 from model_pipeline import paths
@@ -128,6 +129,30 @@ def load_actions(frame_dirs):
         else:
             actions.append(np.zeros(7))  # fallback dummy
     return np.array(actions)
+
+def set_all_seeds(seed: int = 42):
+    """
+    Sets deterministic seeds for Python, NumPy, PyTorch (CPU and CUDA),
+    and forces deterministic execution on the GPU.
+
+    This MUST be called at the very beginning of your script.
+    """
+    print(f"Setting global seed to {seed} for deterministic execution.")
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # --- CUDA/GPU Determinism ---
+    if torch.cuda.is_available():
+        # Set all CUDA seeds for single and multi-GPU setups
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) 
+        
+        # Enforce deterministic behavior for convolutions and other operations
+        # WARNING: This might slightly slow down execution but is necessary for determinism
+        torch.backends.cudnn.deterministic = True 
+        torch.backends.cudnn.benchmark = False 
 
 # ---------------- Sensor init ----------------
 def init_sensor(cfg_path, package_share_path=None, calibrated=True, ref=None, open_camera=False):    

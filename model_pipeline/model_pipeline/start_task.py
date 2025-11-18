@@ -57,7 +57,7 @@ class StagingController(Node):
         msg = Float64MultiArray()
         msg.data = [float(p) for p in leap_pose]
         self.hand_publisher.publish(msg)
-        self.get_logger().info("Hand command sent.")
+        # self.get_logger().info("Hand command sent.")
 
 def main():
     try:
@@ -108,10 +108,10 @@ def main():
         
         open_hand_pose = lhu.allegro_to_LEAPhand([0.0]*16, zeros=False)
         staging_node.command_hand(open_hand_pose)  # Open hand
-        time.sleep(2) # Wait for hand open
+        time.sleep(1) # Wait for hand open
 
-        staging_node.command_arm(start_pose_arm, duration_sec=5)
-        time.sleep(6) # Wait for arm move
+        staging_node.command_arm(start_pose_arm, duration_sec=3)
+        time.sleep(3) # Wait for arm move
 
         # # staging_node.command_hand(hand_grasp_pose)
         # # time.sleep(3) # Wait for grasp

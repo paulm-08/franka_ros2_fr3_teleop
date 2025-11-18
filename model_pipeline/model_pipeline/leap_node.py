@@ -85,7 +85,7 @@ class LeapNode(Node):
         if len(target_pose) == 16:
             # The 'set_leap' function from your teleop script handles all conversions
             self.set_leap(target_pose)
-            self.get_logger().info("Received and executed new hand pose command.")
+            # self.get_logger().info("Received and executed new hand pose command.")
         else:
             self.get_logger().warn(f"Received invalid hand command with {len(target_pose)} joints.")
 

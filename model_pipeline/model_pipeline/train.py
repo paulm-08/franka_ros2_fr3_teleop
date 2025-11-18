@@ -219,7 +219,7 @@ class TrajectoryFrameStackDataset(Dataset):
                 for frame_idx in range(self.k - 1, num_samples - 1):
                     self.indices.append((traj_idx, frame_idx))
         
-        # Slices relative to the original, full state vector (D_state = 47)
+        # Slices relative to the original, full state vector (D_state)
         self.full_state_proprio_slice = slice(TACTILE_DIM, TACTILE_DIM + FULL_PROP_DIM) # 24:47 (23D)
         self.arm_proprio_slice = slice(TACTILE_DIM, TACTILE_DIM + ARM_PROP_DIM) # 24:31 (7D)
         
@@ -277,15 +277,20 @@ class TrajectoryFrameStackDataset(Dataset):
                 self.proprio_end_idx = self.full_state_proprio_slice.stop
 
 
-        # These are used for normalizing the *input* to the drift head (always 23D when proprio_only=True)
+        # These are used for normalizing the *input* to the drift head
         if self.proprio_only:
             # X_mean is already filtered, and proprio is at 0:23
             self.proprio_mean = self.X_mean[self.proprio_start_idx:self.proprio_end_idx]
             self.proprio_std = self.X_std[self.proprio_start_idx:self.proprio_end_idx]
         else:
-            # If proprio_only is False, we use the full X_mean and the original slice (23D)
-            self.proprio_mean = self.X_mean[self.full_state_proprio_slice]
-            self.proprio_std = self.X_std[self.full_state_proprio_slice]
+            # FIX: If arm_only is TRUE, we must use the 7D arm slice for mean/std
+            if self.arm_only:
+                slice_to_use = self.arm_proprio_slice
+            else:
+                slice_to_use = self.full_state_proprio_slice
+                
+            self.proprio_mean = self.X_mean[slice_to_use]
+            self.proprio_std = self.X_std[slice_to_use]
 
 
     def __len__(self):
@@ -357,7 +362,6 @@ class TrajectoryFrameStackDataset(Dataset):
         # Get ground truth clean state and next state proprioception at time t
         q_t_clean = Q_clean_sequence_full[-1, proprio_slice_for_targets].astype(np.float32)
         q_next_gt = traj['state_t'][frame_idx + 1, proprio_slice_for_targets].astype(np.float32)
-        # q_t_clean and q_next_gt are 7D if arm_only=True.
 
         # --- 3a. Generate the single drift noise vector (N_drift) ---
         drift_noise = np.zeros_like(q_t_clean) # Shape is 7D if arm_only
@@ -397,19 +401,20 @@ class TrajectoryFrameStackDataset(Dataset):
         # Get the K-frame clean proprioception sequence (un-normalized)
         if self.proprio_only:
             # full_state_sequence is already filtered to 23D proprio (+ goal)
-            Q_proprio_clean_sequence = full_state_sequence[:, self.proprio_start_idx:self.proprio_end_idx] # (3, 23)
+            Q_proprio_clean_sequence = full_state_sequence[:, self.proprio_start_idx:self.proprio_end_idx]
         else:
-            # If proprio_only is OFF, we need the full 23D sequence for the input head
-            Q_proprio_clean_sequence = Q_clean_sequence_full[:, self.full_state_proprio_slice] # (3, 23)
+            # FIX: If proprio_only is OFF, match the slice size to what is being replaced (7D or 23D)
+            proprio_slice_for_input = self.arm_proprio_slice if self.arm_only else self.full_state_proprio_slice
+            Q_proprio_clean_sequence = Q_clean_sequence_full[:, proprio_slice_for_input] # (3, 7) if arm_only=True
 
-        # Apply the SAME drift noise (7D or 23D) to the entire K-frame history.
+        # Apply the SAME drift noise to the entire K-frame history.
         if self.control_mode == 'joint_space':
             Q_proprio_drifted_sequence = Q_proprio_clean_sequence.copy()
             
-            # ** FIX: Conditionally apply noise based on arm_only status **
             if self.arm_only:
-                # If arm_only is true, drift_noise is 7D. Apply it only to the ARM features (indices 0:7).
-                Q_proprio_drifted_sequence[:, ARM_PROP_SLICE_IN_PROP_VECTOR] += drift_noise
+                # If arm_only is true, drift_noise is 7D. Apply it only to the ARM features (indices 0:7 in the proprio vector).
+                # Since Q_proprio_clean_sequence is now only 7D, we can add directly.
+                Q_proprio_drifted_sequence += drift_noise
             else:
                 # If arm_only is false, drift_noise is 23D and can be added directly.
                 Q_proprio_drifted_sequence += drift_noise
@@ -424,13 +429,14 @@ class TrajectoryFrameStackDataset(Dataset):
         else:
             Q_proprio_drifted_sequence = Q_proprio_clean_sequence
         
-        # Normalize the drifted sequence (against the 23D proprio mean/std)
+        # Normalize the drifted sequence (against the 7D/23D proprio mean/std, depending on arm_only)
         Q_proprio_drifted_norm = (Q_proprio_drifted_sequence - self.proprio_mean) / self.proprio_std
 
         # Create the final drifted state vector (using final_state_bc as the base for non-proprio features)
         final_state_drift = final_state_bc.copy() 
         
         # Replace the proprioception in ALL K frames with the realistic, drifted history
+        # Now, Q_proprio_drifted_norm (3, 7) matches the slice size (3, 7)
         final_state_drift[:, self.proprio_start_idx:self.proprio_end_idx] = Q_proprio_drifted_norm
         
         state_output_drift = final_state_drift.flatten() if self.flatten else final_state_drift
@@ -443,7 +449,7 @@ class TrajectoryFrameStackDataset(Dataset):
             torch.as_tensor(q_t_noisy).float(),
             torch.as_tensor(q_next_gt).float()
         )
-        
+            
 # ===================================================================
 # === UTILITY FUNCTIONS ===
 # ===================================================================

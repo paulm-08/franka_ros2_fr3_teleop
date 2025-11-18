@@ -43,6 +43,7 @@ setup(
             'save_calibration = model_pipeline.save_calibration:main',
             'test_3d_keypoint = model_pipeline.test_3d_keypoint:main',
             'visualize_rollout = model_pipeline.visualize_rollout:main',
+            'create_canonical_vfe = model_pipeline.create_canonical_vfe:main',
         ],
     },
 )

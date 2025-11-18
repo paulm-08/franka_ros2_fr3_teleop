@@ -13,9 +13,11 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.executors import MultiThreadedExecutor
 import asyncio
 import threading
+from threading import Lock
 import pinocchio as pin
 import tempfile
 import random
+import cv2
 
 # ROS 2 message types
 from sensor_msgs.msg import JointState
@@ -67,10 +69,10 @@ class PolicyRolloutNode(Node):
         # --- Declare ROS Parameters (for non-interactive use) ---
         self.declare_parameter('model_path', '')
         self.declare_parameter('goal_state_path', '')
-        self.declare_parameter('control_rate_hz', 20.0)
+        self.declare_parameter('control_rate_hz', 10.0)
 
         # --- REPLAY_MODE Parameters ---
-        self.declare_parameter('replay_gt', True)
+        self.declare_parameter('replay_gt', False)
         self.declare_parameter('dataset_pkl', 'data/processed_datasets/dataset_single_test_noemb.pkl')
         self.declare_parameter('replay_traj_idx', 0)
         self.declare_parameter('start_step', 49)
@@ -80,8 +82,16 @@ class PolicyRolloutNode(Node):
         self.get_logger().info(f"Using device: {self.device}")
 
         # --- Load Model, Config, and Goal from provided paths ---
-        with open(paths.DEFAULT_CONFIG_PATH, 'r') as f:
-            self.config = yaml.safe_load(f)            
+        model_path_str = self.get_parameter('model_path').get_parameter_value().string_value
+        checkpoint = torch.load(model_path_str, map_location=self.device, weights_only=False)
+        training_config = checkpoint.get("training_config", {})
+
+        if training_config == {}:
+            self.get_logger().info("WARNING: 'training_config' not found in checkpoint. Loading from default path.")
+            with open(training_config, 'r') as f:
+                self.config = yaml.safe_load(f)
+        else:
+            self.config = training_config        
 
         self.control_mode = self.config.get('control_mode', {})
         self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
@@ -91,7 +101,6 @@ class PolicyRolloutNode(Node):
         self.replay_actions = None
         self.start_step = self.get_parameter('start_step').get_parameter_value().integer_value
 
-        model_path_str = self.get_parameter('model_path').get_parameter_value().string_value
         goal_path_str = self.get_parameter('goal_state_path').get_parameter_value().string_value
 
         if not model_path_str or not goal_path_str:
@@ -101,7 +110,6 @@ class PolicyRolloutNode(Node):
             self.get_logger().info(f"Loading model from: {model_path_str}")
             self.get_logger().info(f"Loading goal state from: {goal_path_str}")
 
-        checkpoint = torch.load(model_path_str, map_location=self.device, weights_only=False)
         self.frame_stack_k = checkpoint.get("frame_stack", 1)
         self.is_arm_only = checkpoint.get("arm_only", False)
         self.num_arm_joints = checkpoint.get("num_arm_joints", 7)
@@ -149,7 +157,7 @@ class PolicyRolloutNode(Node):
 
         if self.is_replay_mode:
             # --- REPLAY MODE: Load Dataset Actions ---
-            self.get_logger().warn("--- ⚠️ REPLAY MODE ENABLED ⚠️ ---")
+            self.get_logger().info("--- ⚠️ REPLAY MODE ENABLED ⚠️ ---")
             dataset_pkl_path = self.get_parameter('dataset_pkl').get_parameter_value().string_value
             traj_idx = self.get_parameter('replay_traj_idx').get_parameter_value().integer_value
             
@@ -169,7 +177,7 @@ class PolicyRolloutNode(Node):
                 gt_action_dim = self.replay_actions.shape[1]
                 model_action_dim = checkpoint["output_dim"]
                 if self.is_arm_only and gt_action_dim != model_action_dim:
-                    self.get_logger().warn(f"Model is arm_only ({model_action_dim} joints) but GT actions have {gt_action_dim} joints. Slicing GT actions.")
+                    self.get_logger().info(f"Model is arm_only ({model_action_dim} joints) but GT actions have {gt_action_dim} joints. Slicing GT actions.")
                     self.replay_actions = self.replay_actions[:, :model_action_dim]
                 
             except Exception as e:
@@ -204,6 +212,13 @@ class PolicyRolloutNode(Node):
         self.current_arm_states = None
         self.full_joint_names = None
         self.history_buffer = []
+        self.input_history = []
+        self.latest_obs = {} # Stores all raw sensor images
+        self.latest_leap_pos = None
+        self.latest_vision_features = None
+
+        self.vision_lock = Lock()
+        self.sensor_lock = Lock()
 
         # --- Stateful Tracking for Keypoints ---
         # We now store the last known *position* vector separately from the *full feature* vector.
@@ -212,9 +227,9 @@ class PolicyRolloutNode(Node):
 
         # --- Get dimensions from the initialized vision_processor ---
         # These are crucial for correctly parsing the feature vector
-        self.kp_raw_dim = self.vision_processor.extractor1.output_dim  # e.g., 10 (5 per object)
-        self.kp_engineered_dim = self.coord_dim
-        self.kp_total_dim = self.kp_raw_dim + self.kp_engineered_dim # e.g., 13
+        self.kp_raw_dim = self.vision_processor.extractor1.output_dim  # 8 in 2d or 10 in 3d
+        self.kp_engineered_dim = self.coord_dim # 2 in 2d (u,v), 3 in 3d (x,y,z)
+        self.kp_total_dim = self.kp_raw_dim + self.kp_engineered_dim # 10 in 2d, 13 in 3d
         
         self.single_cam_dim = self.vision_processor.single_cam_dim # e.g., 61
 
@@ -232,6 +247,7 @@ class PolicyRolloutNode(Node):
 
         # P-Control
         self.target_q_arm = None   # Stores the desired accumulated position.
+        self.target_q_hand = None  # Stores the desired accumulated position.
         self.smoothed_delta_arm = None
         self.smoothing_alpha = 0.4 # TUNE THIS: 0.0 (max smoothing) to 1.0 (no smoothing)
         self.control_rate_scaling = 1.0 # TUNE THIS: Use > 1.0 (e.g., 1.05) to compensate for JTC tracking lag
@@ -263,62 +279,32 @@ class PolicyRolloutNode(Node):
             msg = Float64MultiArray()
             msg.data = [float(p) for p in intermediate_pose.tolist()]
             self.hand_command_pub.publish(msg)
-            self.get_logger().info("Hand command sent.")
+            # self.get_logger().info("Hand command sent.")
 
             # Wait for a short duration before the next step
             time.sleep(grasp_duration / num_steps)
         
         logging.info("Grasp complete.")
-        time.sleep(10) # A final short pause after grasping
         
-        self.get_logger().info(f"✅ Policy rollout node initialized. Running at {self.control_rate} Hz.")
+        logging.info("Starting LEAP position service thread...")
+        self.leap_thread = threading.Thread(target=self.leap_service_loop, daemon=True)
+        self.leap_thread.start()
+        
+        logging.info("Starting sensor acquisition thread...")
+        self.sensor_thread = threading.Thread(target=self.sensor_acquisition_loop, daemon=True)
+        self.sensor_thread.start()
+
+        logging.info("Starting parallel vision processing thread...")
+        self.vision_thread = threading.Thread(target=self.vision_processing_loop, daemon=True)
+        self.vision_thread.start()
+        
+        time.sleep(10) # A final short pause after grasping
+
 
     def initialize_vision_processor(self):
         data_dirs = [str(paths.RAW_DATA_DIR)] # For depth range calculation
         return VisionProcessor(self.config, self.device, data_dirs)
     
-        # vision_config = self.config.get("vision", {})
-        # state_config = self.config.get("state", {})
-
-        # if state_config.get("use_keypoint_extractor", False):
-        #     logging.info("Initializing KeypointExtractor (YOLO) for visual features.")
-        #     vision_module = KeypointExtractor(
-        #         model_path=str(paths.WORKSPACE_ROOT / vision_config["yolo_model_path"]),
-        #         confidence_threshold=vision_config.get("confidence_threshold", 0.1),
-        #         use_3d=vision_config.get("use_3d", False),
-        #         intrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("intrinsics_path_cam1")),
-        #         extrinsics_path=str(paths.WORKSPACE_ROOT / vision_config.get("extrinsics_path_cam1")),
-        #         device=self.device
-        #     )
-        #     vision_module.is_keypoint_extractor = True
-        #     return vision_module
-        
-        # if state_config.get("use_embeddings", False): # Default to VisualEmbedder
-        #     logging.info("Initializing VisualEmbedder (ResNet) for visual features.")
-        #     global_depth_range = self.config.get("global_depth_range")
-        #     if not global_depth_range:
-        #         logging.warning("Global depth range not found, using default.")
-        #         global_depth_range = (0, 1000)
-
-        #     class ResNetWrapper:
-        #         def __init__(self, config, device, depth_range):
-        #             self.embedder = VisualEmbedder(
-        #                 backbone=config.get("backbone", "resnet18"), device=device,
-        #                 out_dim={'rgb': config.get("visual_dim", 256), 'depth': config.get("depth_dim", 128)},
-        #                 global_depth_range=depth_range
-        #             )
-        #             self.is_keypoint_extractor = False
-        #             self.feature_dim_per_object = self.embedder.out_dim['rgb'] + self.embedder.out_dim['depth']
-                
-        #         def extract_scene_features(self, color_img, depth_img):
-        #             if color_img is None: return np.zeros(self.feature_dim_per_object, dtype=np.float32)
-        #             rgb_emb = self.embedder.embed_rgb(color_img)
-        #             depth_emb = self.embedder.embed_depth(depth_img)
-        #             if rgb_emb is None or depth_emb is None: return np.zeros(self.feature_dim_per_object, dtype=np.float32)
-        #             return np.concatenate([rgb_emb, depth_emb])
-            
-        #     return ResNetWrapper(self.config, self.device, global_depth_range)
-
     def initialize_tactile_sensors(self):
         self.get_logger().info("Initializing 9DTact sensors...")
         sensors = {}
@@ -392,42 +378,97 @@ class PolicyRolloutNode(Node):
                 raw_img = sensor.get_rectify_crop_image()
 
                 if raw_img is None:
-                    self.get_logger().warn(f"Tactile sensor '{name}' returned a None image. Skipping observation.")
+                    self.get_logger().info(f"Tactile sensor '{name}' returned a None image. Skipping observation.")
                     return None # Return None for the whole observation if any sensor fails
                 obs['tactile_images'][name] = raw_img
                 
             return obs
         except Exception as e:
-            self.get_logger().warn(f"Failed to get live observations: {e}")
+            self.get_logger().info(f"Failed to get live observations: {e}")
             return None
+        
+    def sensor_acquisition_loop(self):
+        """
+        This thread's ONLY job is to block on hardware I/O and update
+        the self.latest_obs attribute.
+        """
+        self.get_logger().info("Starting sensor acquisition thread...")
+        first_run = True # Flag for initial logging
+        while rclpy.ok():
+            try:
+                local_obs = {}
+                # --- Get RealSense Data ---
+                frames1 = self.realsense['pipelines']['camera1'].wait_for_frames()
+                aligned1 = self.realsense['aligners']['camera1'].process(frames1)
+                local_obs['color1'] = np.asanyarray(aligned1.get_color_frame().get_data()).astype(np.uint8)
+                local_obs['depth1'] = np.asanyarray(aligned1.get_depth_frame().get_data()).astype(np.uint16)
+                
+                frames2 = self.realsense['pipelines']['camera2'].wait_for_frames()
+                aligned2 = self.realsense['aligners']['camera2'].process(frames2)
+                local_obs['color2'] = np.asanyarray(aligned2.get_color_frame().get_data()).astype(np.uint8)
+                local_obs['depth2'] = np.asanyarray(aligned2.get_depth_frame().get_data()).astype(np.uint16)
+                
+                # --- Get Tactile Data ---
+                local_obs['tactile_images'] = {}
+                tactile_fail = False
+                for name, sensor in self.tactile_sensors.items():
+                    raw_img = sensor.get_rectify_crop_image()
+                    if raw_img is None:
+                        self.get_logger().info(f"Tactile sensor '{name}' returned None in acq_thread.", throttle_duration_sec=5)
+                        tactile_fail = True
+                        break # Don't update this cycle if one sensor fails
+                    local_obs['tactile_images'][name] = raw_img
+                
+                if tactile_fail:
+                    continue # Skip this loop iteration
+
+                # --- Publish to Class ---
+                # If all data is good, publish it under the lock
+                with self.sensor_lock:
+                    self.latest_obs = local_obs
+                    if first_run:
+                        self.get_logger().info("✅ SENSOR ACQUISITION: First successful data package written to self.latest_obs.")
+                        first_run = False
+
+            except Exception as e:
+                self.get_logger().error(f"FATAL RealSense/Sensor Error in acquisition thread: {e}", throttle_duration_sec=5)
+                # You might need to add a small sleep here to prevent rapid failure loops
+                time.sleep(0.1)
     
     def initialize_kinematics_solver(self):
         urdf_content = get_urdf_string_from_xacro()
         if not urdf_content: 
             logging.error("Failed to generate URDF, cannot proceed."); return
 
-        urdf_temp_file = None
+        self.urdf_temp_file = None
         try:
             # 2b. Save to a temporary file for Pinocchio to load
             # This creates a file with a unique name in the system's temp directory
             with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.urdf', encoding='utf-8') as f:
                 f.write(urdf_content)
-                urdf_temp_file = Path(f.name)
+                self.urdf_temp_file = Path(f.name)
         
             kinematics_config = self.config.get("kinematics", {})
             self.solver = KinematicsSolver(
-                urdf_content=urdf_temp_file,
+                urdf_content=self.urdf_temp_file,
                 end_effector_frame_name=kinematics_config.get("ee_frame", "fr3_hand_tcp"),
                 tactile_frame_names=kinematics_config.get("tactile_frames", []),
                 visualize=False,
             )
+            if self.solver is None:
+                logging.error("KinematicsSolver failed to initialize model from URDF.")
+                return
+            logging.info("KinematicsSolver initialized successfully.")
+
+            return self.solver
+
         except Exception as e:
             logging.error(f"Error initializing KinematicsSolver: {e}")
             return
-        finally:
-            # Clean up the temporary URDF file
-            if urdf_temp_file and urdf_temp_file.exists():
-                urdf_temp_file.unlink()
+        # finally:
+        #     # Clean up the temporary URDF file
+        #     if urdf_temp_file and urdf_temp_file.exists():
+        #         urdf_temp_file.unlink()
 
         
     def joint_state_callback(self, msg: JointState):
@@ -470,25 +511,184 @@ class PolicyRolloutNode(Node):
             self.full_joint_names = self.policy_arm_joint_names + hand_names
 
     def get_current_leap_position(self):
-        """Calls the LEAP position service to get the current hand joint positions."""
+        """
+        Calls the LEAP position service synchronously.
+        This function is called from the custom leap_service_loop thread.
+        It must be fully blocking to avoid mixing rclpy executor calls in the custom thread.
+        """
         if not self.leap_position_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn("LEAP position service not available.")
+            # Use ROS logger (rclpy.Node method) here because this function is called 
+            # from a thread running within the rclpy.Node context. It's safe if 
+            # the thread is running while rclpy is active.
+            self.get_logger().info("LEAP position service not available.")
             return None
 
         req = LeapPosition.Request()
-        future = self.leap_position_client.call_async(req)
         
-        # This call is safe because the executor is running in a separate thread.
-        rclpy.spin_until_future_complete(self, future, timeout_sec=0.5) 
-        
-        if future.done() and future.result() is not None:
-            return np.array(future.result().position)
-        else:
-            self.get_logger().warn("Failed to get LEAP position from service (timed out or failed).")
+        # Use the synchronous 'call' method here. This is blocking, but safe within
+        # a dedicated Python thread if the primary executor is running elsewhere.
+        try:
+            # We are blocking here for up to 1 second
+            response = self.leap_position_client.call(req) 
+            
+            if response is not None:
+                return np.array(response.position)
+            else:
+                self.get_logger().info("Failed to get LEAP position: Service call returned None.")
+                return None
+        except Exception as e:
+            self.get_logger().error(f"Exception during synchronous LEAP service call: {e}")
             return None
-                        
+
+
+    def leap_service_loop(self):
+        """This thread's only job is to call the LEAP service and update shared state."""
+        # Using standard logging or ROS logging is fine here, as it's a dedicated thread 
+        # that will shut down cleanly with the main process (daemon=True).
+        self.get_logger().info("Starting LEAP position service thread...")
+        first_run = True # Flag for initial logging
+
+        while rclpy.ok():
+            pos = self.get_current_leap_position()
+            
+            if pos is not None:
+                with self.sensor_lock:
+                    self.latest_leap_pos = pos
+                if first_run:
+                    self.get_logger().info("✅ LEAP SERVICE: Acquired first LEAP position and updated self.latest_leap_pos.")
+                    first_run = False
+            else:
+                self.get_logger().info("LEAP service returned None position.", throttle_duration_sec=5)
+            
+            # Sleep to prevent spamming the service
+            # If the service call itself takes time, the sleep ensures the thread doesn't hog CPU.
+            # Using time.sleep(0.02) aims for 50Hz updates.
+            time.sleep(0.02)
+            
+    # --- "Carry Forward" Logic with Staleness Flag ---
+    def update_features(self, raw_feats, cam_id):
+        """
+        Parses a 'kitchen sink' vector, applies staleness logic to the
+        keypoint part, and preserves the embedding part.
+        """
+        if raw_feats is None: # Handle case where a camera failed
+            return np.zeros(self.single_cam_dim, dtype=np.float32)
+
+        # --- 1. Split the "kitchen sink" vector ---
+        kps_vec = raw_feats[:self.kp_total_dim]
+        embs_vec = raw_feats[self.kp_total_dim:]
+        
+        # Deconstruct the keypoint vector
+        # [tube(5), peg(5), rel(3)]
+        tube_feats = kps_vec[0:self.coord_dim+2]
+        peg_feats = kps_vec[self.coord_dim+2:2*self.coord_dim+4]
+        
+        tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
+
+        # --- 2. Apply Staleness Logic ---
+        # Check TUBE detection (flag is at index 4)
+        if tube_feats[self.coord_dim+1] > 0: # if flag is 1
+            self.last_known_coords[tube_key] = tube_feats[0:self.coord_dim] # Store new 3D pos
+        else:
+            tube_feats[0:self.coord_dim] = self.last_known_coords[tube_key] # Use stale position
+            tube_feats[self.coord_dim:self.coord_dim+2] = 0.0 # Set conf and flag to 0
+
+        # Check PEG detection (flag is at index 4 of its vector)
+        if peg_feats[self.coord_dim+1] > 0: # if flag is 1
+            self.last_known_coords[peg_key] = peg_feats[0:self.coord_dim]
+        else:
+            peg_feats[0:self.coord_dim] = self.last_known_coords[peg_key]
+            peg_feats[self.coord_dim:self.coord_dim+2] = 0.0
+        
+        # --- 3. Re-engineer the relative vector ---
+        # This is crucial: we recalculate the relative vector based on the
+        # (potentially stale) coordinates we are passing to the policy.
+        rel_vec = tube_feats[0:self.coord_dim] - peg_feats[0:self.coord_dim]
+        
+        # Reconstruct the final keypoint vector
+        final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
+        
+        # --- 4. Recombine with embeddings ---
+        # Return the full, corrected "kitchen sink" vector
+        return np.concatenate([final_kps_vec, embs_vec])
+                              
+    def vision_processing_loop(self):
+        self.get_logger().info("Starting parallel vision processing thread...")
+        first_input = True # Flag for initial logging
+        while rclpy.ok():
+            time_start = time.perf_counter()
+            
+            # 1. Get the latest raw images (using the sensor lock)
+            with self.sensor_lock:
+                if 'color1' not in self.latest_obs:
+                    time.sleep(0.01) # Wait for data
+                    continue
+                
+                if first_input:
+                    self.get_logger().info("✅ VISION PROCESSING: Acquired first input from self.latest_obs.")
+                    first_input = False
+
+                color1 = self.latest_obs['color1'].copy()
+                depth1 = self.latest_obs['depth1'].copy()
+                color2 = self.latest_obs['color2'].copy()
+                depth2 = self.latest_obs['depth2'].copy()
+
+            # --- JPEG DEGRADATION WORKAROUND ---
+            success1, encoded_image1 = cv2.imencode('.jpg', color1, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if success1:
+                color1 = cv2.imdecode(encoded_image1, cv2.IMREAD_COLOR)
+            success2, encoded_image2 = cv2.imencode('.jpg', color2, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if success2:
+                color2 = cv2.imdecode(encoded_image2, cv2.IMREAD_COLOR)
+            
+            # 2. Run the SLOW computation
+            # self.get_logger().info("--- VISION START: Initiating slow feature extraction. ---")
+            self.features_per_cam = self.vision_processor.process_cameras(
+                color1, depth1, color2, depth2, frame_id="policy_rollout_latest"
+            )
+            
+            # Initialize a default feature vector in case of failure
+            final_features = np.zeros(self.vision_processor.output_dim, dtype=np.float32)
+
+            try:
+                # 3. Feature Assembly and Staleness Logic
+                # Get the raw "kitchen sink" vectors
+                f1_raw = self.features_per_cam.get('cam1', np.zeros(self.single_cam_dim, dtype=np.float32))
+                f2_raw = self.features_per_cam.get('cam2', np.zeros(self.single_cam_dim, dtype=np.float32))
+
+                # # Apply complex logic (where the failure might be)
+                # f1_final = self.update_features(f1_raw, 'cam1')
+                # f2_final = self.update_features(f2_raw, 'cam2')
+                f1_final = f1_raw
+                f2_final = f2_raw
+
+                # Concatenate the results
+                final_features = np.concatenate([f1_final, f2_final])
+                
+                # self.get_logger().info("Feature assembly successful.")
+
+            except Exception as e:
+                # If the assembly fails, log the full traceback and continue the loop with zeros
+                self.get_logger().error(f"FATAL EXCEPTION DURING FEATURE ASSEMBLY/STALENESS LOGIC: {e}")
+                import traceback
+                self.get_logger().error(traceback.format_exc())
+                # We use the initialized zero vector for final_features if this fails
+
+            # 4. Store the result under the vision lock
+            with self.vision_lock:
+                # Ensure the policy will wait again if we hit an exception
+                self.latest_vision_features = final_features
+            
+            # Now, the publish log is guaranteed to fire unless the thread is forcibly killed.
+            # self.get_logger().info("--- VISION PUBLISH: Features successfully published and lock released. ---")
+            
+            time_end = time.perf_counter()
+            elapsed = time_end - time_start
+            if elapsed > self.sample_period:
+                self.get_logger().info(f"Vision processing is slower ({elapsed*1000:.2f} ms) than control period ({self.sample_period*1000:.2f} ms)!", throttle_duration_sec=5)
+            # self.get_logger().info(f"Vision thread cycle time: {elapsed*1000:.2f} ms")
+
     def control_loop(self):
-        """A regular, synchronous callback function."""
         self.get_logger().info("Waiting for initial arm states...")
         while rclpy.ok() and self.current_arm_states is None:
             time.sleep(0.1)
@@ -501,10 +701,10 @@ class PolicyRolloutNode(Node):
             self.previous_hand_command = np.zeros(16) 
 
         # --- SAFETY PARAMETERS (Tune these for your hardware!) ---
-        self.MAX_ARM_DELTA = 0.1   # Absolute max delta (rad or m)
-        self.ARM_RATE_LIMIT = 0.05  # Max change from the last command
-        self.MAX_HAND_DELTA = 0.5   # Absolute max delta for hand joints
-        self.HAND_RATE_LIMIT = 0.2 # Max change for hand commands
+        self.MAX_ARM_DELTA = 0.06   # Absolute max delta (rad or m)
+        self.ARM_RATE_LIMIT = 0.02  # Max change from the last command
+        self.MAX_HAND_DELTA = 0.4   # Absolute max delta for hand joints
+        self.HAND_RATE_LIMIT = 0.1 # Max change for hand commands
         # ---`--------------------------------------------------------
         
         self.get_logger().info("✅ All dependencies ready. Starting autonomous control loop.")
@@ -535,7 +735,7 @@ class PolicyRolloutNode(Node):
 
                     # 4. Initialize Targets on first step (crucial for replay consistency)
                     if step == 0:
-                        self.get_logger().warn(f"--- REPLAYING TRAJECTORY (Step {step}) ---")
+                        self.get_logger().info(f"--- REPLAYING TRAJECTORY (Step {step}) ---")
                         self.get_logger().info("Initializing targets from live state for replay...")
                         
                         # Arm initialization (waits for first joint_state_callback outside the loop)
@@ -563,16 +763,30 @@ class PolicyRolloutNode(Node):
                 else:
 
                     # --- 1. SENSE ---
-                    obs = self.get_live_observations()
-                    if obs is None: 
+                    # Note: self.current_arm_states is already set by its own async callback
+                    while self.current_arm_states is None:
+                        self.get_logger().info("No arm states yet, waiting.", throttle_duration_sec=2)
                         time.sleep(self.sample_period)
-                        continue
-                    
-                    leap_positions = self.get_current_leap_position()
-                    if leap_positions is None: 
-                        time.sleep(self.sample_period)
-                        continue
-                    
+
+                    with self.sensor_lock:
+                        # Check if the parallel threads have populated the data
+                        while self.latest_leap_pos is None:
+                            self.get_logger().info("No LEAP Hand states yet, waiting.", throttle_duration_sec=2)
+                            time.sleep(self.sample_period)
+
+                        while 'color1' not in self.latest_obs:
+                            self.get_logger().info("Sensor data not ready yet, waiting.", throttle_duration_sec=2)
+                            time.sleep(self.sample_period)
+                        
+                        # Make a local, thread-safe copy of the data for this loop cycle
+                        obs = self.latest_obs.copy()
+                        leap_positions = self.latest_leap_pos.copy()     
+
+                    if self.solver is None:
+                        self.get_logger().fatal("Kinematics solver not initialized. Cannot proceed with control loop.")
+                        break
+
+
                     self.current_joint_states = np.concatenate([self.current_arm_states, leap_positions])
 
                     time_sense = time.perf_counter()
@@ -593,8 +807,10 @@ class PolicyRolloutNode(Node):
                     state_vector_list.append(tactile_feats)
 
                     # 2.2 Proprioceptive Features
+                    _, kinematic_poses = self.solver.get_all_poses(self.current_arm_states, leap_positions)
+                    self.get_logger().info(f"Kinematic Poses: {kinematic_poses}")
+                    
                     if self.control_mode == 'task_space':
-                        kinematic_poses = self.solver.get_all_poses(self.current_arm_states, leap_positions)
                         arm_proprio = kinematic_poses['ee'] # 7D EE Pose
                         state_vector_list.append(arm_proprio)
                     else: # joint_space
@@ -605,72 +821,25 @@ class PolicyRolloutNode(Node):
                     state_vector_list.append(hand_proprio)
                     current_proprio = np.concatenate([arm_proprio, hand_proprio])
 
+                    self.get_logger().info(f"use 3d tactile: {self.config['state']['use_3d_tactile']}")
                     # 2.3 3D Tactile Poses
-                    if self.config.get('state', {}).get('use_3d_tactile'):
-                        for frame_name in self.config['kinematics']['tactile_frames']:
-                            state_vector_list.append(kinematic_poses[frame_name])
+                    if self.config['state']['use_3d_tactile']:
+                        for frame_name, pose in kinematic_poses.items():
+                            self.get_logger().info(f"Pose: {pose}")
+
+                            if frame_name != 'ee' and frame_name in self.config['kinematics']['tactile_frames']:
+                                self.get_logger().info(f"Adding 3D tactile pose for frame: {frame_name}")
+                                state_vector_list.append(pose)
 
                     # 2.4 Visual Features (with Carry-Forward Logic)
-                    features_per_cam = self.vision_processor.process_cameras(obs['color1'], obs['depth1'], obs['color2'], obs['depth2'])
+                    with self.vision_lock:
+                        while self.latest_vision_features is None:
+                            self.get_logger().info("Vision features not ready. Waiting.")
+                            time.sleep(self.sample_period)
+                        visual_features = self.latest_vision_features.copy()
                     
-                    # --- "Carry Forward" Logic with Staleness Flag ---
-                    def update_features(raw_feats, cam_id):
-                        """
-                        Parses a 'kitchen sink' vector, applies staleness logic to the
-                        keypoint part, and preserves the embedding part.
-                        """
-                        if raw_feats is None: # Handle case where a camera failed
-                            return np.zeros(self.single_cam_dim, dtype=np.float32)
-
-                        # --- 1. Split the "kitchen sink" vector ---
-                        kps_vec = raw_feats[:self.kp_total_dim]
-                        embs_vec = raw_feats[self.kp_total_dim:]
-                        
-                        # Deconstruct the keypoint vector
-                        # [tube(5), peg(5), rel(3)]
-                        tube_feats = kps_vec[0:self.coord_dim+2]
-                        peg_feats = kps_vec[self.coord_dim+2:2*self.coord_dim+4]
-                        
-                        tube_key, peg_key = f"{cam_id}_tube", f"{cam_id}_peg"
-
-                        # --- 2. Apply Staleness Logic ---
-                        # Check TUBE detection (flag is at index 4)
-                        if tube_feats[self.coord_dim+1] > 0: # if flag is 1
-                            self.last_known_coords[tube_key] = tube_feats[0:self.coord_dim] # Store new 3D pos
-                        else:
-                            tube_feats[0:self.coord_dim] = self.last_known_coords[tube_key] # Use stale position
-                            tube_feats[self.coord_dim:self.coord_dim+2] = 0.0 # Set conf and flag to 0
-
-                        # Check PEG detection (flag is at index 4 of its vector)
-                        if peg_feats[self.coord_dim+1] > 0: # if flag is 1
-                            self.last_known_coords[peg_key] = peg_feats[0:self.coord_dim]
-                        else:
-                            peg_feats[0:self.coord_dim] = self.last_known_coords[peg_key]
-                            peg_feats[self.coord_dim:self.coord_dim+2] = 0.0
-                        
-                        # --- 3. Re-engineer the relative vector ---
-                        # This is crucial: we recalculate the relative vector based on the
-                        # (potentially stale) coordinates we are passing to the policy.
-                        rel_vec = tube_feats[0:self.coord_dim] - peg_feats[0:self.coord_dim]
-                        
-                        # Reconstruct the final keypoint vector
-                        final_kps_vec = np.concatenate([tube_feats, peg_feats, rel_vec])
-                        
-                        # --- 4. Recombine with embeddings ---
-                        # Return the full, corrected "kitchen sink" vector
-                        return np.concatenate([final_kps_vec, embs_vec])
-
-                    # Get the raw "kitchen sink" vectors
-                    f1_raw = features_per_cam.get('cam1', np.zeros(self.single_cam_dim, dtype=np.float32))
-                    f2_raw = features_per_cam.get('cam2', np.zeros(self.single_cam_dim, dtype=np.float32))
-
-                    # Apply the staleness logic
-                    f1_final = update_features(f1_raw, 'cam1')
-                    f2_final = update_features(f2_raw, 'cam2')
-                    
-                    visual_features = np.concatenate([f1_final, f2_final])
                     state_vector_list.append(visual_features)
-
+                    
                     # --- Final State Assembly ---
                     current_state_np = np.concatenate(state_vector_list)
                     if self.use_goal:
@@ -690,7 +859,7 @@ class PolicyRolloutNode(Node):
                     # self.get_logger().info(f"Visual Features Shape:  {visual_features.shape}")
                     visual_log_msg = "Visual Detections: "
                     # 'raw_features_per_cam' now contains the engineered 10-element vectors
-                    for cam_id, feats in features_per_cam.items():
+                    for cam_id, feats in self.features_per_cam.items():
                         if feats is None: continue
                         tube_flag = feats[3]
                         peg_flag = feats[7]
@@ -733,6 +902,7 @@ class PolicyRolloutNode(Node):
 
                     if current_proprio is not None:
                         self.timestamp_history.append(time_start)
+                        self.input_history.append(full_state_np) 
                         self.proprio_history.append(current_proprio)
                         self.prediction_history.append(action_pred.cpu().numpy())
 
@@ -872,7 +1042,7 @@ class PolicyRolloutNode(Node):
                                 self.target_q_hand = leap_positions.copy()
                             else:
                                 # This should have been caught in SENSE phase, but as fallback:
-                                self.get_logger().warn("Could not initialize hand target (policy mode). Skipping command.")
+                                self.get_logger().info("Could not initialize hand target (policy mode). Skipping command.")
                                 time.sleep(self.sample_period)
                                 continue
                     
@@ -905,6 +1075,18 @@ class PolicyRolloutNode(Node):
                             f"Inference: {(time_inference - time_history)*1000:.1f}ms | "
                             f"Publish: {(time_publish - time_inference)*1000:.1f}ms"
                         )
+                else:
+                    self.get_logger().info(f"Loop time: {total_time*1000:.1f}ms")
+                    if not self.is_replay_mode:
+                        self.get_logger().info(
+                            f"  Sense: {(time_sense - time_start)*1000:.1f}ms | "
+                            f"Features: {(time_state - time_sense)*1000:.1f}ms | "
+                            f"History: {(time_history - time_state)*1000:.1f}ms | "
+                            f"Inference: {(time_inference - time_history)*1000:.1f}ms | "
+                            f"Publish: {(time_publish - time_inference)*1000:.1f}ms"
+                        )
+
+
 
                 time_sleep = max(0, self.sample_period - (time_publish - time_start))
                 time.sleep(time_sleep)
@@ -923,12 +1105,13 @@ class PolicyRolloutNode(Node):
             self.get_logger().info("No trajectory data to save.")
             return
 
-        self.get_logger().info(f"💾 Saving trajectory data to rollout_data.npz...")
+        self.get_logger().info(f"💾 Saving trajectory data to rollout_data.npz with inputs...")
         
         # Use np.stack to convert list of arrays into a single large array
         np.savez_compressed(
             str(paths.MODELS_DIR/f"rollout/rollout_{self.model_type}_{self.control_mode}.npz"),
             timestamps=np.array(self.timestamp_history),
+            inputs=np.stack(self.input_history), 
             proprioception=np.stack(self.proprio_history),
             predictions=np.stack(self.prediction_history)
         )
@@ -941,7 +1124,7 @@ class PolicyRolloutNode(Node):
         This should be called on node shutdown or loop exit.
         """
         if self.target_q_arm is None:
-            self.get_logger().warn("Cannot send smooth stop; target_q_arm was never initialized.")
+            self.get_logger().info("Cannot send smooth stop; target_q_arm was never initialized.")
             return
 
         self.get_logger().info("Sending final smooth stop command...")
