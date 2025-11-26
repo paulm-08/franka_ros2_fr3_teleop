@@ -1004,6 +1004,11 @@ class PolicyRolloutNode(Node):
                     # Command the robot to go to this new, accumulated target position.
                     point.positions = self.target_q_arm.tolist()
 
+                    # *** REFINEMENT: Add implied velocity for Cubic Spline interpolation ***
+                    # The velocity is the displacement (smoothed_delta_arm) divided by the time period.
+                    implied_velocity = self.smoothed_delta_arm / self.sample_period
+                    point.velocities = implied_velocity.tolist() # Enable Cubic Spline
+
                     duration_ns = int(self.sample_period * 1e9)
                     point.time_from_start = Duration(sec=0, nanosec=duration_ns)
 

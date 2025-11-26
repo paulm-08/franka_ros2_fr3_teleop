@@ -11,6 +11,7 @@ import pinocchio as pin
 import tempfile
 import math
 from scipy.spatial.transform import Rotation as R
+from torch.utils.data import TensorDataset, DataLoader
 
 from model_pipeline.train import build_model, MLPPolicy
 from model_pipeline import paths
@@ -486,27 +487,63 @@ def main():
                 X_val_list.append(state_sequence.flatten() if flatten_data else state_sequence)
                 y_val_list.append(y_unstacked[i])
 
-        X_val_raw = torch.tensor(np.array(X_val_list), dtype=torch.float32, device=device)
-        y_val_true = torch.tensor(np.array(y_val_list), dtype=torch.float32, device=device)
-        
+        # Convert to standard numpy arrays first
+        X_val_np = np.array(X_val_list)
+        y_val_np = np.array(y_val_list)
+
+        # Move tensors to the device *only when needed* (in the loop or DataLoader)
+        # For now, keep them on the CPU to create the DataLoader
+        X_val_cpu = torch.tensor(X_val_np, dtype=torch.float32) 
+        y_val_cpu = torch.tensor(y_val_np, dtype=torch.float32)
+
+        # Create a TensorDataset and DataLoader
+        # Batch size is the key to GPU memory efficiency. 
+        # Start with a safe number (e.g., 512, 1024, or 2048) and increase if performance allows.
+        BATCH_SIZE = 1024 # Adjust this value!
+
+        val_dataset = TensorDataset(X_val_cpu, y_val_cpu)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+        logging.info(f"Created DataLoader with {len(val_dataset)} samples and batch size {BATCH_SIZE}.")
+
+        # Initialize lists to collect results on the CPU
+        action_pred_list, y_val_true_list = [], []      
+
         X_mean, X_std, y_mean, y_std = norm_stats
 
         with torch.no_grad():
-            if flatten_data: # MLP
-                X_val_norm = (X_val_raw - X_mean.repeat(frame_stack_k)) / X_std.repeat(frame_stack_k)
-            else: # Sequence models
-                X_val_norm = (X_val_raw - X_mean) / X_std
+            for X_batch_raw, y_batch_true in val_loader:
+                # Move the batch data to the GPU (CUDA)
+                X_batch_raw = X_batch_raw.to(device)
+                y_batch_true = y_batch_true.to(device)
 
-            if final_args.dummy:
-                pred_norm = torch.zeros(X_val_norm.shape[0], joint_dim, device=device)
-            else:
-                pred_norm = model(X_val_norm)
+                # Normalization logic
+                if flatten_data: # MLP
+                    # Ensure the normalisation tensor matches the stacked dimension
+                    X_val_norm = (X_batch_raw - X_mean.repeat(frame_stack_k)) / X_std.repeat(frame_stack_k)
+                else: # Sequence models (X_mean and X_std already have the SeqLen dimension)
+                    # NOTE: Your original sequence model logic seemed to only use the unstacked mean/std
+                    # If the normalisation was *per-step*, X_mean and X_std should be unstacked.
+                    # Assuming X_mean/std are 1D vectors corresponding to a single unstacked state's features:
+                    X_val_norm = (X_batch_raw - X_mean) / X_std
 
-            action_pred = (pred_norm * y_std) + y_mean
-        
-        action_pred_np = to_np(action_pred)
-        action_true_np = to_np(y_val_true)
-        
+                # Model prediction
+                if final_args.dummy:
+                    pred_norm = torch.zeros(X_val_norm.shape[0], joint_dim, device=device)
+                else:
+                    pred_norm = model(X_val_norm)
+
+                # Denormalization
+                action_pred = (pred_norm * y_std) + y_mean
+                
+                # Collect results, moving them back to the CPU
+                action_pred_list.append(action_pred.cpu())
+                y_val_true_list.append(y_batch_true.cpu())
+
+        # Concatenate all batches into final CPU numpy arrays
+        action_pred_np = to_np(torch.cat(action_pred_list))
+        action_true_np = to_np(torch.cat(y_val_true_list))    
+            
         metrics = {'mse': mean_squared_error(action_true_np, action_pred_np), 
                     'mae': mean_absolute_error(action_true_np, action_pred_np), 
                     'r2': r2_score(action_true_np, action_pred_np)}
