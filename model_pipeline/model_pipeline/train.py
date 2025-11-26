@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 # ===================================================================
 class MLPPolicy(nn.Module):
     """A dynamically generated MLP with a configurable number of layers and width."""
-    def __init__(self, input_dim, output_dim, width=512, num_layers=2, dropout_p=0.4):
+    def __init__(self, input_dim, output_dim, width=512, num_layers=2, dropout_p=0.2):
         super().__init__()
         
         layers = []
@@ -194,24 +194,28 @@ class TransformerPolicy(nn.Module):
 class TrajectoryFrameStackDataset(Dataset):
     def __init__(self, trajectories, frame_stack_k, config, arm_only,
                  norm_stats=None, flatten=True, is_train=False,
-                 obs_noise_std=0.0, drift_noise_std=0.0, return_drift_data=False,
-                 proprio_only=False):
+                 obs_noise_std=0.0, drift_noise_std=0.0):
         
         self.trajectories = trajectories
         self.k = frame_stack_k
         self.flatten = flatten
         self.is_train = is_train
-        self.obs_noise_std = obs_noise_std
+        # obs_noise: small noise applied to ALL features (robustness)
+        # drift_noise: large noise applied to PROPRIO (recovery)
+        self.obs_noise_std = obs_noise_std 
         self.drift_noise_std = drift_noise_std
-        self.return_drift_data = return_drift_data
-        self.proprio_only = proprio_only
 
         # --- Config options ---
         self.arm_only = arm_only
         self.control_mode = config.get('control_mode', 'joint_space')
         self.use_goal = config.get('use_goal', False)
         self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
-        
+
+        # --- Constants for Unified Drift Logic ---
+        self.DRIFT_PROB = config.get('drift_prob', 0.2) # 20% of samples get large drift
+        self.DRIFT_CLIP_TAU = config.get('drift_clip_tau', 4) # Limit corrective action to 4 standard deviations
+
+        # --- Build Indices ---
         self.indices = []
         for traj_idx, traj in enumerate(self.trajectories):
             num_samples = traj['state_t'].shape[0]
@@ -219,16 +223,11 @@ class TrajectoryFrameStackDataset(Dataset):
                 for frame_idx in range(self.k - 1, num_samples - 1):
                     self.indices.append((traj_idx, frame_idx))
         
-        # Slices relative to the original, full state vector (D_state)
-        self.full_state_proprio_slice = slice(TACTILE_DIM, TACTILE_DIM + FULL_PROP_DIM) # 24:47 (23D)
-        self.arm_proprio_slice = slice(TACTILE_DIM, TACTILE_DIM + ARM_PROP_DIM) # 24:31 (7D)
-        
-        self.current_state_dim = trajectories[0]['state_t'].shape[1]
-        
-        # --- Normalization stats calculation (calculates X_mean, X_std, y_mean, y_std) ---
+        # --- Normalization Stats ---
         if norm_stats:
             self.X_mean, self.X_std, self.y_mean, self.y_std = norm_stats
         else:
+            # Calculate stats from training data
             if self.use_goal:
                 X_unstacked = np.concatenate([
                     np.concatenate([t['state_t'], t['goal_t']], axis=1)
@@ -243,55 +242,30 @@ class TrajectoryFrameStackDataset(Dataset):
 
             self.X_mean = X_unstacked.mean(axis=0)
             self.X_std  = X_unstacked.std(axis=0)
-            self.y_mean = y_unstacked.mean(axis=0) 
+            self.y_mean = y_unstacked.mean(axis=0)
             self.y_std  = y_unstacked.std(axis=0)
+            
+            # Prevent divide by zero
             self.X_std[self.X_std < 1e-9] = 1.0
             self.y_std[self.y_std < 1e-9] = 1.0
 
-        # --- Filter Stats if proprio_only=True ---
-        if self.proprio_only:
-            logging.warning("--- Proprioception-Only mode is ON ---")
-            
-            proprio_indices = np.arange(self.full_state_proprio_slice.start, self.full_state_proprio_slice.stop)
-            
-            if self.use_goal:
-                goal_indices = np.arange(self.current_state_dim, self.X_mean.shape[0])
-                final_indices = np.concatenate([proprio_indices, goal_indices])
-            else:
-                final_indices = proprio_indices
-            
-            self.X_mean = self.X_mean[final_indices]
-            self.X_std = self.X_std[final_indices]
-            
-            # Update the state_dim to reflect the new, smaller state
-            self.current_state_dim = FULL_PROP_DIM # 23
-            
-            # Update proprio indices to be relative to the *new* X_mean (Proprio is now at the start)
-            self.proprio_start_idx = 0
-            self.proprio_end_idx = FULL_PROP_DIM
-        else:
-            # Proprio indices relative to the un-filtered state (used for BC/Drift input noise removal)
-            self.proprio_start_idx = TACTILE_DIM
-            self.proprio_end_idx = self.arm_proprio_slice.stop # Default to arm+hand
-            if not self.arm_only:
-                self.proprio_end_idx = self.full_state_proprio_slice.stop
-
-
-        # These are used for normalizing the *input* to the drift head
-        if self.proprio_only:
-            # X_mean is already filtered, and proprio is at 0:23
-            self.proprio_mean = self.X_mean[self.proprio_start_idx:self.proprio_end_idx]
-            self.proprio_std = self.X_std[self.proprio_start_idx:self.proprio_end_idx]
-        else:
-            # FIX: If arm_only is TRUE, we must use the 7D arm slice for mean/std
-            if self.arm_only:
-                slice_to_use = self.arm_proprio_slice
-            else:
-                slice_to_use = self.full_state_proprio_slice
-                
-            self.proprio_mean = self.X_mean[slice_to_use]
-            self.proprio_std = self.X_std[slice_to_use]
-
+        self.current_state_dim = trajectories[0]['state_t'].shape[1]
+        
+        # --- Pre-calculate Proprioception Slices ---
+        TACTILE_DIM = 24
+        # In state_t, proprio starts after tactile
+        self.proprio_start_idx = TACTILE_DIM 
+        
+        # Determine how many proprio dimensions we are "drifting"
+        # If arm_only, we drift the 7 arm joints/poses. 
+        # If full body, we drift everything (23).
+        # NOTE: This logic assumes the proprio block is [Arm(7) | Hand(16)]
+        drift_dim = self.num_arm_actions if self.arm_only else 23 
+        self.proprio_end_idx = self.proprio_start_idx + drift_dim
+        
+        # Stats for normalizing the noisy state
+        self.proprio_mean = self.X_mean[self.proprio_start_idx : self.proprio_end_idx]
+        self.proprio_std = self.X_std[self.proprio_start_idx : self.proprio_end_idx]
 
     def __len__(self):
         return len(self.indices)
@@ -301,154 +275,92 @@ class TrajectoryFrameStackDataset(Dataset):
         traj = self.trajectories[traj_idx]
         start_idx, end_idx = frame_idx - self.k + 1, frame_idx + 1
 
-        # Q_clean_sequence (K x D_state) - UN-NORMALIZED
-        Q_clean_sequence_full = traj['state_t'][start_idx:end_idx]
-        
-        # full_state_sequence (K x D_full) - UN-NORMALIZED (including goal if present)
+        # --- 1. Get Clean Ground Truth Data ---
+        # State Sequence
         if self.use_goal:
             full_state_sequence = np.concatenate([
-                Q_clean_sequence_full,
+                traj['state_t'][start_idx:end_idx],
                 traj['goal_t'][start_idx:end_idx],
             ], axis=1)
         else:
-            full_state_sequence = Q_clean_sequence_full
+            full_state_sequence = traj['state_t'][start_idx:end_idx]
 
-        # --- 4. FILTER __getitem__ if proprio_only=True ---
-        if self.proprio_only:
-            # Extract only the proprioception features
-            proprio_features = full_state_sequence[:, self.full_state_proprio_slice]
-            
-            if self.use_goal:
-                goal_features = full_state_sequence[:, traj['state_t'].shape[1]:]
-                full_state_sequence = np.concatenate([proprio_features, goal_features], axis=1)
-            else:
-                full_state_sequence = proprio_features
-                
-        # Normalize the entire state sequence (K x D_full_filtered)
-        full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
-        
-        current_state_norm = full_state_norm[:, :self.current_state_dim]
-        goal_state_norm = full_state_norm[:, self.current_state_dim:] if self.use_goal else None
-
-        # --- 1. Create the state for IMITATION loss (state_output_bc) ---
-        current_state_bc = current_state_norm.copy() 
-        if self.is_train and self.obs_noise_std > 0:
-            current_state_bc += np.random.normal(0, self.obs_noise_std, current_state_norm.shape)
-            if self.return_drift_data:
-                current_state_bc[:, self.proprio_start_idx:self.proprio_end_idx] = \
-                    current_state_norm[:, self.proprio_start_idx:self.proprio_end_idx]
-
-        if self.use_goal:
-            final_state_bc = np.concatenate([current_state_bc, goal_state_norm], axis=1)
-        else:
-            final_state_bc = current_state_bc
-            
-        state_output_bc = final_state_bc.flatten() if self.flatten else final_state_bc
-
-        # --- 2. Get the standard action (for IMITATION loss) ---
-        action = traj['action_t'][frame_idx]
+        # Ground Truth Action (Demonstrator's intent)
+        action_gt = traj['action_t'][frame_idx]
         if self.arm_only:
-            action = action[:self.num_arm_actions] # 7D action
-        action_norm = (action - self.y_mean) / self.y_std # action_bc_norm (7D mean/std)
+            action_gt = action_gt[:self.num_arm_actions]
 
-        if not self.return_drift_data:
-            return torch.as_tensor(state_output_bc).float(), torch.as_tensor(action_norm).float()
-
-        # --- 3. Prepare data for DRIFT loss ---
+        # --- 2. Generate Unified Noise ---
+        # We apply noise to the proprioception of the *current* (last) frame
+        q_t_clean = traj['state_t'][frame_idx, self.proprio_start_idx : self.proprio_end_idx]
         
-        # --- Slice for Targets (must match action dim) ---
-        proprio_slice_for_targets = self.arm_proprio_slice if self.arm_only else self.full_state_proprio_slice
-        
-        # Get ground truth clean state and next state proprioception at time t
-        q_t_clean = Q_clean_sequence_full[-1, proprio_slice_for_targets].astype(np.float32)
-        q_next_gt = traj['state_t'][frame_idx + 1, proprio_slice_for_targets].astype(np.float32)
+        # Calculate Correction Target (default is 0 if no noise)
+        action_corr_raw = np.zeros_like(action_gt)
+        q_t_noisy = q_t_clean.copy()
 
-        # --- 3a. Generate the single drift noise vector (N_drift) ---
-        drift_noise = np.zeros_like(q_t_clean) # Shape is 7D if arm_only
-        if self.is_train and self.drift_noise_std > 0:
-            if self.control_mode == 'joint_space':
-                drift_noise = np.random.normal(0, self.drift_noise_std, q_t_clean.shape).astype(np.float32)
-            elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
-                twist_noise = np.random.normal(0, self.drift_noise_std, 6).astype(np.float32)
-
-        # --- 3b. Apply noise to q_t_clean to get q_t_noisy (for delta_action target) ---
-        if self.control_mode == 'joint_space':
-            q_t_noisy = q_t_clean + drift_noise
-        elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
-            T_clean = pin.XYZQUATToSE3(q_t_clean)
-            T_noise = pin.exp(twist_noise)
-            T_noisy = T_clean * T_noise
-            q_t_noisy = pin.SE3ToXYZQUAT(T_noisy)
-        else:
-            q_t_noisy = q_t_clean
-
-        # --- 3c. Calculate the GROUND TRUTH corrective action required (Delta_A target) ---
-        if self.control_mode == 'joint_space':
-            delta_action_gt_drift = q_next_gt - q_t_noisy
-        elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
-            T_noisy = pin.XYZQUATToSE3(q_t_noisy)
-            T_next_gt = pin.XYZQUATToSE3(q_next_gt)
-            T_corrective = T_noisy.inverse() * T_next_gt
-            delta_action_gt_drift = pin.log(T_corrective).vector
-        else:
-            delta_action_gt_drift = q_next_gt - q_t_noisy
-
-        # Normalize the corrective action (against 7D y_mean/y_std)
-        delta_action_gt_drift_norm = (delta_action_gt_drift - self.y_mean) / self.y_std
-
-        # --- 3d. Create the drifted state vector for the model input (state_output_drift) ---
-        
-        # Get the K-frame clean proprioception sequence (un-normalized)
-        if self.proprio_only:
-            # full_state_sequence is already filtered to 23D proprio (+ goal)
-            Q_proprio_clean_sequence = full_state_sequence[:, self.proprio_start_idx:self.proprio_end_idx]
-        else:
-            # FIX: If proprio_only is OFF, match the slice size to what is being replaced (7D or 23D)
-            proprio_slice_for_input = self.arm_proprio_slice if self.arm_only else self.full_state_proprio_slice
-            Q_proprio_clean_sequence = Q_clean_sequence_full[:, proprio_slice_for_input] # (3, 7) if arm_only=True
-
-        # Apply the SAME drift noise to the entire K-frame history.
-        if self.control_mode == 'joint_space':
-            Q_proprio_drifted_sequence = Q_proprio_clean_sequence.copy()
+        if self.is_train:
+            # A. General Observation Noise (applied to everything)
+            # This helps robustness but doesn't change the target action
+            full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
+            if self.obs_noise_std > 0:
+                full_state_norm += np.random.normal(0, self.obs_noise_std, full_state_norm.shape)
             
-            if self.arm_only:
-                # If arm_only is true, drift_noise is 7D. Apply it only to the ARM features (indices 0:7 in the proprio vector).
-                # Since Q_proprio_clean_sequence is now only 7D, we can add directly.
-                Q_proprio_drifted_sequence += drift_noise
+            # B. Targeted Drift Noise (applied to proprioception)
+            # This DOES change the target action
+            if np.random.rand() < self.DRIFT_PROB:
+                sigma = self.drift_noise_std
             else:
-                # If arm_only is false, drift_noise is 23D and can be added directly.
-                Q_proprio_drifted_sequence += drift_noise
-                
-        elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
-            Q_proprio_drifted_sequence = Q_proprio_clean_sequence.copy()
-            for i in range(self.k):
-                T_clean_i = pin.XYZQUATToSE3(Q_proprio_clean_sequence[i])
-                T_noise = pin.exp(twist_noise)
-                T_noisy_i = T_clean_i * T_noise
-                Q_proprio_drifted_sequence[i] = pin.SE3ToXYZQUAT(T_noisy_i)
+                sigma = 0.0001 # Tiny jitter for continuity
+            
+            if sigma > 0:
+                if self.control_mode == 'joint_space':
+                    drift_noise = np.random.normal(0, sigma, q_t_clean.shape).astype(np.float32)
+                    q_t_noisy = q_t_clean + drift_noise
+                    # Correction: Action needed to go from noisy -> clean
+                    action_corr_raw = q_t_clean - q_t_noisy # = -drift_noise
+                    
+                elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
+                    # Task space noise logic (Twist)
+                    twist_noise = np.random.normal(0, sigma, 6).astype(np.float32)
+                    T_clean = pin.XYZQUATToSE3(q_t_clean)
+                    T_noise = pin.exp(twist_noise)
+                    T_noisy = T_clean * T_noise
+                    q_t_noisy = pin.SE3ToXYZQUAT(T_noisy)
+                    
+                    # Correction: Twist needed to go from noisy -> clean
+                    T_correction = T_noisy.inverse() * T_clean
+                    action_corr_raw = pin.log(T_correction).vector
+            
+            # C. Inject the specific drift into the normalized state vector
+            # We overwrite the generic noise with this specific drift for the proprio channels
+            q_t_noisy_norm = (q_t_noisy - self.proprio_mean) / self.proprio_std
+            
+            # Replace proprio features in the LAST frame of the stack
+            full_state_norm[-1, self.proprio_start_idx : self.proprio_end_idx] = q_t_noisy_norm
+
         else:
-            Q_proprio_drifted_sequence = Q_proprio_clean_sequence
-        
-        # Normalize the drifted sequence (against the 7D/23D proprio mean/std, depending on arm_only)
-        Q_proprio_drifted_norm = (Q_proprio_drifted_sequence - self.proprio_mean) / self.proprio_std
+            # Validation/Test: Just normalize clean data
+            full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
 
-        # Create the final drifted state vector (using final_state_bc as the base for non-proprio features)
-        final_state_drift = final_state_bc.copy() 
+        # --- 3. Calculate Unified Target Action ---
+        # Target = Normalized_Demonstrator_Action + Clipped_Normalized_Correction
         
-        # Replace the proprioception in ALL K frames with the realistic, drifted history
-        # Now, Q_proprio_drifted_norm (3, 7) matches the slice size (3, 7)
-        final_state_drift[:, self.proprio_start_idx:self.proprio_end_idx] = Q_proprio_drifted_norm
+        # Normalize Demonstrator Action
+        action_gt_norm = (action_gt - self.y_mean) / self.y_std
         
-        state_output_drift = final_state_drift.flatten() if self.flatten else final_state_drift
+        # Normalize Correction Action (using the same stats!)
+        action_corr_norm = action_corr_raw / self.y_std
+        
+        # Apply Clipping to the Correction ONLY
+        action_corr_clamped = np.clip(action_corr_norm, -self.DRIFT_CLIP_TAU, self.DRIFT_CLIP_TAU)
+        
+        # Sum them up
+        final_action_target = action_gt_norm + action_corr_clamped
+        
+        # --- 4. Flatten and Return ---
+        state_output = full_state_norm.flatten() if self.flatten else full_state_norm
 
-        return (
-            torch.as_tensor(state_output_bc).float(),
-            torch.as_tensor(state_output_drift).float(),
-            torch.as_tensor(action_norm).float(),
-            torch.as_tensor(delta_action_gt_drift_norm).float(),
-            torch.as_tensor(q_t_noisy).float(),
-            torch.as_tensor(q_next_gt).float()
-        )
+        return torch.from_numpy(state_output).float(), torch.from_numpy(final_action_target).float()
             
 # ===================================================================
 # === UTILITY FUNCTIONS ===
@@ -666,8 +578,8 @@ def main():
                 is_train=True,
                 obs_noise_std=obs_noise_std_train,
                 drift_noise_std=drift_noise_std,
-                return_drift_data=use_drift_regularizer,
-                proprio_only=final_args.proprio_only
+                # return_drift_data=use_drift_regularizer,
+                # proprio_only=final_args.proprio_only
             )
 
             val_dataset = TrajectoryFrameStackDataset(
@@ -679,8 +591,8 @@ def main():
                 flatten=(not is_sequence_model),
                 is_train=False,
                 obs_noise_std=obs_noise_std_val,
-                return_drift_data=use_drift_regularizer,
-                proprio_only=final_args.proprio_only
+                # return_drift_data=use_drift_regularizer,
+                # proprio_only=final_args.proprio_only
             )
 
             if len(train_dataset) == 0:
@@ -702,8 +614,8 @@ def main():
                 is_train=True,
                 obs_noise_std=obs_noise_std_train,
                 drift_noise_std=drift_noise_std,
-                return_drift_data=use_drift_regularizer,
-                proprio_only=final_args.proprio_only
+                # return_drift_data=use_drift_regularizer,
+                # proprio_only=final_args.proprio_only
             )
 
             if len(train_dataset) == 0:
@@ -747,6 +659,7 @@ def main():
         drift_weight_adaptive = drift_loss_weight # Initialize with config value
         EMA_ALPHA = 0.99 
         EMA_EPSILON = 1e-6 # For stable division
+        DRIFT_CLIP_TAU = 10.0
 
         if final_args.adaptive_drift_weight and use_drift_regularizer:
             logging.info(f"--- Using Adaptive Loss Weighting (EMA Alpha: {EMA_ALPHA}) ---")
@@ -758,140 +671,47 @@ def main():
         try:
             for epoch in range(final_args.epochs):
                 model.train()
-                total_train_loss, total_imitation_loss, total_drift_loss = 0.0, 0.0, 0.0
+                total_train_loss = 0.0
 
-                for batch_idx, batch in enumerate(train_loader):
-                    global_step += 1
+                for batch in train_loader:
+                    state_norm, action_target_norm = batch
+                    state_norm, action_target_norm = state_norm.to(device), action_target_norm.to(device)
                     
-                    # NOTE: Dataset now returns 6 items when using drift regularizer
-                    if use_drift_regularizer:
-                        # action_drift_norm is the normalized corrective action target
-                        state_bc_norm, state_drift_norm, action_bc_norm, action_drift_norm, _, _ = batch 
-                        state_drift_norm = state_drift_norm.to(device)
-                        action_drift_norm = action_drift_norm.to(device)
-                    else:
-                        state_bc_norm, action_bc_norm = batch
-
-                    state_bc_norm, action_bc_norm = state_bc_norm.to(device), action_bc_norm.to(device)
                     optimizer.zero_grad()
 
-                    # --- 1. Imitation Loss (BC Loss) ---
-                    pred_norm_bc = model(state_bc_norm)
-                    imitation_loss = loss_fn(pred_norm_bc, action_bc_norm)
+                    # 1. Forward Pass
+                    pred_norm = model(state_norm)
 
-                    if use_drift_regularizer:
-                        # --- 2. Drift Loss (Normalized Action-Space Loss) ---
-                        pred_norm_drift = model(state_drift_norm)
-                        drift_loss = loss_fn(pred_norm_drift, action_drift_norm)
-                        
-                        # --- ADAPTIVE WEIGHTING LOGIC ---
-                        if final_args.adaptive_drift_weight:
-                            imitation_loss_val = imitation_loss.item()
-                            drift_loss_val = drift_loss.item()
-                            
-                            # Initialize EMAs with the first batch losses
-                            if ema_bc_loss is None:
-                                ema_bc_loss = imitation_loss_val
-                                ema_drift_loss = drift_loss_val
-                            else:
-                                # Update EMAs
-                                ema_bc_loss = EMA_ALPHA * ema_bc_loss + (1 - EMA_ALPHA) * imitation_loss_val
-                                ema_drift_loss = EMA_ALPHA * ema_drift_loss + (1 - EMA_ALPHA) * drift_loss_val
-                            
-                            # Calculate adaptive drift weight (lambda)
-                            # We want the contribution of drift loss to match that of BC loss.
-                            # The total loss is L_BC + lambda * L_drift
-                            drift_weight_adaptive = ema_bc_loss / (ema_drift_loss + EMA_EPSILON)
-                            
-                            loss = imitation_loss + (drift_weight_adaptive * drift_loss)
-                            
-                            # Optional: Clamp the adaptive weight to prevent extreme values
-                            # drift_weight_adaptive = max(min(drift_weight_adaptive, 1.0), 1e-4)
-
-                        else:
-                            # Original Fixed Weighting Logic
-                            loss = (1 - drift_loss_weight) * imitation_loss + (drift_loss_weight * drift_loss)
-
-                        total_imitation_loss += imitation_loss.item()
-                        total_drift_loss += drift_loss.item()
-                    else:
-                        loss = imitation_loss # No drift loss
+                    # 2. Loss Calculation
+                    # The target already contains (BC + Clipped_Correction)
+                    loss = loss_fn(pred_norm, action_target_norm)
 
                     loss.backward()
                     optimizer.step()
-                    # CRITICAL FIX: Accumulate loss for all batches
-                    total_train_loss += loss.item() 
+                    total_train_loss += loss.item()
 
-                # Averaging must happen AFTER the loop is complete
                 avg_train_loss = total_train_loss / len(train_loader)
-                avg_imitation_loss = total_imitation_loss / len(train_loader) if use_drift_regularizer else avg_train_loss
-                avg_drift_loss = total_drift_loss / len(train_loader)
                 history["train_loss"].append(avg_train_loss)
 
-                # --- Validation phase (validation loss calculation should use the *current* training weight) ---
+                # --- Validation phase ---
                 if final_args.validation:
                     model.eval()
                     total_val_loss = 0.0
-                    total_val_imitation_loss = 0.0
-                    total_val_drift_loss = 0.0
-                    
-                    # The validation weight (drift_val_weight) should be the last calculated adaptive weight 
-                    # if adaptive weighting is on, or the fixed weight otherwise.
-                    drift_val_weight = drift_weight_adaptive if final_args.adaptive_drift_weight and use_drift_regularizer else drift_loss_weight
-
                     with torch.no_grad():
                         for batch in val_loader:
-                            if use_drift_regularizer:
-                                # Get 5 items from the validation loader
-                                state_bc_norm, state_drift_norm, action_bc_norm, action_drift_norm, _, _ = batch
-                                state_drift_norm = state_drift_norm.to(device)
-                                action_drift_norm = action_drift_norm.to(device) # Target for consistent drift loss
-                            else:
-                                state_bc_norm, action_bc_norm = batch
-
-                            state_bc_norm, action_bc_norm = state_bc_norm.to(device), action_bc_norm.to(device)
-
-                            # --- 1. Imitation Loss ---
-                            pred_norm_bc = model(state_bc_norm)
-                            imitation_loss = loss_fn(pred_norm_bc, action_bc_norm)
-
-                            if use_drift_regularizer:
-                                # --- 2. Drift Loss ---
-                                pred_norm_drift = model(state_drift_norm)
-                                drift_loss = loss_fn(pred_norm_drift, action_drift_norm)
-                                
-                                # Use the appropriate weight (fixed or last adaptive value) for validation loss calculation
-                                if final_args.adaptive_drift_weight:
-                                    loss = imitation_loss + (drift_val_weight * drift_loss)
-                                else:
-                                    loss = (1 - drift_val_weight) * imitation_loss + (drift_val_weight * drift_loss)
-                                
-                                total_val_imitation_loss += imitation_loss.item()
-                                total_val_drift_loss += drift_loss.item()
-                            else:
-                                loss = imitation_loss
-                                
+                            state_norm, action_target_norm = batch
+                            state_norm, action_target_norm = state_norm.to(device), action_target_norm.to(device)
+                            
+                            pred_norm = model(state_norm)
+                            loss = loss_fn(pred_norm, action_target_norm)
                             total_val_loss += loss.item()
 
                     avg_val_loss = total_val_loss / len(val_loader)
-                    avg_val_imitation = total_val_imitation_loss / len(val_loader) if use_drift_regularizer else avg_val_loss
-                    avg_val_drift = total_val_drift_loss / len(val_loader)
                     history["val_loss"].append(avg_val_loss)
-                    
-                    # --- Logging ---
-                    log_msg = f"Epoch {epoch+1:03d}/{final_args.epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}"
-                    if use_drift_regularizer:
-                        log_msg += f" (Weight: {drift_weight_adaptive:.4e})" if final_args.adaptive_drift_weight else ""
-                        log_msg += f" | (Train BC: {avg_imitation_loss:.6f}, Drift: {avg_drift_loss:.6f})"
-                        log_msg += f" | (Val BC: {avg_val_imitation:.6f}, Drift: {avg_val_drift:.6f})"
-                    logging.info(log_msg)
-                    
+                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f}")
                 else:
-                    log_msg = f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}"
-                    if use_drift_regularizer:
-                        log_msg += f" (Weight: {drift_weight_adaptive:.4e})" if final_args.adaptive_drift_weight else ""
-                        log_msg += f" | (Train BC: {avg_imitation_loss:.6f}, Drift: {avg_drift_loss:.6f})"
-                    logging.info(log_msg)
+                    logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}")
+
 
                 # --- Model saving logic (unchanged) ---
                 if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss < best_train_loss):

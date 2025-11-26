@@ -640,7 +640,7 @@ def main():
                 all_metrics.append(metrics)
                 all_preds.append(pred_np)
                 all_gts.append(gt_np)
-                logging.info(f"  Trajectory {i+1}/{len(val_trajectories)} | MSE = {metrics['mse']} | R²={metrics['r2']:.4f}")
+                logging.info(f"  Trajectory {i+1}/{len(val_trajectories)} | MAE = {metrics['mae']} | R² = {metrics['r2']:.4f}")
 
                 if i >= 10:       # only plot first 10
                     continue
