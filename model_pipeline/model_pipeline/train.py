@@ -361,7 +361,39 @@ class TrajectoryFrameStackDataset(Dataset):
         state_output = full_state_norm.flatten() if self.flatten else full_state_norm
 
         return torch.from_numpy(state_output).float(), torch.from_numpy(final_action_target).float()
-            
+
+class JointWeightedMSELoss(nn.Module):
+    def __init__(self, action_weights):
+        """
+        Calculates Mean Squared Error on NORMALIZED actions, weighted by joint importance.
+        
+        Args:
+            action_weights (torch.Tensor): Vector of weights, one per joint (e.g., 10x for arm).
+        """
+        super().__init__()
+        # Ensure weights are float tensors and on the correct device
+        self.action_weights = action_weights.float().to(action_weights.device)
+        
+        # Use reduction='none' to get the loss per element (batch x joints)
+        self.mse_loss = nn.MSELoss(reduction='none') 
+
+    def forward(self, pred_norm, target_norm):
+        """
+        Args:
+            pred_norm (torch.Tensor): Model output (normalized action).
+            target_norm (torch.Tensor): Ground-truth target action (normalized).
+        """
+        
+        # 1. Calculate Squared Error per joint (still normalized space)
+        squared_error = self.mse_loss(pred_norm, target_norm) # Shape: (Batch, OutputDim)
+
+        # 2. Apply Joint Weights
+        # The weight vector (W_i) is broadcast across the batch dimension
+        weighted_squared_error = squared_error * self.action_weights.view(1, -1)
+
+        # 3. Compute Mean Loss across all dimensions (batch and joints)
+        return torch.mean(weighted_squared_error)
+
 # ===================================================================
 # === UTILITY FUNCTIONS ===
 # ===================================================================
@@ -636,7 +668,35 @@ def main():
             num_layers=final_args.num_layers
         ).to(device)
         optimizer = optim.Adam(model.parameters(), lr=final_args.lr, weight_decay=1e-3)
-        loss_fn = nn.MSELoss()
+
+        W_HIGH = 10.0 
+        W_LOW = 1.0 
+        action_weights_np = action_weights_np = np.full((output_dim,), W_LOW, dtype=np.float32)
+        # Set high priority for ARM joints (Indices 0 to 6)
+        action_weights_np[:final_args.num_arm_joints] = W_HIGH
+
+        # INDEX_START, INDEX_END = 7, 11  # Joints 7, 8, 9, 10
+        # THUMB_START, THUMB_END = 19, 23 # Joints 19, 20, 21, 22
+
+        # if not final_args.arm_only:
+        #     # Index
+        #     action_weights_np[INDEX_START:INDEX_END] = W_HIGH
+        #     # Thumb
+        #     action_weights_np[THUMB_START:THUMB_END] = W_HIGH
+
+        action_weights_t = torch.from_numpy(action_weights_np).float().to(device)
+
+        logging.info(f"Action Loss Weights Status (Total {output_dim} joints):")
+        logging.info(f"  Arm (0-{final_args.num_arm_joints-1}): W={W_HIGH}x")
+        # if not final_args.arm_only:
+        #     logging.info(f"  Hand Index ({INDEX_START}-{INDEX_END-1}): W={W_HIGH}x")
+        #     logging.info(f"  Hand Thumb ({THUMB_START}-{THUMB_END-1}): W={W_HIGH}x")
+        #     logging.info(f"  Other Hand Joints: W={W_LOW}x")
+
+        # --- 2. Instantiate the Custom Loss Function ---
+        loss_fn = JointWeightedMSELoss(
+            action_weights=action_weights_t
+        )
 
         y_mean_t = torch.from_numpy(train_dataset.y_mean).float().to(device)
         y_std_t  = torch.from_numpy(train_dataset.y_std).float().to(device)
