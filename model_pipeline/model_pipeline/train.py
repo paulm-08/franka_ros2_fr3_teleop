@@ -74,13 +74,13 @@ class MLPPolicy(nn.Module):
 
 class LSTMPolicy(nn.Module):
     """A more robust LSTM Policy for sequence data."""
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_layers=2):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_layers=2, dropout_p=0.2):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2 if num_layers > 1 else 0)
-        self.dropout1 = nn.Dropout(p=0.5)
+        self.dropout1 = nn.Dropout(p=dropout_p)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.relu = nn.ReLU()
-        self.dropout2 = nn.Dropout(p=0.5)
+        self.dropout2 = nn.Dropout(p=dropout_p)
         self.fc2 = nn.Linear(hidden_dim // 2, output_dim)
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
@@ -91,16 +91,19 @@ class LSTMPolicy(nn.Module):
         return self.fc2(x)
     
 class GRUPolicy(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_layers=2):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_layers=2, dropout_p=0.2):
         super().__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2 if num_layers > 1 else 0)
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout_p if num_layers > 1 else 0)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(hidden_dim // 2, output_dim)
+        self.dropout_out = nn.Dropout(p=dropout_p) 
+
     def forward(self, x):
         gru_out, _ = self.gru(x)
         last_timestep_out = gru_out[:, -1, :]
         x = self.relu(self.fc1(last_timestep_out))
+        x = self.dropout_out(x)
         return self.fc2(x)
     
 class PositionalEncoding(nn.Module):
@@ -123,7 +126,6 @@ class PositionalEncoding(nn.Module):
         """
         # x.size(1) is the sequence length
         return x + self.pe[:, :x.size(1), :]
-
 
 class TransformerPolicy(nn.Module):
     """
@@ -322,14 +324,21 @@ class TrajectoryFrameStackDataset(Dataset):
                 elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
                     # Task space noise logic (Twist)
                     twist_noise = np.random.normal(0, sigma, 6).astype(np.float32)
-                    T_clean = pin.XYZQUATToSE3(q_t_clean)
+                    drift_noise = np.random.normal(0, sigma, 16).astype(np.float32)
+
+                    T_clean = pin.XYZQUATToSE3(q_t_clean[0:7]) # Arm part only
                     T_noise = pin.exp(twist_noise)
                     T_noisy = T_clean * T_noise
-                    q_t_noisy = pin.SE3ToXYZQUAT(T_noisy)
+                    q_t_noisy_arm = pin.SE3ToXYZQUAT(T_noisy)
+
+                    q_t_noisy_hand = q_t_clean[7:] + drift_noise
+                    q_t_noisy = np.concatenate([q_t_noisy_arm, q_t_noisy_hand], axis=0)
                     
                     # Correction: Twist needed to go from noisy -> clean
                     T_correction = T_noisy.inverse() * T_clean
-                    action_corr_raw = pin.log(T_correction).vector
+                    action_corr_raw_arm = pin.log(T_correction).vector
+                    action_corr_raw_hand = q_t_clean[7:] - q_t_noisy[7:]
+                    action_corr_raw = np.concatenate([action_corr_raw_arm, action_corr_raw_hand], axis=0)
             
             # C. Inject the specific drift into the normalized state vector
             # We overwrite the generic noise with this specific drift for the proprio channels
@@ -361,7 +370,53 @@ class TrajectoryFrameStackDataset(Dataset):
         state_output = full_state_norm.flatten() if self.flatten else full_state_norm
 
         return torch.from_numpy(state_output).float(), torch.from_numpy(final_action_target).float()
-            
+
+# --- CUSTOM LOSS FUNCTION (Implements NIDL and Static Joint Weighting) ---
+class JointWeightedDenormalizedMSELoss(nn.Module):
+    def __init__(self, y_mean, y_std, action_weights):
+        """
+        Calculates MSE on REAL (unnormalized) action space, weighted by joint importance.
+        
+        Args:
+            y_mean (torch.Tensor): Mean vector used for action normalization.
+            y_std (torch.Tensor): Standard deviation vector used for action normalization.
+            action_weights (torch.Tensor): Vector of weights, one per joint.
+        """
+        super().__init__()
+        # Ensure constants and weights are float tensors and on the correct device
+        self.y_mean = y_mean.float().to(y_mean.device)
+        self.y_std = y_std.float().to(y_std.device)
+        self.action_weights = action_weights.float().to(y_mean.device)
+        
+        # Use reduction='none' so we can apply weights before taking the mean
+        self.mse_loss = nn.MSELoss(reduction='none') 
+
+    def forward(self, pred_norm, target_norm):
+        """
+        Args:
+            pred_norm (torch.Tensor): Model output (normalized action).
+            target_norm (torch.Tensor): Ground-truth target action (normalized).
+        """
+        
+        # 1. Denormalize Prediction (Model Output)
+        # This converts the prediction back to physical units (radians/meters)
+        pred_real = (pred_norm * self.y_std) + self.y_mean
+
+        # 2. Denormalize Target (Ground Truth)
+        # Since the DataLoader only returned normalized target, we must denormalize 
+        # it here to calculate the error in the physical space.
+        target_real = (target_norm * self.y_std) + self.y_mean
+
+        # 3. Calculate Un-reduced Squared Error in REAL space (NIDL)
+        squared_error = self.mse_loss(pred_real, target_real)
+
+        # 4. Apply Joint Weights
+        # The weight vector is broadcast across the batch dimension
+        weighted_squared_error = squared_error * self.action_weights
+
+        # 5. Compute Mean Loss across all dimensions (batch and joints)
+        return torch.mean(weighted_squared_error)
+    
 # ===================================================================
 # === UTILITY FUNCTIONS ===
 # ===================================================================

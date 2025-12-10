@@ -43,6 +43,7 @@ void FrankaRobotStateTest::SetUp() {
 
   temp_state_interfaces.emplace_back(franka_hw_state);
   franka_state_friend->assign_loaned_state_interfaces(temp_state_interfaces);
+  franka_state_friend->initialize_robot_state_msg(franka_robot_state_msg);
   ASSERT_TRUE(franka_state_friend->get_values_as_message(franka_robot_state_msg));
 }
 
@@ -97,4 +98,22 @@ TEST_F(FrankaRobotStateTest, givenInitializedRobotStateMsg_thenCorrectFrameIDs) 
   ASSERT_EQ(franka_robot_state_msg.o_f_ext_hat_k.header.frame_id, "fr3_link0");
   ASSERT_EQ(franka_robot_state_msg.o_dp_ee_c.header.frame_id, "fr3_link0");
   ASSERT_EQ(franka_robot_state_msg.o_ddp_ee_c.header.frame_id, "fr3_link0");
+}
+
+TEST_F(FrankaRobotStateTest, givenInitializedRobotStateMsg_thenCorrectlySizedDynamicVectors) {
+  franka_state_friend->initialize_robot_state_msg(franka_robot_state_msg);
+  auto expected_size = franka_robot_state_msg.measured_joint_state.name.size();
+
+  ASSERT_EQ(franka_robot_state_msg.desired_joint_state.position.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.desired_joint_state.velocity.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.desired_joint_state.effort.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.measured_joint_state.position.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.measured_joint_state.velocity.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.measured_joint_state.effort.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.measured_joint_motor_state.position.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.measured_joint_motor_state.velocity.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.measured_joint_motor_state.effort.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.tau_ext_hat_filtered.position.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.tau_ext_hat_filtered.velocity.size(), expected_size);
+  ASSERT_EQ(franka_robot_state_msg.tau_ext_hat_filtered.effort.size(), expected_size);
 }

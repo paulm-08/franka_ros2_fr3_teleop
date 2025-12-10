@@ -17,6 +17,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
     control_msgs
     controller_interface
     controller_manager
+    ros2_control_test_assets
     franka_msgs
     franka_semantic_components
     generate_parameter_library
@@ -97,7 +98,7 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/test/franka_robot_state_broadcaster_parameters.yaml)
     target_include_directories(${PROJECT_NAME}_test PRIVATE include)
     target_link_libraries(${PROJECT_NAME}_test ${PROJECT_NAME})
-    ament_target_dependencies(${PROJECT_NAME}_test controller_manager hardware_interface)
+    ament_target_dependencies(${PROJECT_NAME}_test controller_manager hardware_interface ros2_control_test_assets)
 
     ament_add_gmock(test_load_franka_robot_state_broadcaster test/test_load_franka_robot_state_broadcaster.cpp)
     target_include_directories(test_load_franka_robot_state_broadcaster PRIVATE include)

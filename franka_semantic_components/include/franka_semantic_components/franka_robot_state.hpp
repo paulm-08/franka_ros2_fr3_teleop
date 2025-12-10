@@ -57,6 +57,7 @@ class FrankaRobotState
   std::string robot_description_;
   std::string robot_name_;
   const std::string state_interface_name_{"robot_state"};
+  std::string full_robot_state_interface_name_;
   bool gripper_loaded_{false};
   size_t kEndEffectorLinkIndex{8};
   // TODO(yazi_ba) update stiffness frame with the user defined transformation

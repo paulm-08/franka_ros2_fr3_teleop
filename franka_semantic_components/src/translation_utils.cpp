@@ -291,18 +291,14 @@ auto toElbow(const std::array<double, 2>& elbow,
   franka_msgs::msg::Elbow elbow_message;
 
   for (size_t i = 0; i < elbow.size(); i++) {
-    elbow_message.position.at(i) = elbow.at(i);
-    elbow_message.desired_position.at(i) = elbow_d.at(i);
-    elbow_message.commanded_position.at(i) = elbow_c.at(i);
-    elbow_message.commanded_velocity.at(i) = delbow_c.at(i);
-    elbow_message.commanded_acceleration.at(i) = ddelbow_c.at(i);
+    elbow_message.position[i] = elbow[i];
+    elbow_message.desired_position[i] = elbow_d[i];
+    elbow_message.commanded_position[i] = elbow_c[i];
+    elbow_message.commanded_velocity[i] = delbow_c[i];
+    elbow_message.commanded_acceleration[i] = ddelbow_c[i];
   }
 
   return elbow_message;
-}
-
-auto toJointStateVector(const std::array<double, 7>& data_vector) -> std::vector<double> {
-  return {data_vector.cbegin(), data_vector.cend()};
 }
 
 auto updateTimeStamps(const builtin_interfaces::msg::Time& time_stamps,

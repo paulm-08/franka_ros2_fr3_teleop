@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-#include "franka_robot_state_broadcaster/franka_robot_state_broadcaster.hpp"
-
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -21,23 +18,62 @@
 #include <unordered_map>
 #include <vector>
 
-#include "hardware_interface/types/hardware_interface_return_values.hpp"
-#include "hardware_interface/types/hardware_interface_type_values.hpp"
-#include "rclcpp/clock.hpp"
-#include "rclcpp/qos.hpp"
-#include "rclcpp/qos_event.hpp"
-#include "rclcpp/time.hpp"
-#include "rclcpp_lifecycle/lifecycle_node.hpp"
-#include "rcpputils/split.hpp"
-#include "rcutils/logging_macros.h"
-#include "std_msgs/msg/header.hpp"
+#include <rcutils/logging_macros.h>
+#include <hardware_interface/types/hardware_interface_return_values.hpp>
+#include <hardware_interface/types/hardware_interface_type_values.hpp>
+#include <rclcpp/clock.hpp>
+#include <rclcpp/qos.hpp>
+#include <rclcpp/qos_event.hpp>
+#include <rclcpp/time.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <rcpputils/split.hpp>
+#include <std_msgs/msg/header.hpp>
+
+#include <franka_robot_state_broadcaster/franka_robot_state_broadcaster.hpp>
 
 namespace franka_robot_state_broadcaster {
+
+FrankaRobotStateBroadcaster::FrankaRobotStateBroadcaster(
+    std::unique_ptr<franka_semantic_components::FrankaRobotState> franka_robot_state)
+    : franka_robot_state_(std::move(franka_robot_state)) {
+  // Start the publish thread
+  is_publish_thread_running_ = true;
+  publish_thread_ = std::thread(&FrankaRobotStateBroadcaster::publishRunner, this);
+}
+
+FrankaRobotStateBroadcaster::~FrankaRobotStateBroadcaster() {
+  is_publish_thread_running_ = false;
+  condition_variable_publish_next_.notify_all();
+  if (publish_thread_.joinable()) {
+    publish_thread_.join();
+  }
+}
+
+// Override trylock to customize the locking mechanism
+// You are excused for wondering why this is necessary.
+// RealtimePublisher::trylock() failure is highly likely due to the 1kHz publish rate.
+// Here we force the scheduler to yield our thread, rescheduling in [sleep_time_] microseconds.
+// After [try_count_] attempts, we give up. Failure to ever gain Lock results in an error message.
+// Hopefully, the next call to update() will be successful.
+bool FrankaRobotStateBroadcaster::FrankaRobotStateRealtimePublisher::trylock() {
+  int count{0};
+  while (++count <= try_count_ &&
+         !realtime_tools::RealtimePublisher<franka_msgs::msg::FrankaRobotState>::trylock()) {
+    std::this_thread::sleep_for(std::chrono::microseconds(sleep_time_));
+  }
+  return count <= try_count_;
+}
 
 controller_interface::CallbackReturn FrankaRobotStateBroadcaster::on_init() {
   try {
     param_listener = std::make_shared<ParamListener>(get_node());
     params = param_listener->get_params();
+
+    auto_declare<int>(kLockTryCount, kLock_try_count);
+    auto_declare<int>(kLockSleepInterval, kLock_sleep_interval);
+    auto_declare<bool>(kLockLogError, kLock_log_error);
+    auto_declare<bool>(kLockUpdateSuccess, kLock_update_success);
+
   } catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
@@ -63,42 +99,59 @@ FrankaRobotStateBroadcaster::state_interface_configuration() const {
 controller_interface::CallbackReturn FrankaRobotStateBroadcaster::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   params = param_listener->get_params();
+  auto this_node = get_node();
   std::string robot_description;
-  if (!get_node()->get_parameter("robot_description", robot_description)) {
-    RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter");
+  if (!this_node->get_parameter("robot_description", robot_description)) {
+    RCLCPP_ERROR(this_node->get_logger(), "Failed to get robot_description parameter");
     return CallbackReturn::ERROR;
   }
+
   if (!franka_robot_state_) {
     franka_robot_state_ = std::make_unique<franka_semantic_components::FrankaRobotState>(
         franka_semantic_components::FrankaRobotState(params.arm_id + "/" + state_interface_name,
                                                      robot_description));
   }
-  current_pose_stamped_publisher_ = get_node()->create_publisher<geometry_msgs::msg::PoseStamped>(
+
+  current_pose_stamped_publisher_ = this_node->create_publisher<geometry_msgs::msg::PoseStamped>(
       kCurrentPoseTopic, rclcpp::SystemDefaultsQoS());
   last_desired_pose_stamped_publisher_ =
-      get_node()->create_publisher<geometry_msgs::msg::PoseStamped>(kLastDesiredPoseTopic,
-                                                                    rclcpp::SystemDefaultsQoS());
+      this_node->create_publisher<geometry_msgs::msg::PoseStamped>(kLastDesiredPoseTopic,
+                                                                   rclcpp::SystemDefaultsQoS());
   desired_end_effector_twist_stamped_publisher_ =
-      get_node()->create_publisher<geometry_msgs::msg::TwistStamped>(kDesiredEETwist,
-                                                                     rclcpp::SystemDefaultsQoS());
-  measured_joint_states_publisher_ = get_node()->create_publisher<sensor_msgs::msg::JointState>(
+      this_node->create_publisher<geometry_msgs::msg::TwistStamped>(kDesiredEETwist,
+                                                                    rclcpp::SystemDefaultsQoS());
+  measured_joint_states_publisher_ = this_node->create_publisher<sensor_msgs::msg::JointState>(
       kMeasuredJointStates, rclcpp::SystemDefaultsQoS());
   external_wrench_in_stiffness_frame_publisher_ =
-      get_node()->create_publisher<geometry_msgs::msg::WrenchStamped>(
+      this_node->create_publisher<geometry_msgs::msg::WrenchStamped>(
           kExternalWrenchInStiffnessFrame, rclcpp::SystemDefaultsQoS());
   external_wrench_in_base_frame_publisher_ =
-      get_node()->create_publisher<geometry_msgs::msg::WrenchStamped>(kExternalWrenchInBaseFrame,
-                                                                      rclcpp::SystemDefaultsQoS());
-  external_joint_torques_publisher_ = get_node()->create_publisher<sensor_msgs::msg::JointState>(
+      this_node->create_publisher<geometry_msgs::msg::WrenchStamped>(kExternalWrenchInBaseFrame,
+                                                                     rclcpp::SystemDefaultsQoS());
+  external_joint_torques_publisher_ = this_node->create_publisher<sensor_msgs::msg::JointState>(
       kExternalJointTorques, rclcpp::SystemDefaultsQoS());
-  desired_joint_states_publisher_ = get_node()->create_publisher<sensor_msgs::msg::JointState>(
+  desired_joint_states_publisher_ = this_node->create_publisher<sensor_msgs::msg::JointState>(
       kDesiredJointStates, rclcpp::SystemDefaultsQoS());
+
   try {
-    franka_state_publisher = get_node()->create_publisher<franka_msgs::msg::FrankaRobotState>(
+    franka_state_publisher = this_node->create_publisher<franka_msgs::msg::FrankaRobotState>(
         "~/" + state_interface_name, rclcpp::SystemDefaultsQoS());
+
+    lock_log_error_ = this_node->get_parameter(kLockLogError).as_bool();
+    lock_update_success_ = this_node->get_parameter(kLockUpdateSuccess).as_bool();
+
+    int try_count = this_node->get_parameter(kLockTryCount).as_int();
+    int sleep_time = this_node->get_parameter(kLockSleepInterval).as_int();
+
+    if (try_count < 0 || sleep_time < 0) {
+      RCLCPP_ERROR(this_node->get_logger(),
+                   "lock_try_count AND lock_sleep_interval must be greater than 0");
+      return CallbackReturn::ERROR;
+    }
+
     realtime_franka_state_publisher =
-        std::make_shared<realtime_tools::RealtimePublisher<franka_msgs::msg::FrankaRobotState>>(
-            franka_state_publisher);
+        std::make_shared<FrankaRobotStateBroadcaster::FrankaRobotStateRealtimePublisher>(
+            franka_state_publisher, try_count, sleep_time);
     franka_robot_state_->initialize_robot_state_msg(realtime_franka_state_publisher->msg_);
   } catch (const std::exception& e) {
     fprintf(stderr,
@@ -106,6 +159,7 @@ controller_interface::CallbackReturn FrankaRobotStateBroadcaster::on_configure(
             e.what());
     return CallbackReturn::ERROR;
   }
+
   RCLCPP_DEBUG(get_node()->get_logger(), "configure successful");
   return CallbackReturn::SUCCESS;
 }
@@ -125,7 +179,19 @@ controller_interface::CallbackReturn FrankaRobotStateBroadcaster::on_deactivate(
 controller_interface::return_type FrankaRobotStateBroadcaster::update(
     const rclcpp::Time& time,
     const rclcpp::Duration& /*period*/) {
-  if (realtime_franka_state_publisher && realtime_franka_state_publisher->trylock()) {
+  if (!realtime_franka_state_publisher->trylock()) {
+    if (lock_log_error_) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+                   "Failed to lock the realtime publisher after %d attempts",
+                   realtime_franka_state_publisher->try_count());
+    }
+
+    return lock_update_success_ ? controller_interface::return_type::OK
+                                : controller_interface::return_type::ERROR;
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(publish_mutex_);
     realtime_franka_state_publisher->msg_.header.stamp = time;
 
     if (!franka_robot_state_->get_values_as_message(realtime_franka_state_publisher->msg_)) {
@@ -134,31 +200,35 @@ controller_interface::return_type FrankaRobotStateBroadcaster::update(
       realtime_franka_state_publisher->unlock();
       return controller_interface::return_type::ERROR;
     }
-
     realtime_franka_state_publisher->unlockAndPublish();
+  }
 
-    const auto& franka_state_msg = realtime_franka_state_publisher->msg_;
+  // This block is not real-time safe due to jitter introduced by the ROS 2 publisher.
+  publish_now_ = true;
+  condition_variable_publish_next_.notify_all();
 
-    current_pose_stamped_publisher_->publish(franka_state_msg.o_t_ee);
+  return controller_interface::return_type::OK;
+}
 
-    last_desired_pose_stamped_publisher_->publish(franka_state_msg.o_t_ee_d);
+auto FrankaRobotStateBroadcaster::publishRunner() -> void {
+  while (is_publish_thread_running_) {
+    std::unique_lock<std::mutex> lock(publish_mutex_);
+    condition_variable_publish_next_.wait(
+        lock, [this] { return publish_now_ || !is_publish_thread_running_; });
 
-    desired_end_effector_twist_stamped_publisher_->publish(franka_state_msg.o_dp_ee_d);
+    if (publish_now_) {
+      const auto& franka_state_msg = realtime_franka_state_publisher->msg_;
+      current_pose_stamped_publisher_->publish(franka_state_msg.o_t_ee);
+      last_desired_pose_stamped_publisher_->publish(franka_state_msg.o_t_ee_d);
+      desired_end_effector_twist_stamped_publisher_->publish(franka_state_msg.o_dp_ee_d);
+      external_wrench_in_base_frame_publisher_->publish(franka_state_msg.o_f_ext_hat_k);
+      external_wrench_in_stiffness_frame_publisher_->publish(franka_state_msg.k_f_ext_hat_k);
+      measured_joint_states_publisher_->publish(franka_state_msg.measured_joint_state);
+      external_joint_torques_publisher_->publish(franka_state_msg.tau_ext_hat_filtered);
+      desired_joint_states_publisher_->publish(franka_state_msg.desired_joint_state);
+    }
 
-    external_wrench_in_base_frame_publisher_->publish(franka_state_msg.o_f_ext_hat_k);
-
-    external_wrench_in_stiffness_frame_publisher_->publish(franka_state_msg.k_f_ext_hat_k);
-
-    measured_joint_states_publisher_->publish(franka_state_msg.measured_joint_state);
-
-    external_joint_torques_publisher_->publish(franka_state_msg.tau_ext_hat_filtered);
-
-    desired_joint_states_publisher_->publish(franka_state_msg.desired_joint_state);
-
-    return controller_interface::return_type::OK;
-
-  } else {
-    return controller_interface::return_type::ERROR;
+    publish_now_ = false;
   }
 }
 

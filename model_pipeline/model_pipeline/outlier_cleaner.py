@@ -36,7 +36,7 @@ def find_and_clean_outliers(input_path, output_path, threshold_action, threshold
 
     for i, traj in enumerate(all_trajectories):
         # Check for outliers in joint actions (delta_q)
-        max_action = np.max(np.abs(traj['delta_q']))
+        max_action = np.max(np.abs(traj['action_t']))
         if max_action > threshold_action:
             corrupted_indices.add(i)
             outlier_details.append(

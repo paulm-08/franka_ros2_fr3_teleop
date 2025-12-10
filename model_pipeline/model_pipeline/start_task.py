@@ -11,6 +11,9 @@ import numpy as np
 from std_msgs.msg import Float64MultiArray
 import threading
 from rclpy.executors import MultiThreadedExecutor
+import json
+from geometry_msgs.msg import PoseStamped 
+from moveit_msgs.srv import GetPositionFK 
 
 # --- Direct Hardware/Control Imports (from your teleop script) ---
 from dex_retargeting.leap_hand_utils.dynamixel_client import DynamixelClient
@@ -27,27 +30,117 @@ def find_goal_files(search_path):
     goal_files = sorted([p.relative_to(paths.WORKSPACE_ROOT) for p in search_path.glob("*goal*.pkl")])
     return goal_files
 
+def get_control_mode(model_path_str):
+    """
+    Infers the control mode (joint or cartesian) from the model's checkpoint config.
+    Assumes config is stored in a JSON file named 'config.json' next to the checkpoint.
+    """
+    model_dir = Path(model_path_str).parent
+    config_path = model_dir / "config.json"
+    
+    if not config_path.exists():
+        logging.warning(f"Config file not found at {config_path}. Defaulting to 'joint'.")
+        return "joint"
+
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Check a specific key that defines the control type
+        control_type = config.get('control_type', 'joint').lower()
+        if 'cartesian' in control_type or 'servo' in control_type:
+            return "cartesian"
+        return "joint"
+
+    except Exception as e:
+        logging.error(f"Error reading model config: {e}. Defaulting to 'joint'.")
+        return "joint"
+
 class StagingController(Node):
     """A single node to handle both arm and hand staging commands."""
-    def __init__(self):
+  
+    def __init__(self, control_mode): # <-- Take control_mode argument
         super().__init__('staging_controller_node')
+        self.control_mode = control_mode
         
         # --- Arm Controller Interface ---
-        self.arm_publisher = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
+        if self.control_mode == 'cartesian':
+            # Cartesian Interface: Publishes PoseStamped to Servo
+            self.arm_publisher = self.create_publisher(PoseStamped, '/servo_node/pose_tracking_pose', 10)
+            
+            # FK Client for Cartesian staging
+            self.fk_client = self.create_client(GetPositionFK, 'compute_fk')
+            while not self.fk_client.wait_for_service(timeout_sec=1.0):
+                self.get_logger().info('FK service not available, waiting...')
+
+        else:
+            # Joint Interface: Publishes JointTrajectory
+            self.arm_publisher = self.create_publisher(JointTrajectory, '/fr3_arm_controller/joint_trajectory', 10)
         
-        # --- Hand Controller Interface (Mirrors your LeapNode) ---
+        # --- Hand Controller Interface ---
         self.hand_publisher = self.create_publisher(Float64MultiArray, '/leap_hand/target_allegro_pose', 10)
 
-    def command_arm(self, target_pose, duration_sec):
-        msg = JointTrajectory()
-        msg.joint_names = [f'fr3_joint{i+1}' for i in range(7)]
-        point = JointTrajectoryPoint()
-        point.positions = [float(p) for p in target_pose]
-        point.time_from_start = Duration(sec=int(duration_sec))
-        msg.points.append(point)
+    def _get_cartesian_pose_from_joint(self, joint_pose):
+        """Uses MoveIt's FK service to convert a joint pose to an end-effector pose."""
+        if not self.fk_client.wait_for_service(timeout_sec=0.1):
+            self.get_logger().error("FK Service unavailable.")
+            return None
+
+        # Create the request
+        req = GetPositionFK.Request()
+        req.header.frame_id = 'base_link'
+        req.fk_link_names = ['leap_hand_link'] # The end-effector link name
         
-        self.arm_publisher.publish(msg)
-        self.get_logger().info(f"Arm move command sent. Waiting {duration_sec}s...")
+        # Set the joint positions
+        req.robot_state.joint_state.header.stamp = self.get_clock().now().to_msg()
+        req.robot_state.joint_state.name = [f'fr3_joint{i+1}' for i in range(7)]
+        req.robot_state.joint_state.position = [float(p) for p in joint_pose]
+        
+        # Call the service
+        future = self.fk_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        
+        if future.result() is not None and future.result().error_code.val == future.result().error_code.SUCCESS:
+            # Result contains the PoseStamped
+            return future.result().pose_stamped[0].pose
+        else:
+            self.get_logger().error(f"FK calculation failed: {future.result().error_code.val}")
+            return None
+
+
+    def command_arm(self, target_pose_list, duration_sec):
+        """
+        Commands the arm. target_pose_list is ALWAYS the 7-DOF Joint Pose q_start.
+        """
+        if self.control_mode == 'joint':
+            # JOINT CONTROL MODE: Publish JointTrajectory directly
+            msg = JointTrajectory()
+            msg.joint_names = [f'fr3_joint{i+1}' for i in range(7)]
+            point = JointTrajectoryPoint()
+            point.positions = [float(p) for p in target_pose_list]
+            point.time_from_start = Duration(sec=int(duration_sec))
+            msg.points.append(point)
+            
+            self.arm_publisher.publish(msg)
+            self.get_logger().info(f"Arm move command (Joint Trajectory) sent. Waiting {duration_sec}s...")
+
+        elif self.control_mode == 'cartesian':
+            # CARTESIAN CONTROL MODE: 
+            # 1. Convert Joint Pose to Cartesian Pose using FK
+            target_pose = self._get_cartesian_pose_from_joint(target_pose_list)
+            
+            if target_pose is None:
+                self.get_logger().error("Cannot stage arm: FK failed.")
+                return
+
+            # 2. Publish PoseStamped to Servo node
+            msg = PoseStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'base_link' 
+            msg.pose = target_pose # Pose geometry message
+            
+            self.arm_publisher.publish(msg)
+            self.get_logger().info(f"Arm move command (Cartesian/FK) sent. Waiting {duration_sec}s...")
 
     def command_hand(self, leap_pose):
         """
@@ -80,6 +173,23 @@ def main():
             
         selected_model = str(answers['model_path'])
         selected_goal = str(answers['goal_state_path'])
+
+        # 1. Determine Control Mode (using the function above)
+        control_mode = get_control_mode(selected_model)
+        logging.info(f"Selected model requires **{control_mode.upper()}** control.")
+
+        # 2. Configure launch arguments for bringup.launch.py
+        bringup_args = ["ros2", "launch", "franka_fr3_moveit_config", "bringup.launch.py"]
+        
+        if control_mode == "cartesian":
+            # Pass the new YAML that only contains joint_state_broadcaster
+            bringup_args.append("controllers_yaml_file:=fr3_ros_controllers_servo.yaml")
+            # Ensure the pose_tracking node is enabled in bringup.launch.py (by un-commenting it)
+            # Assuming you've already made the changes from the previous answer.
+        else:
+            # Default joint control (fr3_arm_controller)
+            bringup_args.append("controllers_yaml_file:=fr3_ros_controllers_rollout.yaml")
+            # Assuming fr3_ros_controllers_rollout.yaml contains fr3_arm_controller
 
         # --- Launch Robot Drivers ---
         logging.info("Launching robot drivers...")

@@ -47,21 +47,21 @@ fr3_arm_controller:
       goal_time: 0.0 # Time tolerance for reaching the goal (e.g., your control period)
       stopped_velocity_tolerance: 0.1 # Relaxed velocity tolerance when stopping
       
-      # Per-joint trajectory tracking tolerances (adjust 0.05 if needed)
-      fr3_joint1: { trajectory: 0.025, goal: 0.001 }
-      fr3_joint2: { trajectory: 0.025, goal: 0.001 }
-      fr3_joint3: { trajectory: 0.025, goal: 0.001 }
-      fr3_joint4: { trajectory: 0.025, goal: 0.001 }
-      fr3_joint5: { trajectory: 0.025, goal: 0.001 }
-      fr3_joint6: { trajectory: 0.025, goal: 0.001 }
-      fr3_joint7: { trajectory: 0.025, goal: 0.001 }
+      # # Per-joint trajectory tracking tolerances (adjust 0.05 if needed)
+      # fr3_joint1: { trajectory: 0.01, goal: 0.001 }
+      # fr3_joint2: { trajectory: 0.01, goal: 0.001 }
+      # fr3_joint3: { trajectory: 0.01, goal: 0.001 }
+      # fr3_joint4: { trajectory: 0.01, goal: 0.001 }
+      # fr3_joint5: { trajectory: 0.01, goal: 0.001 }
+      # fr3_joint6: { trajectory: 0.01, goal: 0.001 }
+      # fr3_joint7: { trajectory: 0.01, goal: 0.001 }
       
     # --- EFFORT GAINS ---
     gains:
-      fr3_joint1: { p: 1000., d: 30., i: 0., i_clamp: 1. }
-      fr3_joint2: { p: 1000., d: 30., i: 0., i_clamp: 1. }
-      fr3_joint3: { p: 1000., d: 30., i: 0., i_clamp: 1. }
-      fr3_joint4: { p: 1000., d: 30., i: 0., i_clamp: 1. }
+      fr3_joint1: { p: 1000., d: 20., i: 0., i_clamp: 1. }
+      fr3_joint2: { p: 1000., d: 20., i: 0., i_clamp: 1. }
+      fr3_joint3: { p: 1000., d: 20., i: 0., i_clamp: 1. }
+      fr3_joint4: { p: 1000., d: 20., i: 0., i_clamp: 1. }
       fr3_joint5: { p: 800., d: 10., i: 0., i_clamp: 1. }
       fr3_joint6: { p: 250., d: 10., i: 0., i_clamp: 1. }
       fr3_joint7: { p: 150., d: 5., i: 0., i_clamp: 1. }

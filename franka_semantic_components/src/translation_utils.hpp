@@ -105,12 +105,6 @@ auto toElbow(const std::array<double, 2>& elbow,
              const std::array<double, 2>& ddelbow_c) -> franka_msgs::msg::Elbow;
 
 /**
- * @param data_vector Translates this data vector from an array to a vector
- * @return std::vector<double> The translated vector
- */
-auto toJointStateVector(const std::array<double, 7>& data_vector) -> std::vector<double>;
-
-/**
  * @param robot_state Updates the the
  */
 auto updateTimeStamps(const builtin_interfaces::msg::Time& time_stamps,
