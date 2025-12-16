@@ -8,94 +8,163 @@ import sys
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # --- CONFIGURATION (!!! ADJUST THESE PATHS AND THRESHOLDS !!!) ---
-ROLLOUT_DATA_PATH = "/home/user/franka_ros2_ws/models/rollout/rollout_mlp_joint_space.npz" # Update this filename
-CHECKPOINT_PATH = "/home/user/franka_ros2_ws/models/policy_models/policy_mlp_joint_space_arm23.pt" # Update this path
+ROLLOUT_DATA_PATH = "/home/user/franka_ros2_ws/models/rollout/rollout_transformer_joint_space.npz" # Update this filename
+CHECKPOINT_PATH = "/home/user/franka_ros2_ws/models/policy_models/policy_transformer_joint_space_hand6.pt" # Update this path
 Z_SCORE_THRESHOLD = 3.0
 # Set to None to analyze the full rollout
-ANALYZE_UP_TO_TIMESTEP = None 
+ANALYZE_UP_TO_TIMESTEP = 30 
 
-# Define dimensions based on the provided feature construction:
+# =================================================================
+# 1. PRIMARY FEATURE BLOCK DIMENSIONS
+# =================================================================
+
+# --- Tactile Block ---
+# Assumes 3 sensors, each with 8 features: [Centroid_x, Centroid_y, Major_x, Major_y, Eig_Maj, Eig_Min, Force_Proxy, Contact_Flag]
 DIM_TACTILE = 24    # 3 sensors * 8 features/sensor
-DIM_ARM_PROP = 7
-DIM_HAND_PROP = 16  # <-- Confirmed: 16D Hand Proprio
-DIM_KP = 10         # 2 objects * 5 features/object
+
+# --- Proprioception Block ---
+DIM_ARM_PROP = 7    # Arm Joints (or EE Pose if 'task_space')
+DIM_HAND_PROP = 16  # Raw LEAP Hand Joints
+# NOTE: The sum DIM_ARM_PROP + DIM_HAND_PROP = 23D
+
+# --- Kinematic Poses Block (NEW Optional Block) ---
+# Example: 3 finger tips (Index, Middle, Thumb), 7D pose each (XYZ + Quat)
+DIM_FINGER_CARTESIAN = 21 # 3 tips * 7 features/tip. Set to 0 if not used. 
+# You would use this block if you stop using the previous 45D "legacy" tactile block.
+
+# --- Visual Keypoint Configuration ---
+# Set the dimensionality of the Keypoint vector (2 for u,v; 3 for x,y,z)
+DIM_KP_VECTOR_SIZE = 2 # <-- CHANGED from 2D (u,v) to 3D (x,y,z)
+
+# Keypoint (KP) block size is determined by:
+# 2 objects (Tube, Peg) * [Position (3D) + Confidence (1D) + Flag (1D)] 
+# + 1 Relative Vector (3D)
+DIM_KP_FEATURES_PER_OBJECT = DIM_KP_VECTOR_SIZE + 2 # 5D per object (3D Pos + 1D Conf + 1D Flag)
+DIM_KP_RELATIVE_VECTOR = DIM_KP_VECTOR_SIZE        # 3D Relative Vec (Tube - Peg)
+DIM_KP = (2 * DIM_KP_FEATURES_PER_OBJECT) + DIM_KP_RELATIVE_VECTOR # 2*5 + 3 = 13
+
+# --- Visual Embedding Block ---
 DIM_RGB_EMBED = 128
 DIM_DEPTH_EMBED = 32
 DIM_EMBED = DIM_RGB_EMBED + DIM_DEPTH_EMBED # 160
 
-# --- DYNAMIC START INDICES ---
+# =================================================================
+# 2. SEQUENTIAL START INDICES (Self-Calculating)
+# =================================================================
+
+# 1. Tactile Features
 TACTILE_START = 0
 ARM_PROP_START = TACTILE_START + DIM_TACTILE                 # 24
+
+# 2. Proprioception Features
 HAND_PROP_START = ARM_PROP_START + DIM_ARM_PROP              # 31
-CAM1_KP_START = HAND_PROP_START + DIM_HAND_PROP              # 47
-CAM1_EMBED_START = CAM1_KP_START + DIM_KP                    # 57
-CAM2_KP_START = CAM1_EMBED_START + DIM_EMBED                 # 217
-CAM2_EMBED_START = CAM2_KP_START + DIM_KP                    # 227
 
-TOTAL_EXPECTED_DIM = CAM2_EMBED_START + DIM_EMBED # 387
+# 3. Finger Cartesian Poses (New Block)
+FINGER_CART_START = HAND_PROP_START + DIM_HAND_PROP          # 47 (16+31)
 
-# --- FEATURE MAPPING (Uses dynamic constants for self-tuning) ---
-FEATURE_MAPPING = {
-    # --- Tactile Features (24D: 3 Sensors * 8 Features/Sensor) ---
-    # Order: [Centroid_x, Centroid_y, Major_x, Major_y, log(Eig_Major+1), log(Eig_Minor+1), Force_Proxy, Contact_Flag]
-    "Tactile_Index_Tip_Centroid_X": (TACTILE_START + 0, TACTILE_START + 1),
-    "Tactile_Index_Tip_Centroid_Y": (TACTILE_START + 1, TACTILE_START + 2),
-    "Tactile_Index_Tip_Major_X": (TACTILE_START + 2, TACTILE_START + 3),
-    "Tactile_Index_Tip_Major_Y": (TACTILE_START + 3, TACTILE_START + 4),
-    "Tactile_Index_Tip_Major_Eig": (TACTILE_START + 4, TACTILE_START + 5),
-    "Tactile_Index_Tip_Minor_Eig": (TACTILE_START + 5, TACTILE_START + 6),
-    "Tactile_Index_Tip_Force_Proxy": (TACTILE_START + 6, TACTILE_START + 7),
-    "Tactile_Index_Tip_Contact_Flag": (TACTILE_START + 7, TACTILE_START + 8),
+# 4. Visual Features (Cam 1)
+CAM1_KP_START = FINGER_CART_START + DIM_FINGER_CARTESIAN     # 47 + 21 = 68 (if DIM_FINGER_CARTESIAN was 21)
+CAM1_EMBED_START = CAM1_KP_START + DIM_KP                    # 68 + 13 = 81 (using DIM_KP=13)
 
-    "Tactile_Middle_Tip_Centroid_X": (TACTILE_START + 8, TACTILE_START + 9),
-    "Tactile_Middle_Tip_Centroid_Y": (TACTILE_START + 9, TACTILE_START + 10),
-    "Tactile_Middle_Tip_Major_X": (TACTILE_START + 10, TACTILE_START + 11),
-    "Tactile_Middle_Tip_Major_Y": (TACTILE_START + 11, TACTILE_START + 12),
-    "Tactile_Middle_Tip_Major_Eig": (TACTILE_START + 12, TACTILE_START + 13),
-    "Tactile_Middle_Tip_Minor_Eig": (TACTILE_START + 13, TACTILE_START + 14),
-    "Tactile_Middle_Tip_Force_Proxy": (TACTILE_START + 14, TACTILE_START + 15),
-    "Tactile_Middle_Tip_Contact_Flag": (TACTILE_START + 15, TACTILE_START + 16),
-    
-    "Tactile_Thumb_Tip_Centroid_X": (TACTILE_START + 16, TACTILE_START + 17),
-    "Tactile_Thumb_Tip_Centroid_Y": (TACTILE_START + 17, TACTILE_START + 18),
-    "Tactile_Thumb_Tip_Major_X": (TACTILE_START + 18, TACTILE_START + 19),
-    "Tactile_Thumb_Tip_Major_Y": (TACTILE_START + 19, TACTILE_START + 20),
-    "Tactile_Thumb_Tip_Major_Eig": (TACTILE_START + 20, TACTILE_START + 21),
-    "Tactile_Thumb_Tip_Minor_Eig": (TACTILE_START + 21, TACTILE_START + 22),
-    "Tactile_Thumb_Tip_Force_Proxy": (TACTILE_START + 22, TACTILE_START + 23),
-    "Tactile_Thumb_Tip_Contact_Flag": (TACTILE_START + 23, TACTILE_START + 24),
+# 5. Visual Features (Cam 2)
+CAM2_KP_START = CAM1_EMBED_START + DIM_EMBED                 # 81 + 160 = 241
+CAM2_EMBED_START = CAM2_KP_START + DIM_KP                    # 241 + 13 = 254
+
+# 6. Total Check
+TOTAL_EXPECTED_DIM = CAM2_EMBED_START + DIM_EMBED            # 254 + 160 = 414 (New total using 3D KPs and 21D Finger Cartesians)
+# If DIM_KP_VECTOR_SIZE=2 and DIM_FINGER_CARTESIAN=0, TOTAL_EXPECTED_DIM would be 387.
+
+# =================================================================
+# 3. FEATURE MAPPING (Uses dynamic constants)
+# =================================================================
+FEATURE_MAPPING = {}
+
+# Helper to define feature slices
+def slice_feature(start, size):
+    return (start, start + size)
+
+# --- Tactile Features (24D) ---
+for i, name in enumerate(["Index_Tip", "Middle_Tip", "Thumb_Tip"]):
+    base = TACTILE_START + i * 8
+    FEATURE_MAPPING[f"Tactile_{name}_Centroid_X"] = slice_feature(base + 0, 1)
+    FEATURE_MAPPING[f"Tactile_{name}_Centroid_Y"] = slice_feature(base + 1, 1)
+    FEATURE_MAPPING[f"Tactile_{name}_Major_X"] = slice_feature(base + 2, 1)
+    FEATURE_MAPPING[f"Tactile_{name}_Major_Y"] = slice_feature(base + 3, 1)
+    FEATURE_MAPPING[f"Tactile_{name}_Major_Eig"] = slice_feature(base + 4, 1)
+    FEATURE_MAPPING[f"Tactile_{name}_Minor_Eig"] = slice_feature(base + 5, 1)
+    FEATURE_MAPPING[f"Tactile_{name}_Force_Proxy"] = slice_feature(base + 6, 1)
+    FEATURE_MAPPING[f"Tactile_{name}_Contact_Flag"] = slice_feature(base + 7, 1)
+
+# --- Proprioception Features (23D) ---
+FEATURE_MAPPING["Arm_Proprio_Joints_or_Pose"] = slice_feature(ARM_PROP_START, DIM_ARM_PROP) # 7D
+FEATURE_MAPPING["Hand_Proprio_Leap"] = slice_feature(HAND_PROP_START, DIM_HAND_PROP)       # 16D
+
+# --- Kinematic Poses (e.g., 21D) ---
+if DIM_FINGER_CARTESIAN > 0:
+    # Assuming 3 poses (7D each: XYZ, Quat)
+    cart_names = ["Index_Tip_Pose", "Middle_Tip_Pose", "Thumb_Tip_Pose"]
+    for i, name in enumerate(cart_names):
+        base = FINGER_CART_START + i * 7
+        FEATURE_MAPPING[name] = slice_feature(base, 7)
+        
+# --- Visual Features (Cam 1) ---
+BASE = CAM1_KP_START
+# 1. Tube Keypoint (3D Pos + 1D Conf + 1D Flag)
+FEATURE_MAPPING["Visual_Cam1_KP_Tube_Pos"] = slice_feature(BASE, DIM_KP_VECTOR_SIZE)
+BASE += DIM_KP_VECTOR_SIZE
+FEATURE_MAPPING["Visual_Cam1_KP_Tube_Conf"] = slice_feature(BASE, 1)
+BASE += 1
+FEATURE_MAPPING["Visual_Cam1_KP_Tube_Flag"] = slice_feature(BASE, 1)
+BASE += 1
+
+# 2. Peg Keypoint (3D Pos + 1D Conf + 1D Flag)
+FEATURE_MAPPING["Visual_Cam1_KP_Peg_Pos"] = slice_feature(BASE, DIM_KP_VECTOR_SIZE)
+BASE += DIM_KP_VECTOR_SIZE
+FEATURE_MAPPING["Visual_Cam1_KP_Peg_Conf"] = slice_feature(BASE, 1)
+BASE += 1
+FEATURE_MAPPING["Visual_Cam1_KP_Peg_Flag"] = slice_feature(BASE, 1)
+BASE += 1
+
+# 3. Relative Vector (3D)
+FEATURE_MAPPING["Visual_Cam1_KP_Relative_Vec"] = slice_feature(BASE, DIM_KP_RELATIVE_VECTOR)
+BASE += DIM_KP_RELATIVE_VECTOR
+
+# Sanity check for KP Start
+if BASE != CAM1_EMBED_START:
+    raise ValueError(f"CAM1 KP block calculation mismatch: Expected end index {CAM1_EMBED_START}, got {BASE}")
+
+FEATURE_MAPPING["Visual_Cam1_RGB_Embed"] = slice_feature(CAM1_EMBED_START, DIM_RGB_EMBED)
+FEATURE_MAPPING["Visual_Cam1_Depth_Embed"] = slice_feature(CAM1_EMBED_START + DIM_RGB_EMBED, DIM_DEPTH_EMBED)
 
 
-    # --- Proprioception Features (23D) ---
-    "Arm_Proprio_Joints_or_Pose": (ARM_PROP_START, ARM_PROP_START + DIM_ARM_PROP),  # Indices 24-30 (7D)
-    "Hand_Proprio_Leap": (HAND_PROP_START, HAND_PROP_START + DIM_HAND_PROP),          # Indices 31-46 (16D)
+# --- Visual Features (Cam 2) ---
+BASE = CAM2_KP_START
+# 1. Tube Keypoint (3D Pos + 1D Conf + 1D Flag)
+FEATURE_MAPPING["Visual_Cam2_KP_Tube_Pos"] = slice_feature(BASE, DIM_KP_VECTOR_SIZE)
+BASE += DIM_KP_VECTOR_SIZE
+FEATURE_MAPPING["Visual_Cam2_KP_Tube_Conf"] = slice_feature(BASE, 1)
+BASE += 1
+FEATURE_MAPPING["Visual_Cam2_KP_Tube_Flag"] = slice_feature(BASE, 1)
+BASE += 1
 
+# 2. Peg Keypoint (3D Pos + 1D Conf + 1D Flag)
+FEATURE_MAPPING["Visual_Cam2_KP_Peg_Pos"] = slice_feature(BASE, DIM_KP_VECTOR_SIZE)
+BASE += DIM_KP_VECTOR_SIZE
+FEATURE_MAPPING["Visual_Cam2_KP_Peg_Conf"] = slice_feature(BASE, 1)
+BASE += 1
+FEATURE_MAPPING["Visual_Cam2_KP_Peg_Flag"] = slice_feature(BASE, 1)
+BASE += 1
 
-    # --- Visual Features (340D) ---
-    # Cam 1 (Indices 47 to 216)
-    "Visual_Cam1_KP_Tube_Pos": (CAM1_KP_START + 0, CAM1_KP_START + 2),     # 2D Position (u, v)
-    "Visual_Cam1_KP_Tube_Conf": (CAM1_KP_START + 2, CAM1_KP_START + 3),    # Confidence
-    "Visual_Cam1_KP_Tube_Flag": (CAM1_KP_START + 3, CAM1_KP_START + 4),    # Detection Flag (Index 50)
-    "Visual_Cam1_KP_Peg_Pos": (CAM1_KP_START + 4, CAM1_KP_START + 6),      # 2D Position (u, v)
-    "Visual_Cam1_KP_Peg_Conf": (CAM1_KP_START + 6, CAM1_KP_START + 7),     # Confidence
-    "Visual_Cam1_KP_Peg_Flag": (CAM1_KP_START + 7, CAM1_KP_START + 8),     # Detection Flag
-    "Visual_Cam1_KP_Relative_Vec": (CAM1_KP_START + 8, CAM1_KP_START + 10), # 2D Relative Vector (tube - peg)
-    
-    "Visual_Cam1_RGB_Embed": (CAM1_EMBED_START, CAM1_EMBED_START + DIM_RGB_EMBED),
-    "Visual_Cam1_Depth_Embed": (CAM1_EMBED_START + DIM_RGB_EMBED, CAM1_EMBED_START + DIM_EMBED),
+# 3. Relative Vector (3D)
+FEATURE_MAPPING["Visual_Cam2_KP_Relative_Vec"] = slice_feature(BASE, DIM_KP_RELATIVE_VECTOR)
+BASE += DIM_KP_RELATIVE_VECTOR
 
-    # Cam 2 (Indices 217 to 386)
-    "Visual_Cam2_KP_Tube_Pos": (CAM2_KP_START + 0, CAM2_KP_START + 2),
-    "Visual_Cam2_KP_Tube_Conf": (CAM2_KP_START + 2, CAM2_KP_START + 3),
-    "Visual_Cam2_KP_Tube_Flag": (CAM2_KP_START + 3, CAM2_KP_START + 4),    # Detection Flag (Index 220)
-    "Visual_Cam2_KP_Peg_Pos": (CAM2_KP_START + 4, CAM2_KP_START + 6),
-    "Visual_Cam2_KP_Peg_Conf": (CAM2_KP_START + 6, CAM2_KP_START + 7),
-    "Visual_Cam2_KP_Peg_Flag": (CAM2_KP_START + 7, CAM2_KP_START + 8),
-    "Visual_Cam2_KP_Relative_Vec": (CAM2_KP_START + 8, CAM2_KP_START + 10),
-    
-    "Visual_Cam2_RGB_Embed": (CAM2_EMBED_START, CAM2_EMBED_START + DIM_RGB_EMBED),
-    "Visual_Cam2_Depth_Embed": (CAM2_EMBED_START + DIM_RGB_EMBED, CAM2_EMBED_START + DIM_EMBED),
-}
+# Sanity check for KP Start
+if BASE != CAM2_EMBED_START:
+    raise ValueError(f"CAM2 KP block calculation mismatch: Expected end index {CAM2_EMBED_START}, got {BASE}")
+
+FEATURE_MAPPING["Visual_Cam2_RGB_Embed"] = slice_feature(CAM2_EMBED_START, DIM_RGB_EMBED)
+FEATURE_MAPPING["Visual_Cam2_Depth_Embed"] = slice_feature(CAM2_EMBED_START + DIM_RGB_EMBED, DIM_DEPTH_EMBED)
 
 
 def load_normalization_data(checkpoint_path):
