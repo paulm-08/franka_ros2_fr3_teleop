@@ -1,4 +1,3 @@
-from model_pipeline import paths
 from pathlib import Path
 import argparse
 import logging
@@ -14,6 +13,7 @@ import matplotlib.pyplot as plt
 import yaml
 import math
 import os
+from scipy.spatial.transform import Rotation as R
 
 from model_pipeline.utils import find_config_files
 from model_pipeline import paths
@@ -22,7 +22,7 @@ from model_pipeline.utils import find_pkl_files
 try:
     import pinocchio as pin
     PINOCCHIO_AVAILABLE = True
-except ImportError:
+except:
     PINOCCHIO_AVAILABLE = False
     print("Warning: Pinocchio not installed. Task-space drift regularization will not work.")
 
@@ -202,37 +202,41 @@ class TrajectoryFrameStackDataset(Dataset):
         self.k = frame_stack_k
         self.flatten = flatten
         self.is_train = is_train
-        # obs_noise: small noise applied to ALL features (robustness)
-        # drift_noise: large noise applied to PROPRIO (recovery)
         self.obs_noise_std = obs_noise_std 
         self.drift_noise_std = drift_noise_std
 
         # --- Config options ---
         self.arm_only = arm_only
         self.control_mode = config.get('control_mode', 'joint_space')
+        self.action_space = config.get('action_space', 'delta') # 'delta' or 'absolute'
         self.use_goal = config.get('use_goal', False)
-        self.num_arm_actions = 6 if self.control_mode == 'task_space' else 7
+
+        # --- Dimensions ---
+        # Proprioception (Input) is ALWAYS 7 for arm (Pos + Quat) or 7 joints
+        self.proprio_arm_dim = 7 
+        
+        # Action (Output) dimensions depend on mode
+        if self.control_mode == 'task_space':
+            if self.action_space == 'absolute':
+                self.num_arm_actions = 9  # 3 Pos + 6 Rot (Ortho6D)
+            else:
+                self.num_arm_actions = 6  # 6 Twist (Delta)
+        else:
+            self.num_arm_actions = 7      # 7 Joints
 
         # --- Constants for Unified Drift Logic ---
-        self.DRIFT_PROB = config.get('drift_prob', 0.2) # 20% of samples get large drift
-        self.DRIFT_CLIP_TAU = config.get('drift_clip_tau', 4) # Limit corrective action to 4 standard deviations
-        self.correction_alpha = config.get('correction_alpha', 0.1) # Scaling factor for correction action
-
-        # --- Action Space ---
-        self.action_space = config.get('action_space', 'delta') # 'delta' or 'absolute'
+        self.DRIFT_PROB = config.get('drift_prob', 0.2)
+        self.DRIFT_CLIP_TAU = config.get('drift_clip_tau', 4)
+        self.correction_alpha = config.get('correction_alpha', 0.1)
 
         # --- Pre-calculate Proprioception Slices ---
         TACTILE_DIM = 24
-        # In state_t, proprio starts after tactile
         self.proprio_start_idx = TACTILE_DIM 
         
-        # Determine how many proprio dimensions we are "drifting"
-        # If arm_only, we drift the 7 arm joints/poses. 
-        # If full body, we drift everything (23).
-        # NOTE: This logic assumes the proprio block is [Arm(7) | Hand(16)]
-        drift_dim = self.num_arm_actions if self.arm_only else 23 
+        # We drift the input features (proprio). 
+        # For task space input, proprio is 7D (Pos+Quat). For joint space, it's 7D (Joints).
+        drift_dim = self.proprio_arm_dim if self.arm_only else 23 
         self.proprio_end_idx = self.proprio_start_idx + drift_dim
-
 
         # --- Build Indices ---
         self.indices = []
@@ -246,7 +250,7 @@ class TrajectoryFrameStackDataset(Dataset):
         if norm_stats:
             self.X_mean, self.X_std, self.y_mean, self.y_std = norm_stats
         else:
-            # Calculate stats from training data
+            # 1. State Stats
             if self.use_goal:
                 X_unstacked = np.concatenate([
                     np.concatenate([t['state_t'], t['goal_t']], axis=1)
@@ -255,47 +259,32 @@ class TrajectoryFrameStackDataset(Dataset):
             else:
                 X_unstacked = np.concatenate([t['state_t'] for t in trajectories], axis=0)
 
-            # --- Calculate stats for the Action Output (y) ---
-            
-            # 1. Determine the raw unstacked action/pose data based on self.action_space
+            # 2. Action Stats
             if self.action_space == 'delta':
-                # Use the pre-calculated delta actions from the pkl file
                 y_unstacked_full = np.concatenate([t['action_t'] for t in trajectories], axis=0)
                 
             elif self.action_space == 'absolute':
-                # Calculate the absolute target pose (Q_t+1) on the fly
                 y_data_list = []
                 
-                # --- APPLY THE 7D -> 6D CONVERSION LOGIC HERE FOR TASK_SPACE ---
-                if self.control_mode == 'task_space':
-                    # Import necessary module for conversion
-                    from scipy.spatial.transform import Rotation as R
-                
                 for traj in trajectories:
-                    # Q_t+1 proprio features (7D Pos+Quat + 16D Hand Joints)
-                    q_next_proprio_full = traj['state_t'][1:, 
-                                                          self.proprio_start_idx : self.proprio_end_idx]
+                    # Input Proprio: 7D Arm (Pos+Quat) + Hand
+                    q_next_proprio_full = traj['state_t'][1:, self.proprio_start_idx : self.proprio_end_idx]
                     
                     if self.control_mode == 'joint_space':
-                        # Joint Space Absolute (7D Arm) - No conversion needed
                         y_data_list.append(q_next_proprio_full)
                         
                     elif self.control_mode == 'task_space':
-                        # Task Space Absolute (6D Arm) - Requires conversion
+                        # CONVERSION: 7D Pose -> 9D Ortho6D Action
                         y_traj_list = []
                         for i in range(q_next_proprio_full.shape[0]):
                             q_next_7d = q_next_proprio_full[i, :7]
                             q_next_hand_16d = q_next_proprio_full[i, 7:]
                             
-                            # Convert 7D arm to 6D (Pos + RotVec)
-                            p_next = q_next_7d[:3]
-                            quat_next = q_next_7d[3:] # [qx, qy, qz, qw]
-                            r_next_vec = R.from_quat(quat_next).as_rotvec() # 3D Rot Vector
-
-                            action_gt_arm_6d = np.concatenate([p_next, r_next_vec], axis=0)
+                            # Helper to convert to 9D
+                            action_gt_arm_9d = self._convert_7d_to_9d(q_next_7d)
                             
                             # Recombine with hand
-                            action_gt_full = np.concatenate([action_gt_arm_6d, q_next_hand_16d], axis=0)
+                            action_gt_full = np.concatenate([action_gt_arm_9d, q_next_hand_16d], axis=0)
                             y_traj_list.append(action_gt_full)
                             
                         y_data_list.append(np.stack(y_traj_list, axis=0))
@@ -305,8 +294,8 @@ class TrajectoryFrameStackDataset(Dataset):
             else:
                 raise ValueError(f"Unknown action_space: {self.action_space}")
                 
-            # 2. Final slicing based on self.arm_only
-            # This is now correct: for task_space, y_unstacked_full is 22D, and self.num_arm_actions=6
+            # Final slicing based on arm_only
+            # y_unstacked_full is now 25D (9+16) for task space absolute, or 23D (7+16) for joint
             y_unstacked = (y_unstacked_full[:, :self.num_arm_actions]
                            if self.arm_only else y_unstacked_full)
 
@@ -315,15 +304,27 @@ class TrajectoryFrameStackDataset(Dataset):
             self.y_mean = y_unstacked.mean(axis=0)
             self.y_std  = y_unstacked.std(axis=0)
             
-            # Prevent divide by zero
+            # Robustness
             self.X_std[self.X_std < 1e-9] = 1.0
             self.y_std[self.y_std < 1e-9] = 1.0
 
         self.current_state_dim = trajectories[0]['state_t'].shape[1]
                 
-        # Stats for normalizing the noisy state
+        # Stats for normalizing the noisy state (Input features are Proprio)
         self.proprio_mean = self.X_mean[self.proprio_start_idx : self.proprio_end_idx]
         self.proprio_std = self.X_std[self.proprio_start_idx : self.proprio_end_idx]
+
+    def _convert_7d_to_9d(self, pose_7d):
+        """
+        Helper: Converts [x,y,z, qx,qy,qz,qw] -> [x,y,z, r11,r21,r31,r12,r22,r32]
+        """
+        pos = pose_7d[:3]
+        quat = pose_7d[3:]
+        # Convert Quat -> Rotation Matrix
+        rot_mat = R.from_quat(quat).as_matrix() # 3x3
+        # Flatten first two columns (Ortho6D)
+        r6d = rot_mat[:, :2].T.flatten() # 6D
+        return np.concatenate([pos, r6d])
 
     def __len__(self):
         return len(self.indices)
@@ -334,7 +335,6 @@ class TrajectoryFrameStackDataset(Dataset):
         start_idx, end_idx = frame_idx - self.k + 1, frame_idx + 1
 
         # --- 1. Get Clean Ground Truth Data ---
-        # State Sequence (X_t) extraction remains unchanged
         if self.use_goal:
             full_state_sequence = np.concatenate([
                 traj['state_t'][start_idx:end_idx],
@@ -343,78 +343,54 @@ class TrajectoryFrameStackDataset(Dataset):
         else:
             full_state_sequence = traj['state_t'][start_idx:end_idx]
         
-        # --- Ground Truth Action (Y_t) calculation ---
+        # --- Ground Truth Action (Y_t) ---
         
-        # Default DELTA action (used for joint_space delta and task_space delta)
+        # Get raw delta from dataset (handles 'delta' modes)
         action_gt_delta_full = traj['action_t'][frame_idx]
         action_gt_delta = (action_gt_delta_full[:self.num_arm_actions] 
                            if self.arm_only else action_gt_delta_full)
 
         if self.action_space == 'delta':
-            # This covers: Joint Delta (7D) and Task Delta (6D)
             action_gt = action_gt_delta
 
         elif self.action_space == 'absolute':
-            # Action target is the ABSOLUTE POSE of the next state (S_t+1)
-            
-            # 1. Get the next state's full proprioception features
+            # Get next state proprio
             q_next_full = traj['state_t'][frame_idx + 1] 
             q_next_proprio_full = q_next_full[self.proprio_start_idx : self.proprio_end_idx]
             
-            # --- NEW LOGIC: ABSOLUTE TARGET CALCULATION ---
             if self.control_mode == 'joint_space':
-                # ABSOLUTE JOINT POSE: Proprio features are already 7D joint angles (q_t+1)
-                # Keep it 7D, slicing is just for arm_only if applicable
                 action_gt = q_next_proprio_full[:self.num_arm_actions] if self.arm_only else q_next_proprio_full
             
             elif self.control_mode == 'task_space':
-                # ABSOLUTE CARTESIAN POSE: Output must be 6D (3D Pos + 3D Rot Vec)
+                # ABSOLUTE CARTESIAN POSE: Output must be 9D (3 Pos + 6 Ortho6D)
+                q_next_arm_7d = q_next_proprio_full[:7]
                 
-                # Arm slicing uses the first 7 DOFs of proprio (Pos+Quat)
-                q_next_arm_7d = q_next_proprio_full[:7] 
-                
-                # 3D Position: [x, y, z]
-                p_next = q_next_arm_7d[:3]
-                
-                # 4D Quaternion: [qx, qy, qz, qw]
-                quat_next = q_next_arm_7d[3:7] 
-
-                # Convert quaternion to 3D rotation vector (Axis-Angle form)
-                from scipy.spatial.transform import Rotation as R
-                r_next_vec = R.from_quat(quat_next).as_rotvec() # r_next_vec is 3D
-
-                # Recombine to the 6D arm target
-                action_gt_arm_6d = np.concatenate([p_next, r_next_vec], axis=0) # 6D
+                # Convert using helper
+                action_gt_arm_9d = self._convert_7d_to_9d(q_next_arm_7d)
                 
                 if self.arm_only:
-                    action_gt = action_gt_arm_6d
+                    action_gt = action_gt_arm_9d
                 else:
-                    # Recombine 6D arm target with 16D hand joint targets
                     q_next_hand_16d = q_next_proprio_full[7:] 
-                    action_gt = np.concatenate([action_gt_arm_6d, q_next_hand_16d], axis=0) # 22D total
+                    action_gt = np.concatenate([action_gt_arm_9d, q_next_hand_16d], axis=0)
             
             else:
                 raise ValueError(f"Unknown control_mode: {self.control_mode}")
             
         # --- 2. Generate Unified Noise ---
-        # We apply noise to the proprioception of the *current* (last) frame
-        # NOTE: q_t_clean is still 7D (Pos+Quat) for task_space input!
+        # q_t_clean is ALWAYS 7D (Pos+Quat) for arm proprio, or 7D joint angles
         q_t_clean = traj['state_t'][frame_idx, self.proprio_start_idx : self.proprio_end_idx]
         
-        # Calculate Correction Target (default is 0 if no noise)
-        # action_gt_delta is the *FULL* delta action (7D or 6D)
-        # We need action_gt_corr to match the shape of action_gt (22D or 23D etc.)
         action_corr_raw = np.zeros_like(action_gt) 
         q_t_noisy = q_t_clean.copy()
 
         if self.is_train:
-            # A. General Observation Noise (applied to everything)
-            # This helps robustness but doesn't change the target action
+            # A. General Observation Noise
             full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
             if self.obs_noise_std > 0:
                 full_state_norm += np.random.normal(0, self.obs_noise_std, full_state_norm.shape)
             
-            # B. Targeted Drift Noise (applied to proprioception)
+            # B. Targeted Drift Noise
             if np.random.rand() < self.DRIFT_PROB:
                 sigma = self.drift_noise_std
             else:
@@ -422,207 +398,122 @@ class TrajectoryFrameStackDataset(Dataset):
             
             if sigma > 0:
                 if self.control_mode == 'joint_space':
-                    # Joint Space (7D) noise and correction remains delta (q_clean - q_noisy)
+                    # Joint Space Logic (Unchanged)
                     drift_noise = np.random.normal(0, sigma, q_t_clean.shape).astype(np.float32)
                     q_t_noisy = q_t_clean + drift_noise
-                    action_corr_raw = q_t_clean - q_t_noisy # = -drift_noise (This is a 7D or 23D delta)
-                    
-                    # If action_gt is 7D, action_corr_raw is 7D. They match.
-                    # If action_gt is 23D, action_corr_raw is 23D. They match.
+                    action_corr_raw = q_t_clean - q_t_noisy 
                     
                 elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
-                    # Task space (7D input) noise logic (Twist)
+                    # Task Space Logic (SE3 Geometric Drift)
                     twist_noise = np.random.normal(0, sigma, 6).astype(np.float32)
                     drift_noise_hand = np.random.normal(0, sigma, 16).astype(np.float32)
 
-                    # Apply noise to arm pose (Proprio is 7D (Pos+Quat))
+                    # 1. Apply SE3 Noise to input
                     T_clean = pin.XYZQUATToSE3(q_t_clean[0:7]) 
                     T_noise = pin.exp(twist_noise)
-                    T_noisy = T_clean * T_noise
+                    T_noisy = T_clean * T_noise # Noisy Pose
                     q_t_noisy_arm_7d = pin.SE3ToXYZQUAT(T_noisy)
 
-                    # Apply noise to hand joints
                     q_t_noisy_hand_16d = q_t_clean[7:] + drift_noise_hand
-                    q_t_noisy = np.concatenate([q_t_noisy_arm_7d, q_t_noisy_hand_16d], axis=0) # 23D noisy state
+                    q_t_noisy = np.concatenate([q_t_noisy_arm_7d, q_t_noisy_hand_16d], axis=0)
                     
-                    # Correction: Twist needed to go from noisy -> clean
-                    T_correction = T_noisy.inverse() * T_clean
-                    action_corr_raw_arm_6d = pin.log(T_correction).vector # 6D twist correction
-                    
-                    # Hand correction is simple delta
-                    action_corr_raw_hand_16d = q_t_clean[7:] - q_t_noisy_hand_16d 
-                    
-                    # The correction action must match the final target shape (action_gt)
+                    # 2. Calculate Correction
                     if self.action_space == 'absolute':
-                        # 1. Convert absolute ground truth (action_gt) back to 7D Pos+Quat for T_GT
-                        # NOTE: This requires action_gt to have been calculated BEFORE this block.
-                        p_gt = action_gt[:3]
-                        r_gt_vec = action_gt[3:6]
-                        from scipy.spatial.transform import Rotation as R
-                        quat_gt = R.from_rotvec(r_gt_vec).as_quat() # [qx, qy, qz, qw]
-                        q_next_arm_7d_gt = np.concatenate([p_gt, quat_gt], axis=0)
-                        T_GT = pin.XYZQUATToSE3(q_next_arm_7d_gt)
+                        # 1. Get the geometries
+                        # Current Clean Frame (t)
+                        T_clean = pin.XYZQUATToSE3(q_t_clean[:7])
+                        # Current Noisy Frame (t) (The state the robot "thinks" it is in)
+                        T_noisy = pin.XYZQUATToSE3(q_t_noisy[:7])
+                        # Expert Next Frame (t+1) (Where the expert went)
+                        q_next_clean_7d = traj['state_t'][frame_idx + 1, self.proprio_start_idx : self.proprio_start_idx+7]
+                        T_next_clean = pin.XYZQUATToSE3(q_next_clean_7d)
 
-                        # 2. Calculate Gap Twist (V_gap: from T_noisy -> T_GT)
-                        T_gap = T_noisy.inverse() * T_GT
-                        V_gap = pin.log(T_gap).vector # 6D Twist
+                        # 2. Calculate the Drift Vector (Local Frame)
+                        # This represents the error: "How far is Noisy from Clean?"
+                        T_drift = T_clean.actInv(T_noisy) # T_clean^-1 * T_noisy
+                        v_drift = pin.log(T_drift).vector # 6D Twist
 
-                        # 3. Calculate Scaled/Corrected Twist (V_target)
-                        # We use (1 - alpha) to scale the gap, so that alpha=1 means no correction.
-                        V_target = V_gap * (1.0 - self.correction_alpha) 
+                        # 3. Calculate "Allowed Remaining Drift"
+                        # If alpha = 0.1 (correct 10%), we want to keep 90% of the drift for the next target
+                        # This prevents the "snap back" jerkiness.
+                        v_drift_remaining = v_drift * (1.0 - self.correction_alpha)
                         
-                        # 4. Compose Final Target Pose (T_final)
-                        T_final = T_noisy * pin.exp(V_target)
-                        
-                        # 5. Convert T_final back to 6D Absolute Pose Target (Pos + RotVec)
-                        q_t_final_arm_7d = pin.SE3ToXYZQUAT(T_final)
-                        
-                        p_final = q_t_final_arm_7d[:3]
-                        quat_final = q_t_final_arm_7d[3:7] 
+                        # 4. Compute the Damped Target
+                        # Target = Expert_Next + Remaining_Drift
+                        T_target_damped = T_next_clean * pin.exp(v_drift_remaining)
 
-                        # Canonicalize quaternion before conversion to rotvec
-                        if quat_final[3] < 0:
-                            quat_final = -quat_final
-                            
-                        r_final_vec = R.from_quat(quat_final).as_rotvec()
-                        
-                        # Final corrected 6D arm target
-                        action_gt_arm_6d_final = np.concatenate([p_final, r_final_vec], axis=0) # 6D
-                        
-                        # Append the uncorrected hand target
+                        # 5. Convert back to Network Output Format (9D)
+                        q_target_7d = pin.SE3ToXYZQUAT(T_target_damped)
+                        action_gt_arm_9d = self._convert_7d_to_9d(q_target_7d)
+
+                        # 6. Re-assemble full action (Arm + Hand)
                         if not self.arm_only:
-                            q_next_hand_16d = action_gt[6:] # Use the hand targets from the original action_gt
-                            action_gt_final = np.concatenate([action_gt_arm_6d_final, q_next_hand_16d], axis=0)
+                            # For the hand, we can just use the standard linear interpolation
+                            hand_clean = q_t_clean[7:]
+                            hand_noisy = q_t_noisy[7:]
+                            hand_next = traj['state_t'][frame_idx + 1, self.proprio_start_idx+7 : self.proprio_end_idx]
+                            
+                            # Target = Next + (1-alpha)*(Noisy - Clean)
+                            hand_drift = hand_noisy - hand_clean
+                            hand_target = hand_next + hand_drift * (1.0 - self.correction_alpha)
+                            
+                            action_gt = np.concatenate([action_gt_arm_9d, hand_target])
                         else:
-                            action_gt_final = action_gt_arm_6d_final
+                            action_gt = action_gt_arm_9d
 
-                        # IMPORTANT: Overwrite the target action (action_gt) with the geometrically corrected version
-                        action_gt = action_gt_final
-                        
-                        # Set action_corr_raw to zeros, as the correction is now baked into action_gt
+                        # IMPORTANT: Zero out the "correction" term in the return 
+                        # because we baked it directly into action_gt
                         action_corr_raw = np.zeros_like(action_gt)
-                    
-                    elif self.action_space == 'delta':
-                        # Target is 6D Twist + 16D Hand Delta
-                        action_corr_raw = np.concatenate([action_corr_raw_arm_6d, action_corr_raw_hand_16d], axis=0)
-                    else:
-                         raise ValueError(f"Unknown action_space: {self.action_space}")
-                
-                # C. Inject the specific drift into the normalized state vector
-                # q_t_noisy is 7D (or 23D). This keeps the input features consistent.
+
+                # C. Inject Drift into State (Normalized)
                 q_t_noisy_norm = (q_t_noisy - self.proprio_mean) / self.proprio_std
-                
-                # Replace proprio features in the LAST frame of the stack
                 full_state_norm[-1, self.proprio_start_idx : self.proprio_end_idx] = q_t_noisy_norm
 
         else:
-            # Validation/Test: Just normalize clean data
             full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
 
         # --- 3. Calculate Unified Target Action ---
-        # Target = Normalized_Demonstrator_Action + Clipped_Normalized_Correction
-        
-        # Normalize Demonstrator Action
+        # Normalize Ground Truth
         action_gt_norm = (action_gt - self.y_mean) / self.y_std 
         
-        # Normalize Correction Action (Now using self.y_std, which is 22D or 7D etc.)
+        # Normalize Correction (if delta mode)
         action_corr_norm = action_corr_raw / self.y_std
-
-        # --- Revised Clipping: Smooth correction proportional to the error (P gain) ---
         action_corr_clamped = action_corr_norm * self.correction_alpha
         
-        # Sum them up
         final_action_target = action_gt_norm + action_corr_clamped
         
-        # --- 4. Flatten and Return ---
         state_output = full_state_norm.flatten() if self.flatten else full_state_norm
 
         return torch.from_numpy(state_output).float(), torch.from_numpy(final_action_target).float()
-
+    
 class JointWeightedMSELoss(nn.Module):
-    def __init__(self, action_weights, control_mode='joint_space', action_space='delta', is_arm_only=False):
-            """
-            Calculates Mean Squared Error on NORMALIZED actions, weighted by importance,
-            and uses a minimal distance metric for Cartesian Orientation (RotVec).
+    def __init__(self, action_weights):
+        """
+        Calculates Mean Squared Error on actions, weighted by joint importance.
+        
+        With the switch to 9D Ortho6D for absolute task space, we no longer need 
+        complex geometric handling (like quaternion double-cover checks) in the loss.
+        Standard MSE on the 6D continuous rotation representation is robust and correct.
 
-            Args:
-                action_weights (torch.Tensor): Vector of weights, one per joint.
-                control_mode (str): 'joint_space' or 'task_space'.
-                action_space (str): 'delta' or 'absolute'.
-                is_arm_only (bool): If True, output does not include hand joints.
-            """
-            super().__init__()
-            self.action_weights = action_weights.float().to(action_weights.device)
-            self.mse_loss = nn.MSELoss(reduction='none') 
-            
-            self.is_task_absolute = (control_mode == 'task_space') and (action_space == 'absolute')
-            self.is_arm_only = is_arm_only
-            
-            # --- Constants for Task Space Orientation Slicing ---
-            # The first 3 dimensions are position (or joint angles, if joint_space)
-            self.POS_END_IDX = 3 
-            
-            # RotVec starts at index 3 and ends at index 6 (for the 6D arm output)
-            if self.is_task_absolute:
-                self.ORI_START_IDX = 3
-                self.ORI_END_IDX = 6
-                # Hand/Remaining DOFs start after the arm's 6D output
-                self.HAND_START_IDX = 6
+        Args:
+            action_weights (torch.Tensor): Vector of weights, one per dimension.
+        """
+        super().__init__()
+        self.register_buffer('action_weights', action_weights.float())
+        self.action_weights = action_weights.float()
+        self.mse_loss = nn.MSELoss(reduction='none') 
 
     def forward(self, pred_norm, target_norm):
-        """
-        Args:
-            pred_norm (torch.Tensor): Model output (normalized action).
-            target_norm (torch.Tensor): Ground-truth target action (normalized).
-        """
-        
-        # Standard squared error for all components
+        # Standard squared error: (pred - target)^2
         squared_error = self.mse_loss(pred_norm, target_norm) # Shape: (B, D)
 
-        if self.is_task_absolute:
-            # 1. Separate the Rotation Vector component (R_x, R_y, R_z)
-            pred_ori_norm = pred_norm[:, self.ORI_START_IDX : self.ORI_END_IDX]
-            target_ori_norm = target_norm[:, self.ORI_START_IDX : self.ORI_END_IDX]
-            
-            # 2. Calculate the "Flipped" Error for the Rotation Vector
-            # The rotation vector r and -r represent rotations around the same axis 
-            # by angles theta and -theta. In the normalized space, this is equivalent to
-            # comparing r_pred vs r_target AND r_pred vs -r_target (the 2*pi difference).
-            
-            # Error 1: Standard (r_pred - r_target)^2
-            sq_err_std = (pred_ori_norm - target_ori_norm)**2
-            
-            # Error 2: Flipped (r_pred - (-r_target))^2 = (r_pred + r_target)^2
-            # This handles the case where r_target is near +pi and r_pred is near -pi (or vice-versa).
-            sq_err_flip = (pred_ori_norm + target_ori_norm)**2 
-            
-            # 3. Use the MINIMUM of the two squared errors for each orientation DOF
-            min_sq_err_ori = torch.min(sq_err_std, sq_err_flip)
-            
-            # 4. Inject the corrected minimum squared error back into the full error tensor
-            
-            # Position/Other Arm DOFs (Pos in task space)
-            error_pos = squared_error[:, :self.POS_END_IDX]
-
-            # Hand/Remaining DOFs (if not arm_only)
-            if not self.is_arm_only and pred_norm.shape[1] > self.HAND_START_IDX:
-                error_hand = squared_error[:, self.HAND_START_IDX:]
-                # Concatenate Position error, Corrected Orientation error, and Hand error
-                corrected_error = torch.cat([error_pos, min_sq_err_ori, error_hand], dim=1)
-            else:
-                # Concatenate Position error and Corrected Orientation error only
-                corrected_error = torch.cat([error_pos, min_sq_err_ori], dim=1)
-            
-            # Sanity check: ensure the dimension hasn't changed
-            assert corrected_error.shape == squared_error.shape, "Error dimension mismatch after correction."
-            squared_error = corrected_error
-        
-        # 5. Apply Joint Weights (Standard for all modes)
+        # Apply Weights
+        # self.action_weights shape: (D,) -> broadcast to (1, D)
         weighted_squared_error = squared_error * self.action_weights.view(1, -1)
 
-        # 6. Compute Mean Loss
+        # Mean over batch and dimensions
         return torch.mean(weighted_squared_error)
-
+    
 # --- CUSTOM LOSS FUNCTION (Implements NIDL and Static Joint Weighting) ---
 class JointWeightedDenormalizedMSELoss(nn.Module):
     def __init__(self, y_mean, y_std, action_weights):
@@ -851,23 +742,24 @@ def main():
         else:
             logging.info(f"Loaded {len(all_trajectories)} trajectories: Using for training only.")
 
-        if final_args.arm_only:
-            if control_mode == 'joint_space':
-                logging.info(f"ARM-ONLY mode enabled. Slicing ACTIONS to the first {final_args.num_arm_joints} joints.")
-                n = final_args.num_arm_joints
-                
-                for traj in all_trajectories:
-                    # We ONLY slice the action vector (the output of the policy).
-                    traj['action_t'] = traj['action_t'][:, :n]
-
-                    # We DO NOT slice 'joints_t' or 'goal_t'.
-                    # The policy's input (the state) should contain the full 23 joints.
+        # --- Determine Action Dimensions for Slicing ---
+        # This logic must match the Dataset class exactly
+        if control_mode == 'joint_space':
+            arm_action_dim = final_args.num_arm_joints # Usually 7
+        elif control_mode == 'task_space':
+            if action_space == 'absolute':
+                arm_action_dim = 9  # 3D Pos + 6D Rotation (Ortho6D)
             else:
-                logging.info(f"ARM-ONLY mode enabled. Slicing ACTIONS to the arm 6D pose.")
-                
-                for traj in all_trajectories:
-                    # We ONLY slice the action vector (the output of the policy).
-                    traj['action_t'] = traj['action_t'][:, :6]
+                arm_action_dim = 6  # 3D Lin Vel + 3D Ang Vel (Twist)
+
+        # --- Apply Slicing based on configuration ---
+        if final_args.arm_only:
+            logging.info(f"ARM-ONLY mode enabled. Slicing ACTIONS to first {arm_action_dim} dimensions.")
+            
+            for traj in all_trajectories:
+                # We ONLY slice the action vector (the output of the policy).
+                # The input state still contains full proprioception.
+                traj['action_t'] = traj['action_t'][:, :arm_action_dim]
 
         logging.info("Preparing datasets and dataloaders...")
 
@@ -930,7 +822,9 @@ def main():
 
             train_loader = DataLoader(train_dataset, batch_size=final_args.batch_size, shuffle=True, num_workers=TARGET_WORKERS,  pin_memory=True)
 
-        # --- Model setup (before the loop) ---
+        # --- Model setup ---
+        # We get dimensions dynamically from the dataset after it has processed the stats
+        # train_dataset.y_mean is automatically the correct size (9, 25, 6, 22, etc.)
         single_frame_dim = train_dataset.X_mean.shape[0]
         output_dim = train_dataset.y_mean.shape[0]
         input_dim = single_frame_dim * final_args.frame_stack if not is_sequence_model else single_frame_dim
@@ -942,39 +836,30 @@ def main():
             hidden_dim=final_args.hidden_dim,
             num_layers=final_args.num_layers
         ).to(device)
+        
         optimizer = optim.Adam(model.parameters(), lr=final_args.lr, weight_decay=1e-3)
 
+        # --- Weighting Logic ---
         W_HIGH = config.get("joint_high_weight", 2.0)
         W_LOW = config.get("joint_low_weight", 1.0)
-        action_weights_np = action_weights_np = np.full((output_dim,), W_HIGH, dtype=np.float32)
-        # Set low priority for hand joints (last 16 indices)
-        action_weights_np[-16:] = W_LOW
-
-        # INDEX_START, INDEX_END = 7, 11  # Joints 7, 8, 9, 10
-        # THUMB_START, THUMB_END = 19, 23 # Joints 19, 20, 21, 22
-
-        # if not final_args.arm_only:
-        #     # Index
-        #     action_weights_np[INDEX_START:INDEX_END] = W_HIGH
-        #     # Thumb
-        #     action_weights_np[THUMB_START:THUMB_END] = W_HIGH
+        
+        # Initialize all weights to High
+        action_weights_np = np.full((output_dim,), W_HIGH, dtype=np.float32)
+        
+        # If we have hand joints, set them to Low
+        # We detect this by checking if output > arm_action_dim
+        if output_dim > arm_action_dim:
+            # The hand joints are the trailing dimensions
+            hand_dim = output_dim - arm_action_dim
+            action_weights_np[-hand_dim:] = W_LOW
+            logging.info(f"Weights: Arm (0-{arm_action_dim-1})={W_HIGH}, Hand ({arm_action_dim}-{output_dim-1})={W_LOW}")
+        else:
+            logging.info(f"Weights: Arm Only (0-{arm_action_dim-1})={W_HIGH}")
 
         action_weights_t = torch.from_numpy(action_weights_np).float().to(device)
 
-        logging.info(f"Action Loss Weights Status (Total {output_dim} joints):")
-        logging.info(f"  Arm (0-{final_args.num_arm_joints-1}): W={W_HIGH}x")
-        # if not final_args.arm_only:
-        #     logging.info(f"  Hand Index ({INDEX_START}-{INDEX_END-1}): W={W_HIGH}x")
-        #     logging.info(f"  Hand Thumb ({THUMB_START}-{THUMB_END-1}): W={W_HIGH}x")
-        #     logging.info(f"  Other Hand Joints: W={W_LOW}x")
-
-        # --- 2. Instantiate the Custom Loss Function ---
-        loss_fn = JointWeightedMSELoss(
-            action_weights=action_weights_t,
-            control_mode=control_mode,
-            action_space=action_space,
-            is_arm_only=final_args.arm_only
-        )
+        # --- Instantiate the Simplified Loss ---
+        loss_fn = JointWeightedMSELoss(action_weights=action_weights_t)
 
         y_mean_t = torch.from_numpy(train_dataset.y_mean).float().to(device)
         y_std_t  = torch.from_numpy(train_dataset.y_std).float().to(device)
