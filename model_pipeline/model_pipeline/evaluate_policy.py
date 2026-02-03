@@ -119,7 +119,7 @@ def perform_rollout(model, trajectory, horizon, norm_stats, robot_limits, frame_
                     start_time_idx=None,
                     mimic_rollout_start=False, use_average_policy=False,
                     proprio_only=False,
-                    action_space='delta'):
+                    action_space="delta"):
     """
     Closed-loop rollout evaluating policy predictions.
     Handles:
@@ -609,10 +609,11 @@ def main():
                 # Traj action is already sliced in data loading if needed, 
                 # but ensure we match model output dim
                 if is_arm_only:
-                    y_unstacked = y_unstacked[:, :6] # Twist (6)                
-                else:
-                    logging.error(f"Unknown action_space '{action_space}'")
-                    continue
+                    y_unstacked = y_unstacked[:, :6] # Twist (6)    
+                                
+            else:
+                logging.error(f"Unknown action_space '{action_space}'")
+                continue
 
             if len(X_unstacked) < frame_stack_k: continue
 

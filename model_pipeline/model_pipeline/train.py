@@ -159,7 +159,7 @@ class TransformerPolicy(nn.Module):
             nhead=num_heads, 
             dim_feedforward=hidden_dim * 4, # Common practice
             batch_first=True, 
-            dropout=0.1
+            dropout=0.2
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
@@ -305,8 +305,8 @@ class TrajectoryFrameStackDataset(Dataset):
             self.y_std  = y_unstacked.std(axis=0)
             
             # Robustness
-            self.X_std[self.X_std < 1e-9] = 1.0
-            self.y_std[self.y_std < 1e-9] = 1.0
+            self.X_std[self.X_std < 1e-6] = 1.0
+            self.y_std[self.y_std < 1e-6] = 1.0
 
         self.current_state_dim = trajectories[0]['state_t'].shape[1]
                 
@@ -332,159 +332,155 @@ class TrajectoryFrameStackDataset(Dataset):
     def __getitem__(self, idx):
         traj_idx, frame_idx = self.indices[idx]
         traj = self.trajectories[traj_idx]
-        start_idx, end_idx = frame_idx - self.k + 1, frame_idx + 1
-
-        # --- 1. Get Clean Ground Truth Data ---
-        if self.use_goal:
-            full_state_sequence = np.concatenate([
-                traj['state_t'][start_idx:end_idx],
-                traj['goal_t'][start_idx:end_idx],
-            ], axis=1)
-        else:
-            full_state_sequence = traj['state_t'][start_idx:end_idx]
         
-        # --- Ground Truth Action (Y_t) ---
+        # Define window
+        start_idx = frame_idx - self.k + 1
+        end_idx = frame_idx + 1 # Current frame index
         
-        # Get raw delta from dataset (handles 'delta' modes)
-        action_gt_delta_full = traj['action_t'][frame_idx]
-        action_gt_delta = (action_gt_delta_full[:self.num_arm_actions] 
-                           if self.arm_only else action_gt_delta_full)
-
-        if self.action_space == 'delta':
-            action_gt = action_gt_delta
-
-        elif self.action_space == 'absolute':
-            # Get next state proprio
-            q_next_full = traj['state_t'][frame_idx + 1] 
-            q_next_proprio_full = q_next_full[self.proprio_start_idx : self.proprio_end_idx]
-            
-            if self.control_mode == 'joint_space':
-                action_gt = q_next_proprio_full[:self.num_arm_actions] if self.arm_only else q_next_proprio_full
-            
-            elif self.control_mode == 'task_space':
-                # ABSOLUTE CARTESIAN POSE: Output must be 9D (3 Pos + 6 Ortho6D)
-                q_next_arm_7d = q_next_proprio_full[:7]
-                
-                # Convert using helper
-                action_gt_arm_9d = self._convert_7d_to_9d(q_next_arm_7d)
-                
-                if self.arm_only:
-                    action_gt = action_gt_arm_9d
-                else:
-                    q_next_hand_16d = q_next_proprio_full[7:] 
-                    action_gt = np.concatenate([action_gt_arm_9d, q_next_hand_16d], axis=0)
-            
-            else:
-                raise ValueError(f"Unknown control_mode: {self.control_mode}")
-            
-        # --- 2. Generate Unified Noise ---
-        # q_t_clean is ALWAYS 7D (Pos+Quat) for arm proprio, or 7D joint angles
-        q_t_clean = traj['state_t'][frame_idx, self.proprio_start_idx : self.proprio_end_idx]
+        # --- 1. Get Clean Data ---
+        # Sequence of states (History) [K, State_Dim]
+        state_seq_clean = traj['state_t'][start_idx:end_idx].copy()
         
-        action_corr_raw = np.zeros_like(action_gt) 
-        q_t_noisy = q_t_clean.copy()
+        # Current Clean State (Single Frame) [State_Dim]
+        q_t_clean_full = traj['state_t'][frame_idx].copy()
+        
+        # Expert Next State (Single Frame) [State_Dim]
+        q_next_clean_full = traj['state_t'][frame_idx + 1].copy()
 
+        # Initialize Noisy Sequence
+        state_seq_noisy = state_seq_clean.copy()
+        target_action_raw = None 
+
+        # --- 2. Apply Sequence-Wide Drift (Train Only) ---
         if self.is_train:
-            # A. General Observation Noise
-            full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
-            if self.obs_noise_std > 0:
-                full_state_norm += np.random.normal(0, self.obs_noise_std, full_state_norm.shape)
+            # Decide drift
+            apply_drift = np.random.rand() < self.DRIFT_PROB
+            # Use small epsilon if not drifting to avoid divide-by-zero or empty logic
+            sigma = self.drift_noise_std if apply_drift else 0.00001
             
-            # B. Targeted Drift Noise
-            if np.random.rand() < self.DRIFT_PROB:
-                sigma = self.drift_noise_std
-            else:
-                sigma = 0.0001 
+            p_start, p_end = self.proprio_start_idx, self.proprio_end_idx
             
-            if sigma > 0:
+            # --- JOINT SPACE LOGIC ---
+            if self.control_mode == 'joint_space':
+                # Generate ONE drift vector for the whole sequence
+                # Shape: (23,) if arm+hand, or (7,) if arm only
+                drift_vector = np.random.normal(0, sigma, p_end - p_start).astype(np.float32)
+                
+                # Apply drift to ALL frames in the sequence (Broadcasting (K, 23) += (23,))
+                state_seq_noisy[:, p_start:p_end] += drift_vector
+                
+                # --- Calculate Target Action ---
+                # Slice the clean vectors to get just the proprio parts we care about
+                q_next_proprio = q_next_clean_full[p_start:p_end]
+                q_curr_proprio = q_t_clean_full[p_start:p_end]
+                
+                if self.action_space == 'absolute':
+                    # Target = Expert_Next + (1 - alpha) * Error
+                    # We want to be at Expert_Next, but we accept keeping some of the current drift
+                    target_proprio = q_next_proprio + (1.0 - self.correction_alpha) * drift_vector
+                else: 
+                    # Delta Mode
+                    # Standard Delta = Expert_Next - Current_Clean
+                    # Corrective Delta = Standard_Delta - alpha * Drift
+                    clean_delta = q_next_proprio - q_curr_proprio
+                    target_proprio = clean_delta - (self.correction_alpha * drift_vector)
+
+                # Filter for Arm Only if needed
+                target_action_raw = target_proprio[:self.num_arm_actions] if self.arm_only else target_proprio
+
+            # --- TASK SPACE LOGIC ---
+            elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
+                # 1. Generate Drifts
+                twist_drift = np.random.normal(0, sigma, 6).astype(np.float32) # 6D
+                hand_drift = np.random.normal(0, sigma, 16).astype(np.float32) # 16D
+                
+                # Precompute Drift Matrix
+                T_drift = pin.exp(twist_drift)
+
+                # 2. Apply Drift to Sequence History
+                # We iterate because SE(3) isn't a simple addition
+                for i in range(self.k):
+                    # Arm: Extract 7D pose -> SE3 -> Apply Drift -> Back to 7D
+                    q_i_arm = state_seq_clean[i, p_start : p_start+7]
+                    T_i_clean = pin.XYZQUATToSE3(q_i_arm)
+                    T_i_noisy = T_i_clean * T_drift # Systematic sensor bias
+                    state_seq_noisy[i, p_start : p_start+7] = pin.SE3ToXYZQUAT(T_i_noisy)
+                    
+                    # Hand: Linear addition
+                    if not self.arm_only:
+                        state_seq_noisy[i, p_start+7 : p_end] += hand_drift
+
+                # 3. Calculate Target Action (Single Frame)
+                # We need the "Current Noisy" state to calculate delta or correction
+                T_curr_noisy = pin.XYZQUATToSE3(state_seq_noisy[-1, p_start : p_start+7])
+                T_next_clean = pin.XYZQUATToSE3(q_next_clean_full[p_start : p_start+7])
+                
+                # Damped Target Pose: Expert * exp( (1-alpha) * drift )
+                # Effectively: "Go to expert, but offset by 90% of the current error"
+                T_target_damped = T_next_clean * pin.exp(twist_drift * (1.0 - self.correction_alpha))
+                
+                # Arm Action Part
+                if self.action_space == 'absolute':
+                    # Absolute: Output the Damped Target Pose (as Ortho6D)
+                    q_target_7d = pin.SE3ToXYZQUAT(T_target_damped)
+                    action_arm = self._convert_7d_to_9d(q_target_7d)
+                else: 
+                    # Delta: Twist from Current Noisy -> Damped Target
+                    # "How do I move from where I THINK I am, to where I want to be?"
+                    action_arm = pin.log(T_curr_noisy.actInv(T_target_damped)).vector
+                
+                # Hand Action Part
+                if not self.arm_only:
+                    hand_next_clean = q_next_clean_full[p_start+7 : p_end]
+                    # Target = Next + (1-alpha)*Drift
+                    hand_target = hand_next_clean + (1.0 - self.correction_alpha) * hand_drift
+                    target_action_raw = np.concatenate([action_arm, hand_target])
+                else:
+                    target_action_raw = action_arm
+
+        # --- 3. Fallback / Validation Logic ---
+        # If we didn't drift (validation or probability check), use standard Ground Truth
+        if target_action_raw is None:
+            # Get raw delta from dataset (handles 'delta' modes natively)
+            if self.action_space == 'delta':
+                action_gt_full = traj['action_t'][frame_idx]
+                target_action_raw = (action_gt_full[:self.num_arm_actions] 
+                                     if self.arm_only else action_gt_full)
+            
+            # Construct absolute target from state t+1
+            elif self.action_space == 'absolute':
+                q_next_proprio = q_next_clean_full[self.proprio_start_idx : self.proprio_end_idx]
+                
                 if self.control_mode == 'joint_space':
-                    # Joint Space Logic (Unchanged)
-                    drift_noise = np.random.normal(0, sigma, q_t_clean.shape).astype(np.float32)
-                    q_t_noisy = q_t_clean + drift_noise
-                    action_corr_raw = q_t_clean - q_t_noisy 
+                    target_action_raw = q_next_proprio[:self.num_arm_actions] if self.arm_only else q_next_proprio
+                
+                elif self.control_mode == 'task_space':
+                    q_next_arm_7d = q_next_proprio[:7]
+                    action_gt_arm = self._convert_7d_to_9d(q_next_arm_7d)
                     
-                elif self.control_mode == 'task_space' and PINOCCHIO_AVAILABLE:
-                    # Task Space Logic (SE3 Geometric Drift)
-                    twist_noise = np.random.normal(0, sigma, 6).astype(np.float32)
-                    drift_noise_hand = np.random.normal(0, sigma, 16).astype(np.float32)
+                    if self.arm_only:
+                        target_action_raw = action_gt_arm
+                    else:
+                        q_next_hand = q_next_proprio[7:] 
+                        target_action_raw = np.concatenate([action_gt_arm, q_next_hand], axis=0)
 
-                    # 1. Apply SE3 Noise to input
-                    T_clean = pin.XYZQUATToSE3(q_t_clean[0:7]) 
-                    T_noise = pin.exp(twist_noise)
-                    T_noisy = T_clean * T_noise # Noisy Pose
-                    q_t_noisy_arm_7d = pin.SE3ToXYZQUAT(T_noisy)
+        # --- 4. Final Normalization ---
+        # Ensure target_action_raw is definitely a numpy array of shape (Output_Dim,)
+        target_action_raw = np.array(target_action_raw, dtype=np.float32)
 
-                    q_t_noisy_hand_16d = q_t_clean[7:] + drift_noise_hand
-                    q_t_noisy = np.concatenate([q_t_noisy_arm_7d, q_t_noisy_hand_16d], axis=0)
-                    
-                    # 2. Calculate Correction
-                    if self.action_space == 'absolute':
-                        # 1. Get the geometries
-                        # Current Clean Frame (t)
-                        T_clean = pin.XYZQUATToSE3(q_t_clean[:7])
-                        # Current Noisy Frame (t) (The state the robot "thinks" it is in)
-                        T_noisy = pin.XYZQUATToSE3(q_t_noisy[:7])
-                        # Expert Next Frame (t+1) (Where the expert went)
-                        q_next_clean_7d = traj['state_t'][frame_idx + 1, self.proprio_start_idx : self.proprio_start_idx+7]
-                        T_next_clean = pin.XYZQUATToSE3(q_next_clean_7d)
+        # Normalize State Stack (Apply obs noise here, AFTER drift)
+        state_seq_norm = (state_seq_noisy - self.X_mean) / self.X_std
+        if self.is_train and self.obs_noise_std > 0:
+            state_seq_norm += np.random.normal(0, self.obs_noise_std, state_seq_norm.shape)
 
-                        # 2. Calculate the Drift Vector (Local Frame)
-                        # This represents the error: "How far is Noisy from Clean?"
-                        T_drift = T_clean.actInv(T_noisy) # T_clean^-1 * T_noisy
-                        v_drift = pin.log(T_drift).vector # 6D Twist
+        # Normalize Action
+        # This was the line causing errors. Now target_action_raw is guaranteed (23,) or (9,) etc.
+        action_norm = (target_action_raw - self.y_mean) / self.y_std
 
-                        # 3. Calculate "Allowed Remaining Drift"
-                        # If alpha = 0.1 (correct 10%), we want to keep 90% of the drift for the next target
-                        # This prevents the "snap back" jerkiness.
-                        v_drift_remaining = v_drift * (1.0 - self.correction_alpha)
-                        
-                        # 4. Compute the Damped Target
-                        # Target = Expert_Next + Remaining_Drift
-                        T_target_damped = T_next_clean * pin.exp(v_drift_remaining)
-
-                        # 5. Convert back to Network Output Format (9D)
-                        q_target_7d = pin.SE3ToXYZQUAT(T_target_damped)
-                        action_gt_arm_9d = self._convert_7d_to_9d(q_target_7d)
-
-                        # 6. Re-assemble full action (Arm + Hand)
-                        if not self.arm_only:
-                            # For the hand, we can just use the standard linear interpolation
-                            hand_clean = q_t_clean[7:]
-                            hand_noisy = q_t_noisy[7:]
-                            hand_next = traj['state_t'][frame_idx + 1, self.proprio_start_idx+7 : self.proprio_end_idx]
-                            
-                            # Target = Next + (1-alpha)*(Noisy - Clean)
-                            hand_drift = hand_noisy - hand_clean
-                            hand_target = hand_next + hand_drift * (1.0 - self.correction_alpha)
-                            
-                            action_gt = np.concatenate([action_gt_arm_9d, hand_target])
-                        else:
-                            action_gt = action_gt_arm_9d
-
-                        # IMPORTANT: Zero out the "correction" term in the return 
-                        # because we baked it directly into action_gt
-                        action_corr_raw = np.zeros_like(action_gt)
-
-                # C. Inject Drift into State (Normalized)
-                q_t_noisy_norm = (q_t_noisy - self.proprio_mean) / self.proprio_std
-                full_state_norm[-1, self.proprio_start_idx : self.proprio_end_idx] = q_t_noisy_norm
-
-        else:
-            full_state_norm = (full_state_sequence - self.X_mean) / self.X_std
-
-        # --- 3. Calculate Unified Target Action ---
-        # Normalize Ground Truth
-        action_gt_norm = (action_gt - self.y_mean) / self.y_std 
+        # Flatten if required
+        x_out = state_seq_norm.flatten() if self.flatten else state_seq_norm
         
-        # Normalize Correction (if delta mode)
-        action_corr_norm = action_corr_raw / self.y_std
-        action_corr_clamped = action_corr_norm * self.correction_alpha
-        
-        final_action_target = action_gt_norm + action_corr_clamped
-        
-        state_output = full_state_norm.flatten() if self.flatten else full_state_norm
-
-        return torch.from_numpy(state_output).float(), torch.from_numpy(final_action_target).float()
+        return torch.from_numpy(x_out).float(), torch.from_numpy(action_norm).float()
     
 class JointWeightedMSELoss(nn.Module):
     def __init__(self, action_weights):
