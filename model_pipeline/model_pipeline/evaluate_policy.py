@@ -92,26 +92,25 @@ def quat_to_ortho6d_np(quat_batch):
 
 def compute_ortho6d_to_rotation_matrix(ortho6d):
     """
-    Decodes 6D rotation representation (first two columns of rot matrix) 
-    into a valid 3x3 rotation matrix using Gram-Schmidt.
-    Input: tensor of shape (6,)
-    Output: tensor of shape (3, 3)
+    Decodes 6D rotation (two 3D vectors) into a valid 3x3 SO(3) matrix.
+    Uses torch.linalg for modern compatibility.
     """
     x_raw = ortho6d[0:3]
     y_raw = ortho6d[3:6]
     
-    # Normalize x
-    x = x_raw / (torch.norm(x_raw) + 1e-8)
-    # Project y onto x to make it orthogonal
-    y = y_raw - torch.dot(x, y_raw) * x
-    # Normalize y
-    y = y / (torch.norm(y) + 1e-8)
-    # z is the cross product
-    z = torch.cross(x, y)
+    # 1. Normalize first basis vector
+    x = x_raw / torch.linalg.norm(x_raw).clamp(min=1e-8)
     
-    # Stack columns to form rotation matrix
-    matrix = torch.stack((x, y, z), dim=1)
-    return matrix
+    # 2. Orthogonalize y and normalize
+    # dot(x, y_raw) * x is the projection of y_raw onto x
+    y = y_raw - torch.dot(x, y_raw) * x
+    y = y / torch.linalg.norm(y).clamp(min=1e-8)
+    
+    # 3. Compute z via cross product (ensures right-handedness)
+    z = torch.linalg.cross(x, y)
+    
+    # Stack as columns to form the 3x3 rotation matrix
+    return torch.stack((x, y, z), dim=1)
 
 def perform_rollout(model, trajectory, horizon, norm_stats, robot_limits, frame_stack_k,
                     is_arm_only, num_arm_joints, device, control_mode='joint_space', 
@@ -172,7 +171,7 @@ def perform_rollout(model, trajectory, horizon, norm_stats, robot_limits, frame_
     else:
         q_pred_history = state_t[history_start_idx:history_end_idx, PROP_START_IDX:PROP_END_IDX].clone()
     
-    predicted_q_trajectory = []
+    predicted_q_trajectory = [to_np(q) for q in q_pred_history]
     is_sequence_model = any(k in model.__class__.__name__.lower() for k in ['lstm', 'gru', 'transformer', 'rnn'])
     
     # --- 1. DETERMINE ARM ACTION DIMENSION ---
@@ -326,7 +325,7 @@ def perform_rollout(model, trajectory, horizon, norm_stats, robot_limits, frame_
     # --- Metrics Calculation ---
     pred_np = np.array(predicted_q_trajectory)
     
-    gt_start_idx = start_frame + 1
+    gt_start_idx = history_start_idx
     gt_end_idx = start_frame + 1 + rollout_steps
     gt_np = to_np(state_t[gt_start_idx : gt_end_idx, PROP_START_IDX:PROP_END_IDX])
 
@@ -340,21 +339,41 @@ def perform_rollout(model, trajectory, horizon, norm_stats, robot_limits, frame_
     gt_np = gt_np[:min_len]
 
     # Compute metrics (on Arm only or Full)
-    if is_arm_only:
-        gt_for_metrics = gt_np[:, :ARM_PROP_DIM]
-        pred_for_metrics = pred_np[:, :ARM_PROP_DIM]
-    else:
-        gt_for_metrics = gt_np
-        pred_for_metrics = pred_np
+    # --- G. DECOUPLED METRICS CALCULATION ---
+    min_len = min(len(pred_np), len(gt_np))
+    pred_np = pred_np[:min_len]
+    gt_np = gt_np[:min_len]
 
+    # Slice the Arm (first 7 dims) and Hand (remaining 16)
+    pred_arm = pred_np[:, :ARM_PROP_DIM]
+    gt_arm = gt_np[:, :ARM_PROP_DIM]
+    
+    pred_hand = pred_np[:, ARM_PROP_DIM:]
+    gt_hand = gt_np[:, ARM_PROP_DIM:]
+
+    # Calculate Arm Metrics
+    mae_arm = mean_absolute_error(gt_arm, pred_arm)
+    r2_arm = r2_score(gt_arm, pred_arm)
+
+    # Calculate Hand Metrics
+    if not is_arm_only:
+        mae_hand = mean_absolute_error(gt_hand, pred_hand)
+        r2_hand = r2_score(gt_hand, pred_hand)
+    else:
+        mae_hand, r2_hand = 0.0, 1.0
+
+    # Combine into metrics dictionary
     metrics = {
-        'mse': mean_squared_error(gt_for_metrics, pred_for_metrics),
-        'mae': mean_absolute_error(gt_for_metrics, pred_for_metrics),
-        'r2': r2_score(gt_for_metrics, pred_for_metrics)
+        'mse': mean_squared_error(gt_np, pred_np), # Overall for backward compatibility
+        'mae': (mae_arm + mae_hand) / 2,           # Average MAE
+        'mae_arm': mae_arm,
+        'mae_hand': mae_hand,
+        'r2_arm': r2_arm,
+        'r2_hand': r2_hand,
+        'r2': r2_arm  # We prioritize Arm R2 as the "global" health check
     }
     
     return pred_np, gt_np, metrics
-
 def main():
     parser = argparse.ArgumentParser(description="Interactively evaluate a trained policy.")
     # Arguments are now fully optional, for advanced/scripted use
@@ -725,12 +744,10 @@ def main():
             plot_indices.append(i)
             plot_names.append(arm_names[i])
 
-        # 2. Hand (Representative)
+        # 2. Hand
         if not is_arm_only:
             # Hand starts after arm_dim
             hand_start_idx = arm_dim 
-            # Plot Index and Thumb (first 4 and middle 4 usually)
-            # Just plotting first 4 for brevity in grid
             for i in range(16): 
                 if hand_start_idx + i < action_true_np.shape[1]:
                     plot_indices.append(hand_start_idx + i)
@@ -855,110 +872,108 @@ def main():
                 all_metrics.append(metrics)
                 all_preds.append(pred_np)
                 all_gts.append(gt_np)
-                logging.info(f"  Trajectory {i+1}/{len(val_trajectories)} | MAE = {metrics['mae']} | R² = {metrics['r2']:.4f}")
-
+                
+                # Decoupled Logging for clarity
+                log_str = (
+                    f" Trajectory {i+1}/{len(val_trajectories)} | "
+                    f"Arm MAE: {metrics['mae_arm']:.5f} | "
+                    f"Hand MAE: {metrics.get('mae_hand', 0):.5f} | "
+                    f"R² Arm: {metrics['r2_arm']:.4f}"
+                )
+                logging.info(log_str)
                 if i >= 10:       # only plot first 10
                     continue
 
                 # --- DATA PREPARATION FOR PLOTTING ---
-                gt_to_plot = gt_np.copy()
-                pred_to_plot = pred_np.copy()
+                history_cutoff = frame_stack_k - 1
                 
-                # If in task space, convert quaternions to 6D Pos+RotVec for a smooth plot
                 if control_mode == 'task_space':
-                    # Create temporary containers (N, 6)
-                    gt_6d = np.zeros((gt_np.shape[0], 6))
-                    pred_6d = np.zeros((pred_np.shape[0], 6))
+                    # 1. Quaternion Smoothing
+                    def smooth_quats(q_array):
+                        q_smooth = q_array.copy()
+                        for t in range(1, len(q_smooth)):
+                            if np.dot(q_smooth[t], q_smooth[t-1]) < 0:
+                                q_smooth[t] *= -1
+                        return q_smooth
 
-                    # 1. Copy Position (XYZ)
-                    gt_6d[:, :3] = gt_np[:, :3]
-                    pred_6d[:, :3] = pred_np[:, :3]
-                    
-                    # 2. Convert Quaternions to Rotation Vectors
+                    gt_quat = smooth_quats(gt_np[:, 3:7])
+                    pred_quat = smooth_quats(pred_np[:, 3:7])
+
                     from scipy.spatial.transform import Rotation as R
-
-                    # Ground Truth: Canonicalize sign, then convert
-                    gt_quat = gt_np[:, 3:7] # [qx, qy, qz, qw]
-                    # Canonicalize: if w < 0, flip entire quat
-                    neg_w_indices = gt_quat[:, 3] < 0
-                    gt_quat[neg_w_indices] *= -1
-                    gt_6d[:, 3:] = R.from_quat(gt_quat).as_rotvec()
-
-                    # Prediction: Canonicalize sign, then convert
-                    pred_quat = pred_np[:, 3:7]
-                    neg_w_indices_p = pred_quat[:, 3] < 0
-                    pred_quat[neg_w_indices_p] *= -1
-                    pred_6d[:, 3:] = R.from_quat(pred_quat).as_rotvec()
+                    gt_to_plot = np.zeros((gt_np.shape[0], 6))
+                    pred_to_plot = np.zeros((pred_np.shape[0], 6))
                     
-                    gt_to_plot = gt_6d
-                    pred_to_plot = pred_6d
+                    gt_to_plot[:, :3] = gt_np[:, :3]
+                    pred_to_plot[:, :3] = pred_np[:, :3]
+                    
+                    gt_to_plot[:, 3:] = R.from_quat(gt_quat).as_rotvec()
+                    pred_to_plot[:, 3:] = R.from_quat(pred_quat).as_rotvec()
+
+                    # 2. RotVec Continuity Fix
+                    for j in range(3, 6):
+                        for t in range(1, len(pred_to_plot)):
+                            diff = pred_to_plot[t, j] - gt_to_plot[t, j]
+                            if abs(diff) > np.pi:
+                                pred_to_plot[t, j] -= np.sign(diff) * 2 * np.pi
+                    
+                    titles = ["Pos X", "Pos Y", "Pos Z", "Rot X", "Rot Y", "Rot Z"]
+                    y_label = "m / rad"
+                    num_plots = 6
                 
-                # --- START ARM PLOTTING LOGIC ---
-                if control_mode == "joint_space":
-                    fig, ax = plt.subplots(figsize=(12, 6))
-                    for j in range(arm_dim): 
-                        c = f"C{j%10}"
-                        ax.plot(gt_to_plot[:, j], c=c, ls='--', label=f"GT {arm_names[j]}")
-                        ax.plot(pred_to_plot[:, j], c=c, label=f"Pred {arm_names[j]}")
-                    
-                    fig.suptitle(f"Rollout vs GT – Joint Angles (Traj {i+1})", fontsize=14)
-                    ax.set(xlabel="Timestep", ylabel=arm_label)
-                    ax.legend(loc="upper right", bbox_to_anchor=(1.15, 1))
-                    ax.grid(ls='--')
-                    plt.tight_layout(rect=(0, 0, 1, 0.95)) 
-                    plt.savefig(rollout_plot_dir / f"rollout_traj_{i+1}_arm.png")
-                    plt.close(fig)
+                else: # joint_space
+                    # In joint space, we just use the first 7 DOFs directly
+                    gt_to_plot = gt_np[:, :7]
+                    pred_to_plot = pred_np[:, :7]
+                    titles = arm_names # ["Joint 1", ..., "Joint 7"]
+                    y_label = "Radians"
+                    num_plots = 7
 
-                else: # task_space
-                    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-                    
-                    # Subplot 1: Position
-                    pos_names = ["x", "y", "z"]
-                    for j in range(3):
-                        c = f"C{j%10}"
-                        axes[0].plot(gt_to_plot[:, j], c=c, ls='--', label=f"GT {pos_names[j]}")
-                        axes[0].plot(pred_to_plot[:, j], c=c, label=f"Pred {pos_names[j]}")
-                    
-                    axes[0].set_title("EE Position (XYZ)")
-                    axes[0].set_ylabel("Position (m)")
-                    axes[0].legend(loc="upper right", bbox_to_anchor=(1.1, 1))
-                    axes[0].grid(ls='--')
-
-                    # Subplot 2: Orientation (Rotation Vector)
-                    ori_names = ["r_x", "r_y", "r_z"] 
-                    for j in range(3):
-                        c = f"C{j%10}"
-                        # Indices 3,4,5 in the 6D array
-                        axes[1].plot(gt_to_plot[:, j+3], c=c, ls='--', label=f"GT {ori_names[j]}")
-                        axes[1].plot(pred_to_plot[:, j+3], c=c, label=f"Pred {ori_names[j]}")
-                    
-                    axes[1].set_title("EE Orientation (Rotation Vector)")
-                    axes[1].set_xlabel("Timestep")
-                    axes[1].set_ylabel("Angle * Axis (rad)")
-                    axes[1].legend(loc="upper right", bbox_to_anchor=(1.1, 1))
-                    axes[1].grid(ls='--')
-                    
-                    fig.suptitle(f"Rollout vs GT – Cartesian Pose (Traj {i+1})", fontsize=14)                    
-                    plt.tight_layout(rect=(0, 0, 1, 0.95))
-                    plt.savefig(rollout_plot_dir / f"rollout_traj_{i+1}_arm.png")
-                    plt.close(fig)
+                # --- ARM PLOT GENERATION ---
+                fig, axes = plt.subplots(num_plots, 1, figsize=(12, 3 * num_plots), sharex=True)
+                if num_plots == 1: axes = [axes] # Handle single plot case
                 
-                # --- Hand Plotting (unchanged logic) ---
+                for j in range(num_plots):
+                    ax = axes[j]
+                    chan_r2 = r2_score(gt_to_plot[:, j], pred_to_plot[:, j])
+                    
+                    # Style logic
+                    color = f"C{j%10}" if control_mode == 'joint_space' else ("C0" if j < 3 else "C1")
+                    
+                    ax.plot(gt_to_plot[:, j], color='black', ls='--', alpha=0.5, label="Expert")
+                    ax.plot(pred_to_plot[:, j], color=color, lw=2, label="Policy")
+                    ax.axvline(x=history_cutoff, color='red', ls=':', label="Rollout Start")
+                    
+                    ax.set_title(f"{titles[j]} | R²: {chan_r2:.3f}")
+                    ax.set_ylabel(y_label)
+                    ax.grid(True, alpha=0.3)
+                    if j == 0: ax.legend(loc="upper right")
+
+                fig.suptitle(f"Traj {i+1} Arm ({control_mode}) | MAE: {metrics['mae_arm']:.5f}")
+                plt.tight_layout(rect=(0, 0, 1, 0.97))
+                plt.savefig(rollout_plot_dir / f"rollout_traj_{i+1}_arm.png")
+                plt.close(fig)
+
+                # --- HAND PLOTS (Legend and Color Fix) ---
                 if not is_arm_only and gt_np.shape[1] > 7:
-                    fig, ax = plt.subplots(figsize=(12,6))
+                    fig, ax = plt.subplots(figsize=(14, 7))
                     hand_start = 7
-                    hand_to_plot = range(min(16, gt_np.shape[1]-7)) # Plot all 16 hand joints
-                    for k, hj in enumerate(hand_to_plot):
+                    for hj in range(min(16, gt_np.shape[1]-7)):
                         idx = hand_start + hj
-                        c = f"C{k%10}"
-                        ax.plot(gt_np[:,idx], c=c, ls='--', label=f"GT Hand J{hj+1}")
-                        ax.plot(pred_np[:,idx], c=c, label=f"Pred Hand J{hj+1}")
-                    ax.set(title=f"Rollout vs GT – Hand DOFs (Traj {i+1})",
-                           xlabel="Timestep", ylabel="Joint Angle (rad)")
-                    ax.legend(loc="upper right", bbox_to_anchor=(1.15,1), fontsize=7) # The legend can be long, so make it fit
-                    ax.grid(ls='--')
+                        # Let matplotlib pick the next color in the cycle
+                        p = ax.plot(gt_np[:, idx], ls='--', alpha=0.4) 
+                        color = p[0].get_color() # Get that specific color
+                        
+                        # Apply same color to Policy solid line
+                        ax.plot(pred_np[:, idx], color=color, label=f"Joint {hj+1}")
+                    
+                    ax.axvline(x=history_cutoff, color='red', ls=':', label="History End")
+                    ax.set_title(f"Hand Traj {i+1} | MAE: {metrics['mae_hand']:.4f}")
+                    
+                    # Place legend outside
+                    ax.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize=8, ncol=1)
+                    ax.grid(True, alpha=0.3)
                     plt.tight_layout()
-                    plt.savefig(rollout_plot_dir/f"rollout_traj_{i+1}_hand.png")
+                    plt.savefig(rollout_plot_dir / f"rollout_traj_{i+1}_hand.png")
                     plt.close(fig)
 
             # --- AGGREGATE PLOTS ---

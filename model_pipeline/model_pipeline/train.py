@@ -593,7 +593,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--split_ratio", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--arm_only", action=argparse.BooleanOptionalAction, help="Train a policy for arm joints only.")
@@ -695,11 +695,12 @@ def main():
         logging.info(f"Action space: {action_space}")
         use_goal = config.get("use_goal", False)
         logging.info(f"Use goal conditioning: {use_goal}")
-        use_drift_regularizer = config.get("use_drift_regularizer", False)
-        logging.info(f"Use drift regularizer: {use_drift_regularizer}")
+        # use_drift_regularizer = config.get("use_drift_regularizer", False)
         drift_loss_weight = config.get("drift_loss_weight", 0.1)
         drift_noise_std = config.get("drift_noise_std", 0.05)
+        use_drift_regularizer = drift_loss_weight > 0 and drift_noise_std > 0
 
+        logging.info(f"Use drift regularizer: {use_drift_regularizer}")
         if use_drift_regularizer:
             logging.info(f"     Drift loss weight: {drift_loss_weight}")
             logging.info(f"     Drift noise std: {drift_noise_std}")
@@ -887,6 +888,7 @@ def main():
             ema_drift_loss = None
             
         # --- Training loop ---
+        save_interval = 20  # Define how often to save a periodic snapshot
         try:
             for epoch in range(final_args.epochs):
                 model.train()
@@ -902,7 +904,6 @@ def main():
                     pred_norm = model(state_norm)
 
                     # 2. Loss Calculation
-                    # The target already contains (BC + Clipped_Correction)
                     loss = loss_fn(pred_norm, action_target_norm)
 
                     loss.backward()
@@ -932,13 +933,19 @@ def main():
                     logging.info(f"Epoch {epoch+1:03d}/{final_args.epochs} | Train Loss: {avg_train_loss:.6f}")
 
 
-                # --- Model saving logic (unchanged) ---
-                if (final_args.validation and avg_val_loss < best_val_loss) or (not final_args.validation and avg_train_loss < best_train_loss):
-                    if final_args.validation:
-                        best_val_loss = avg_val_loss
-                    else:
-                        best_train_loss = avg_train_loss
+                # --- Model saving logic ---
+                is_best = (final_args.validation and avg_val_loss < best_val_loss) or \
+                          (not final_args.validation and avg_train_loss < best_train_loss)
+                
+                is_periodic = (epoch + 1) % save_interval == 0
 
+                if is_best or is_periodic:
+                    if is_best:
+                        if final_args.validation: best_val_loss = avg_val_loss
+                        else: best_train_loss = avg_train_loss
+                        patience_counter = 0
+                    
+                    # Prepare the common checkpoint dictionary
                     model_hyperparams = {
                         "width": final_args.width,
                         "hidden_dim": final_args.hidden_dim,
@@ -946,7 +953,7 @@ def main():
                         "num_heads": final_args.num_heads
                     }
 
-                    torch.save({
+                    checkpoint = {
                         "state_dict": model.state_dict(),
                         "model_type": final_args.model_type,
                         "input_dim": input_dim, "output_dim": output_dim,
@@ -961,16 +968,25 @@ def main():
                         "epoch": epoch + 1,
                         "arm_only": final_args.arm_only,
                         "num_arm_joints": final_args.num_arm_joints
-                    }, model_save_path)
+                    }
 
-                    msg = f"  -> New best model saved to {model_save_path} "
-                    msg += f"(Val Loss: {best_val_loss:.6f})" if final_args.validation else f"(Train Loss: {best_train_loss:.6f})"
-                    logging.info(msg)
-                    patience_counter = 0
+                    # Save 'Best' version
+                    if is_best:
+                        torch.save(checkpoint, model_save_path)
+                        msg = f"  -> New best model saved to {model_save_path} "
+                        msg += f"(Val Loss: {best_val_loss:.6f})" if final_args.validation else f"(Train Loss: {best_train_loss:.6f})"
+                        logging.info(msg)
+
+                    # Save 'Periodic' version
+                    if is_periodic:
+                        periodic_path = model_save_path.parent / f"{model_save_path.stem}_epoch_{epoch+1}.pt"
+                        torch.save(checkpoint, periodic_path)
+                        logging.info(f"  -> Periodic snapshot saved to {periodic_path}")
+
                 else:
                     patience_counter += 1
 
-                if patience_counter >= final_args.patience:
+                if final_args.patience != 0 and patience_counter >= final_args.patience:
                     logging.info(f"Early stopping: no improvement for {final_args.patience} epochs.")
                     break
 
