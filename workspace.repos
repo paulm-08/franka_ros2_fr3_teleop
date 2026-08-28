@@ -1,0 +1,10 @@
+repositories:
+    dex_retargeting:
+        type: git
+        url: https://github.com/paulm-08/dex-retargeting.git
+        version: main
+    
+    dex_retargeting/assets:
+        type: git
+        url: https://github.com/dexsuite/dex-urdf.git
+        version: 7304c7fb59214dab870eca02cf26f76e944e12df
