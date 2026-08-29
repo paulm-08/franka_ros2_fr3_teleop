@@ -8,3 +8,8 @@ repositories:
         type: git
         url: https://github.com/dexsuite/dex-urdf.git
         version: 7304c7fb59214dab870eca02cf26f76e944e12df
+
+    tact9d:
+        type: git
+        url: https://github.com/paulm-08/9DTact.git
+        version: main
